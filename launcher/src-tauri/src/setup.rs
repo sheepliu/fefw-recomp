@@ -289,7 +289,8 @@ fn dev_build_ok(p: &Paths) -> bool {
                  "runtime/games/fefw/fefw_game.cpp", "runtime/games/fefw/fefw_game.h",
                  "runtime/games/fefw/fefw_menu.cpp", "runtime/games/fefw/fefw_mods.cpp",
                  "runtime/games/fefw/fefw_mods.h", "runtime/games/fefw/fefw_mods_menu.cpp",
-                 "runtime/src/gfx/overlay.cpp", "runtime/third_party/nlohmann/json.hpp"] {
+                 "runtime/src/gfx/overlay.cpp", "runtime/src/gfx/play/play.cpp",
+                 "runtime/third_party/nlohmann/json.hpp"] {
         let path = p.repo.join(name);
         let meta = fs::metadata(&path).ok();
         revisions.push((path, meta.as_ref().and_then(|m| m.modified().ok()), meta.as_ref().map_or(0, |m| m.len())));

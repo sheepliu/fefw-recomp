@@ -191,6 +191,8 @@ jobs:
           - Launcher Mods page for IPS/IPS32 packages and compatible runtime mod manifests.
           - ExeFS patches are applied to a staged copy during Setup; original game files remain unchanged.
           - Game runtime includes an F1 Mods interface; runtime mod packages must be installed separately.
+          - Fixed keyboard text input in the F1 Mods interface, including mod search and numeric fields.
+          - Setup now detects changes to the runtime play loop and rebuilds the game when needed.
           - The release includes the launcher, runtime and offline build tools, but no game, saves, shader cache, IPS patches, or mod packages.
 
           ## Install
