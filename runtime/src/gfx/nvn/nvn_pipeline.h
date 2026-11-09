@@ -129,7 +129,9 @@ struct PrewarmStats {
     double wait_ms = 0;
 };
 PrewarmStats prewarm_stats();
-VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgLayout& layout);
+// `ints`: samplers that read integer textures (spirv_int_samplers); null when that variant cannot be made (the caller then uses the
+// translated module with float views).
+VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgLayout& layout, const std::vector<SpvIntSampler>& ints = {});
 VkShaderModule shader_module(const ShaderInfo* s);
 // A content id of a shader module (hash of the words it was made from): two modules made from the same words have the same id, so the shader
 // parts built for the stand-in shaders of the key file are found again by the game's own. Any thread.

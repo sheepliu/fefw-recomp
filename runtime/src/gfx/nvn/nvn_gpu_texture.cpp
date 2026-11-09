@@ -69,6 +69,7 @@ struct TexGpu {
     bool depth = false;                                 // depth and/or stencil aspect
     bool uploaded = false;                              // the image holds the storage's content (or the black fallback)
     bool gpu_written = false;                           // rendered by the GPU since the CPU last wrote the storage
+    bool presented = false;                             // also read by the renderer, outside the NVN submission timeline
     float scale = 1.0f;                                 // resolution scale: base is the NVN size times this ([gfx] render_scale, render targets only)
     bool scale_blocked = false;                         // was scaled, brought back to 1 (bound as a storage image, or paired with an unscaled target)
     std::map<std::array<uint32_t, 12>, VkImageView> views;
@@ -1014,7 +1015,8 @@ VkImageView view_for(TexGpu& g, VkImageViewType type, uint32_t base_level, uint3
 
 VkImageView bad_view(const Texture& t, const char* what) {
     if (first_time("view " + std::to_string(t.id) + " " + what))
-        NXLOG_W(kTag, "texture %u: view not possible (%s): the binding gets the dummy view", t.id, what);
+        NXLOG_W(kTag, "texture %u (%s, target %d, %dx%dx%d, %u layers): view not possible (%s): the binding gets the dummy view", t.id,
+                t.fmt ? t.fmt->name : "?", t.b.target, t.b.width, t.b.height, t.b.depth, t.layers, what);
     return VK_NULL_HANDLE;
 }
 
@@ -1454,6 +1456,10 @@ bool tex_rescale(Texture* t, Frame& f, float to, const char* why) {
         nl = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     }
     gfx::Image old = g->img;
+    // The renderer samples window images in its own submission. Finishing the
+    // NVN serial alone does not retire those reads (notably boot's window swap).
+    if (g->presented) device().wait_idle();
+    g->presented = false;
     std::vector<VkImageView> views;
     for (auto& kv : g->views) views.push_back(kv.second);
     g->views.clear();
@@ -1956,6 +1962,18 @@ VkImageView tex_sampled_view(Texture* t, const ViewRequest& req) {
     return view_for(*g, req.type, bl, nl, bly, nly, fmt, asp, req.swizzle);
 }
 
+uint8_t tex_int_sampler_component(Texture* t, VkFormat requested) {
+    TexGpu* g = tex_or_null(t);
+    if (!g || g->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return 0;
+    const VkFormat fmt = requested == VK_FORMAT_UNDEFINED ? g->format : promoted_view_format(*g, requested);
+    if (!vk_format_is_integer(fmt) || !format_view_ok(*g, fmt)) return 0;
+    if (g->mutable_fmt) {                        // a 32-bit integer format: its float alias already gives a float shader the bits
+        const VkFormat a = float_alias(fmt);
+        if (a != VK_FORMAT_UNDEFINED && format_view_ok(*g, a)) return 0;
+    }
+    return vk_format_is_signed_int(fmt) ? 2 : 3;
+}
+
 VkImageView tex_attachment_view(Texture* t, uint32_t level, uint32_t layer, uint32_t layer_count, VkFormat view_format) {
     TexGpu* g = tex_or_null(t);
     if (!g) return VK_NULL_HANDLE;
@@ -1993,6 +2011,7 @@ VkImageLayout tex_sampled_layout(Texture* t) {
 VkImageView tex_present_view(Texture* t) {
     TexGpu* g = tex_or_null(t);
     if (!g) return VK_NULL_HANDLE;
+    g->presented = true;
     // The UNORM alias of an sRGB image; the plain view when the image cannot be viewed as UNORM.
     const VkFormat fmt = (g->mutable_fmt && is_srgb(g->format)) ? srgb_partner(g->format) : g->format;
     return view_for(*g, VK_IMAGE_VIEW_TYPE_2D, 0, 1, 0, 1, fmt, g->aspect, kIdentity);
@@ -2127,6 +2146,7 @@ void tex_destroy(TexGpu* g) {
         if (!g_live_set.erase(g)) return;   // already destroyed by tex_shutdown
     }
     g_gauge_textures_live.sub(1);
+    if (g->presented) device().wait_idle();
     for (auto& kv : g->views) { vkDestroyImageView(vkdev(), kv.second, nullptr); vk_gauge_image_views().sub(1); }
     g->views.clear();
     if (g->img) g_live_images.fetch_sub(1);

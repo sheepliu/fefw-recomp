@@ -4,6 +4,7 @@
 #define _SILENCE_CXX20_U8PATH_DEPRECATION_WARNING
 #include <windows.h>
 
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -226,6 +227,75 @@ NXTEST(rom_file_system_read_only) {
     int64_t fsz;
     std::memcpy(&fsz, &ents[0x310 + 0x308], 8);
     CHECK_EQ(fsz, 1000);
+}
+
+// The data of the root's first file (a.bin in the fixture) read through the RomFS tables of IStorage `st`.
+static std::string first_root_file(Session& st) {
+    uint64_t f64[10] = {};
+    if (!st.call(0, Args().i64(0).i64(0x50).buf_b(f64, 0x50)).ok()) return {};
+    uint32_t root[6] = {};
+    if (!st.call(0, Args().i64(static_cast<int64_t>(f64[3])).i64(24).buf_b(root, 24)).ok()) return {};
+    uint8_t fe[0x28] = {};
+    if (!st.call(0, Args().i64(static_cast<int64_t>(f64[7] + root[3])).i64(0x28).buf_b(fe, 0x28)).ok()) return {};
+    uint64_t off, size;
+    std::memcpy(&off, fe + 0x08, 8);
+    std::memcpy(&size, fe + 0x10, 8);
+    std::string data(static_cast<size_t>(size), '\0');
+    if (size && !st.call(0, Args().i64(static_cast<int64_t>(f64[9] + off)).i64(static_cast<int64_t>(size)).buf_b(data.data(), size)).ok()) return {};
+    return data;
+}
+
+NXTEST(rom_storage_with_mods) {
+    Fixture f;
+    nxrt::services::profile_reload();
+    const stdfs::path mods = f.dir / "mods";
+    std::error_code ec;
+    char other[17];
+    std::snprintf(other, sizeof other, "%016llX", static_cast<unsigned long long>(nxrt::services::profile().program_id + 0x10000));
+    for (const char* m : {"01-first", "02-second", "_off", "zz-exefs-only"}) stdfs::create_directories(mods / m / "romfs", ec);
+    stdfs::remove_all(mods / "zz-exefs-only" / "romfs", ec);
+    stdfs::create_directories(mods / "zz-exefs-only" / "exefs", ec);
+    stdfs::create_directories(mods / "contents" / other / "x" / "romfs", ec);
+    Fixture::write(mods / "01-first" / "romfs" / "A.BIN", "first");      // case differs from the game's a.bin
+    Fixture::write(mods / "02-second" / "romfs" / "a.bin", "second");    // sorted last: wins
+    Fixture::write(mods / "_off" / "romfs" / "a.bin", "off");
+    Fixture::write(mods / "contents" / other / "x" / "romfs" / "a.bin", "other title");
+    nxrt::config_set("fs", "mods", mods.string().c_str());
+    nxrt::services::reset_all();
+    Session s = open_fsp();
+    Session st = s.sub(s.call(200));
+    REQUIRE(st.valid());
+    CHECK_EQ(first_root_file(st), std::string("second"));
+    // without mods the game's file is served
+    nxrt::config_set("fs", "mods", (f.dir / "no_mods").string().c_str());
+    nxrt::services::reset_all();
+    Session s2 = open_fsp();
+    Session st2 = s2.sub(s2.call(200));
+    REQUIRE(st2.valid());
+    CHECK_EQ(first_root_file(st2), std::string(1000, 'a'));
+}
+
+NXTEST(aoc_storage_by_data_id) {
+    Fixture f;
+    nxrt::services::profile_reload();
+    const uint64_t id = nxrt::services::profile().program_id + 0x1001ull;
+    char name[17];
+    std::snprintf(name, sizeof name, "%016llX", static_cast<unsigned long long>(id));
+    std::error_code ec;
+    stdfs::create_directories(f.dir / "dlc" / name / "0" / "romfs", ec);
+    Fixture::write(f.dir / "dlc" / name / "0" / "romfs" / "dlc1.txt", "x");
+    nxrt::config_set("aoc", "dir", (f.dir / "dlc").string().c_str());
+    Session s = open_fsp();
+    // OpenDataStorageByDataId (cmd 202): u8 storage id, 7 bytes padding, u64 data id.
+    Reply r = s.call(202, Args().u8(0).pad(7).u64(id));
+    REQUIRE(r.ok());
+    Session st = s.sub(r);
+    REQUIRE(st.valid());
+    CHECK(st.call(4).get<int64_t>(0) > 0x200);
+    uint64_t hdr[10] = {};
+    CHECK(st.call(0, Args().i64(0).i64(0x50).buf_b(hdr, 0x50)).ok());
+    CHECK_EQ(hdr[0], 0x50u);
+    CHECK_EQ(s.call(202, Args().u8(0).pad(7).u64(id + 1)).result, kTargetNotFound);   // not supplied
 }
 
 NXTEST(sd_card_is_absent) {

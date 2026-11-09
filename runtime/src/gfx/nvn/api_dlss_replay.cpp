@@ -618,6 +618,7 @@ void dlss_replay(gpu::Frame& f, Obj* o) {
             told = true;
             NXLOG_W(kTag, "%s is not available (its DLLs, or Streamline not started): the built-in temporal upscaler is used", upscaler_name(u));
         }
+        u = Upscaler::Taau;   // what runs from here on, for the log lines below
     }
 
     // the built-in upscaler

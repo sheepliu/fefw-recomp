@@ -311,3 +311,36 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## Kompas9's Switch-Game-Patches, Fortune's Weave ultrawide patch (MIT)
+
+`games/fefw/fefw_wide.cpp` (`[fefw] ultrawide`) and its sites in `recomp/games/fefw/main.sites` follow Kompas9's "Ultrawide 3440x1440 v1.1"
+patch for this game build (`games/Fire-Emblem-Fortunes-Weave`: `ULTRAWIDE.md`, `ultrawide-patch-records.json`): which code computes the
+perspective camera's aspect, the 1920x1080 UI projections, the scissor pane, the world-to-screen markers, the 2D effects' projection and
+scissors, and the movie viewport, and what each change does there. The runtime re-implements those findings as host hooks that compute their
+values from the output's aspect; the IPS patch and its code caves are neither used nor distributed. Source:
+https://github.com/Kompas9/Switch-Game-Patches.
+
+```
+MIT License
+
+Copyright (c) 2026 Kompas9
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```

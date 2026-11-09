@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "nxrt/input_source.h"
 #include "nxrt/ipc.h"
@@ -39,6 +40,32 @@ void register_audio();       void audio_reset();       // audio.cpp       audren
 void register_audio_out();   void audio_out_reset();   // audio_out.cpp   audout:u, audin:u
 std::shared_ptr<ipc::Service> audio_out_manager();   std::shared_ptr<ipc::Service> audio_in_manager();   // for aud:u (Switch 2)
 void register_vi_nv();       void vi_nv_reset();       // vi_nv.cpp       vi:u (vi:m, vi:s), nvdrv (nvdrv:a, nvdrv:s)
+
+// common.cpp: add-on content (DLC) the player supplied from their own dump, under [aoc] dir (default "game/dlc"): one folder per add-on
+// named by its 16-hex-digit data id (application id + 0x1000 + index), holding romfs/ directly or in one subfolder ("<id>/romfs" or
+// "<id>/<n>/romfs"; with several subfolders the highest numbered one is used). Only ids of this title with index 1..0xFFF count.
+// Rescanned on every call, sorted by index. aoc:u lists these and fsp-srv OpenDataStorageByDataId serves their RomFS.
+struct AddOnContent {
+    uint64_t data_id = 0;
+    uint32_t index = 0;
+    std::string romfs;   // host folder
+};
+std::string aoc_dir();
+std::vector<AddOnContent> installed_aoc();
+
+// common.cpp: RomFS mods under [fs] mods (default "mods"), the layout emulators use, so mods made for them work as they are: any folder
+// below it (up to 4 levels) holding romfs/ or exefs/ is a mod ("mods/<name>/romfs", "mods/contents/<title id>/<name>/romfs"). A folder
+// whose name starts with '-', '_' or '.' is off, and so is a folder named by another title's id. Sorted by their path below the mods
+// folder, ignoring case: when two mods have the same file, the one sorted last wins (01-..., 02-...). exefs/ (code patches) is not
+// applied, since the code is compiled ahead of time; such mods are reported with has_exefs. The layout and rules follow Hookshot
+// host/mods.c (NotRexed/Hookshot, GPL-3.0-or-later; from SkyboundTotk's loader), so a mods folder works the same in both.
+struct RomfsMod {
+    std::string name;    // path below the mods folder, '/'-separated
+    std::string romfs;   // host folder, empty when the mod has only exefs/
+    bool has_exefs = false;
+};
+std::string mods_dir();
+std::vector<RomfsMod> installed_mods();
 
 // album.cpp: caps:su (photos saved as PNG into the album folder), registered by register_misc().
 std::shared_ptr<ipc::Service> make_screenshot_app();

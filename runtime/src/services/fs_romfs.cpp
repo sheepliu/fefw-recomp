@@ -220,6 +220,66 @@ bool scan_nup(const std::string& nup_path, Node& root, std::string& msg) {
     return true;
 }
 
+// ---- overlays (RomFS mods) --------------------------------------------------------------------------------------------------------
+bool same_name_nocase(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); i++) {
+        unsigned char x = static_cast<unsigned char>(a[i]), y = static_cast<unsigned char>(b[i]);
+        if (x >= 'A' && x <= 'Z') x = static_cast<unsigned char>(x + 32);
+        if (y >= 'A' && y <= 'Z') y = static_cast<unsigned char>(y + 32);
+        if (x != y) return false;
+    }
+    return true;
+}
+
+uint32_t count_files(const Node& n) {
+    if (!n.is_dir) return 1;
+    uint32_t c = 0;
+    for (const Node& k : n.kids) c += count_files(k);
+    return c;
+}
+
+// Gives n (and everything under it) its image path under the directory `parent`. False when a path gets too long.
+bool repath(Node& n, const std::string& parent, std::string& msg) {
+    n.path = parent + "/" + n.name;
+    if (n.path.size() > kMaxPath) {
+        msg = "path too long for a RomFS (0x300 bytes): " + n.path;
+        return false;
+    }
+    for (Node& k : n.kids)
+        if (!repath(k, n.path, msg)) return false;
+    return true;
+}
+
+// Lays the overlay directory `add` over `base`. `taken` counts the files taken from the overlay.
+bool merge(Node& base, Node& add, uint32_t& taken, std::string& msg) {
+    for (Node& k : add.kids) {
+        auto it = std::find_if(base.kids.begin(), base.kids.end(), [&](const Node& b) { return b.name == k.name; });
+        if (it == base.kids.end())
+            it = std::find_if(base.kids.begin(), base.kids.end(), [&](const Node& b) { return same_name_nocase(b.name, k.name); });
+        if (it == base.kids.end()) {
+            if (!repath(k, base.path, msg)) return false;
+            taken += count_files(k);
+            base.kids.push_back(std::move(k));
+        } else if (it->is_dir && k.is_dir) {
+            if (!merge(*it, k, taken, msg)) return false;
+        } else if (!it->is_dir && !k.is_dir) {
+            it->host = k.host;
+            it->size = k.size;
+            it->src = 0;
+            taken++;
+        } else {
+            // a file where the game has a folder, or the other way round: the overlay's entry replaces the game's
+            const std::string name = it->name;
+            *it = std::move(k);
+            it->name = name;
+            if (!repath(*it, base.path, msg)) return false;
+            taken += count_files(*it);
+        }
+    }
+    return true;
+}
+
 void flatten(Node& n, std::vector<Node*>& dirs, std::vector<Node*>& files) {
     for (Node& k : n.kids) {
         if (k.is_dir) {
@@ -261,7 +321,7 @@ struct Layout {
 };
 
 // Lays out the host folder: entries sorted by full path in each table, file data in that order, 16-byte aligned.
-bool make_layout(const std::string& host_dir, Layout& L, std::string* err) {
+bool make_layout(const std::string& host_dir, const std::vector<std::string>& overlays, Layout& L, std::string* err) {
     std::string msg;
     std::wstring wdir;
     const bool packaged = nup::is_nup(host_dir);
@@ -282,6 +342,35 @@ bool make_layout(const std::string& host_dir, Layout& L, std::string* err) {
         if (err) *err = msg;
         return false;
     }
+    uint32_t taken = 0;
+    for (const std::string& o : overlays) {
+        std::wstring wo;
+        std::error_code oec;
+        const std::filesystem::path oabs = to_wide(o, wo) ? std::filesystem::absolute(std::filesystem::path(wo), oec) : std::filesystem::path();
+        if (oabs.empty() || oec || !std::filesystem::is_directory(oabs, oec)) {
+            NXLOG_W("fs", "romfs overlay '%s' is not a folder: left out", o.c_str());
+            continue;
+        }
+        Node ov;
+        ov.is_dir = true;
+        ov.host = long_path(oabs.wstring());
+        std::string omsg;
+        if (!scan(ov, omsg)) {
+            NXLOG_W("fs", "romfs overlay '%s' left out: %s", o.c_str(), omsg.c_str());
+            continue;
+        }
+        // merge into a copy, so an overlay that fails halfway (a path too long) leaves the tree as it was
+        Node merged = root;
+        uint32_t n = 0;
+        if (!merge(merged, ov, n, omsg)) {
+            NXLOG_W("fs", "romfs overlay '%s' left out: %s", o.c_str(), omsg.c_str());
+            continue;
+        }
+        root = std::move(merged);
+        taken += n;
+        NXLOG_I("fs", "romfs overlay '%s': %u files", o.c_str(), n);
+    }
+    if (!overlays.empty()) sort_tree(root);
 
     std::vector<Node*> dirs{&root}, files;
     flatten(root, dirs, files);
@@ -410,6 +499,7 @@ bool make_layout(const std::string& host_dir, Layout& L, std::string* err) {
     L.stats.dirs = static_cast<uint32_t>(dirs.size());
     L.stats.data_bytes = data_bytes;
     L.stats.data_offset = kPartitionOfs;
+    L.stats.overlay_files = taken;
     L.built = true;
     return true;
 }
@@ -499,9 +589,9 @@ struct RomfsImage::Impl {
 RomfsImage::RomfsImage() : p_(std::make_unique<Impl>()) {}
 RomfsImage::~RomfsImage() = default;
 
-bool RomfsImage::build(const std::string& host_dir, std::string* err) {
+bool RomfsImage::build(const std::string& host_dir, std::string* err, const std::vector<std::string>& overlays) {
     Layout fresh;
-    const bool ok = make_layout(host_dir, fresh, err);
+    const bool ok = make_layout(host_dir, overlays, fresh, err);
     std::lock_guard<std::mutex> lk(p_->mu);
     p_->cache.clear();
     p_->l = ok ? std::move(fresh) : Layout{};

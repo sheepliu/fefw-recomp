@@ -10,6 +10,8 @@
 // min(output, display size), so the vi answer must give 2160p for outputs above 1440p (the docked default does).
 //
 // [fefw] output = console | 720p | 1080p | 1440p | 2160p | 4k | window | WxH     (console: each config keeps its own)
+// [fefw] ultrawide = auto | off                                                   (auto: an output wider than 16:9 keeps its shape,
+//                                                                                  fefw_wide.cpp; a narrower one gets 16:9 inside it)
 // [fefw] render_ratio = 0 (the config's own, 0.5) | 0.25..1.0 per side            (1.0: DLAA)
 // [fefw] render = WxH                                                              (wins over render_ratio)
 // [fefw] shadow_size = 0 (the config's) | 512..8192                                (shadow-map base size)
@@ -275,11 +277,16 @@ bool parse_wxh(const std::string& v, int* w, int* h) {
     return true;
 }
 
-// The window's client size at start, fitted to 16:9.
-void window_output(int* w, int* h) {
+// The window's client size at start, fitted to 16:9; with [fefw] ultrawide a wider window is taken as it is (fefw_wide.cpp).
+void window_output(int* w, int* h, bool wide) {
     int pw = 0, ph = 0;
     platform::pixel_size(&pw, &ph);
     if (pw <= 0 || ph <= 0) return;
+    if (wide && wide_aspect(pw, ph)) {
+        *w = pw & ~1;
+        *h = ph & ~1;
+        return;
+    }
     int fw = std::min(pw, ph * 16 / 9);
     int fh = fw * 9 / 16;
     *w = fw & ~1;
@@ -289,12 +296,28 @@ void window_output(int* w, int* h) {
 void read_options(Res& r) {
     std::string o = config_get_str("fefw", "output", "console");
     for (char& ch : o) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    const bool wide = wide_mode() != "off";
     if (o == "720p") r.out_w = 1280, r.out_h = 720;
     else if (o == "1080p") r.out_w = 1920, r.out_h = 1080;
     else if (o == "1440p") r.out_w = 2560, r.out_h = 1440;
     else if (o == "2160p" || o == "4k") r.out_w = 3840, r.out_h = 2160;
-    else if (o == "window") window_output(&r.out_w, &r.out_h);
+    else if (o == "window") window_output(&r.out_w, &r.out_h, wide);
     else if (o != "console" && !o.empty() && !parse_wxh(o, &r.out_w, &r.out_h)) NXLOG_W(kTag, "[fefw] output = %s is not known: console", o.c_str());
+    if (wide && r.out_w > 0 && wide_aspect(r.out_w, r.out_h)) {
+        // [fefw] ultrawide: the shape is kept within the 3840x2160 window textures (5120x1440 -> 3840x1080; the window scales it up)
+        const double s = std::min({1.0, static_cast<double>(kMaxW) / r.out_w, static_cast<double>(kMaxH) / r.out_h});
+        if (s < 1.0) {
+            const int w0 = r.out_w, h0 = r.out_h;
+            r.out_w = 2 * static_cast<int>(std::lround(w0 * s / 2));
+            r.out_h = 2 * static_cast<int>(std::lround(h0 * s / 2));
+            NXLOG_W(kTag, "[fefw] output %dx%d is above the game's %dx%d window textures: %dx%d, the same shape", w0, h0, kMaxW, kMaxH, r.out_w, r.out_h);
+        }
+    } else if (wide && r.out_w > 0 && static_cast<double>(r.out_w) * 9.0 * 1.01 < static_cast<double>(r.out_h) * 16.0) {
+        // narrower than 16:9 (16:10, 4:3): the game's 16:9 picture inside it, letterboxed by the window
+        const int h0 = r.out_h;
+        r.out_h = (r.out_w * 9 / 16) & ~1;
+        NXLOG_I(kTag, "[fefw] output %dx%d is narrower than 16:9: %dx%d, letterboxed ([fefw] ultrawide = auto)", r.out_w, h0, r.out_w, r.out_h);
+    }
     if (r.out_w > kMaxW || r.out_h > kMaxH) {
         NXLOG_W(kTag, "[fefw] output %dx%d is above the game's 3840x2160 window textures: 3840x2160", r.out_w, r.out_h);
         r.out_w = std::min(r.out_w, kMaxW);
@@ -385,6 +408,7 @@ void res_install(uint64_t base) {
     r.base = base;
     rt_pool_install();
     read_options(r);
+    if (wide_mode() != "off") wide_install(base, r.out_w, r.out_h);   // only an output wider than 16:9 installs anything
     if (!any_option(r)) return;
     r.sdk_fn = module_find_symbol(kGetScale);
     hle_register(kGetScale, get_current_graphics_scale);

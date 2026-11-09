@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <tuple>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -70,7 +71,9 @@ struct GfxEntry {
     std::shared_ptr<PipeUpgrade> up;
 };
 std::unordered_map<uint64_t, std::vector<GfxEntry>> g_gfx;
-std::map<std::pair<const ShaderInfo*, VkPipelineLayout>, VkPipeline> g_compute;
+// Compute pipelines by (shader, layout, integer samplers: set << 17 | binding << 1 | signed, see spirv_int_samplers; empty for the translated module).
+std::map<std::tuple<const ShaderInfo*, VkPipelineLayout, std::vector<uint32_t>>, VkPipeline> g_compute;
+std::map<std::pair<const ShaderInfo*, std::vector<uint32_t>>, VkShaderModule> g_int_samplers;   // their modules (null: could not be made)
 VkPipelineCache g_cache = VK_NULL_HANDLE;
 bool g_cache_tried = false;
 std::string g_cache_path;
@@ -780,12 +783,34 @@ VkPipeline graphics_pipeline(const GraphicsKey& key, const ProgLayout& layout) {
     return pipe;
 }
 
-VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgLayout& layout) {
+// The compute shader with the samplers in `ints` reading integer images (nvn_spirv_patch.h); null when the rewrite is not possible.
+static VkShaderModule int_sampler_module(const ShaderInfo* cs, const std::vector<SpvIntSampler>& ints, const std::vector<uint32_t>& key) {
+    std::lock_guard<std::recursive_mutex> lk(g_module_mu);
+    const auto k = std::make_pair(cs, key);
+    auto it = g_int_samplers.find(k);
+    if (it != g_int_samplers.end()) return it->second;
+    std::vector<uint32_t> patched;
+    VkShaderModule m = VK_NULL_HANDLE;
+    std::string desc;
+    for (const SpvIntSampler& s : ints) desc += " set " + std::to_string(s.set) + " binding " + std::to_string(s.binding) + (s.is_signed ? " (int)" : " (uint)");
+    if (spirv_int_samplers(cs->spirv, ints, patched)) {
+        m = create_module(patched, cs->hash.c_str());
+        NXLOG_I(kTag, "%s: integer sampler variant:%s", cs->hash.c_str(), desc.c_str());
+    } else {
+        NXLOG_W(kTag, "%s: the samplers%s read integer textures but could not be retyped; they get the dummy view", cs->hash.c_str(), desc.c_str());
+    }
+    g_int_samplers[k] = m;
+    return m;
+}
+
+VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgLayout& layout, const std::vector<SpvIntSampler>& ints) {
     ensure_cache();
-    const auto k = std::make_pair(cs, layout.layout);
+    std::vector<uint32_t> ikey;
+    for (const SpvIntSampler& s : ints) ikey.push_back(s.set << 17 | s.binding << 1 | (s.is_signed ? 1u : 0u));
+    const auto k = std::make_tuple(cs, layout.layout, ikey);
     auto it = g_compute.find(k);
     if (it != g_compute.end()) return it->second;
-    VkShaderModule m = shader_module(cs);
+    VkShaderModule m = ints.empty() ? shader_module(cs) : int_sampler_module(cs, ints, ikey);
     VkPipeline pipe = VK_NULL_HANDLE;
     if (m) {
         VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, ubo_robustness()};
@@ -943,6 +968,14 @@ VkDescriptorImageInfo pool_image(const TexturePool::Entry& e, VkImageViewType ty
     q.swizzle = {vk_swizzle(sw[0]), vk_swizzle(sw[1]), vk_swizzle(sw[2]), vk_swizzle(sw[3])};
     q.depth_aspect = dsmode == NVN_TEXTURE_DEPTH_STENCIL_MODE_DEPTH;
     q.component = 1;                            // the arrays are float images
+    // An 8- or 16-bit integer texture (the light probes' RGBA8UI cubes) has no float view with its bits, and no translated shader reads
+    // integers through the pool arrays (none bitcasts what it samples there): such ids stay the dummy, without a warning per texture.
+    if (tex_int_sampler_component(t, q.format)) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            NXLOG_I(kTag, "pool arrays: integer textures (texture %u, %s, first) stay the dummy in the float arrays", t->id, t->fmt->name);
+        return ii;
+    }
     if (VkImageView v = tex_sampled_view(t, q)) {
         ii.imageView = v;
         ii.imageLayout = tex_sampled_layout(t);
@@ -1426,6 +1459,9 @@ void pipeline_shutdown() {
     for (auto& [k, p] : g_compute)
         if (p) vkDestroyPipeline(d, p, nullptr);
     g_compute.clear();
+    for (auto& [k, m] : g_int_samplers)
+        if (m) vkDestroyShaderModule(d, m, nullptr);
+    g_int_samplers.clear();
     g_compute_keys.sub(g_compute_keys.get());
     g_layouts.clear();
     for (auto& [k, l] : g_shared_layouts) {          // the handles in g_layouts were copies of these

@@ -99,7 +99,14 @@ fn paths(cfg: &Config) -> Result<setup::Paths, String> {
         if cfg.dump_dir.trim().is_empty() { "Choose your game files first.".to_string() } else { format!("The game files at {} are not usable: {}", cfg.dump_dir, report.errors.join(" ")) }
     })?;
     let game_dir = game_dir_of(cfg, &repo);
-    Ok(setup::Paths { repo, exefs: PathBuf::from(chosen.exefs), romfs: PathBuf::from(chosen.romfs), game_dir, package: package_tools() })
+    Ok(setup::Paths {
+        repo,
+        exefs: PathBuf::from(chosen.exefs),
+        romfs: PathBuf::from(chosen.romfs),
+        dlc: report.dlc_dir.map(PathBuf::from),
+        game_dir,
+        package: package_tools(),
+    })
 }
 
 /// The supported builds of main: the package's dump_hashes.json, else the checkout's recomp/games/fefw/config.py.
@@ -416,6 +423,15 @@ fn open_game_dir(app: AppHandle) -> Result<(), String> {
     play::open_with_shell(&dir)
 }
 
+/// Opens <run folder>/mods ([fs] mods), creating it: RomFS mods go in mods/<name>/romfs.
+#[tauri::command]
+fn open_mods_dir(app: AppHandle) -> Result<(), String> {
+    let cfg = load_config(&app);
+    let dir = game_dir_of(&cfg, &need_repo(&cfg)?).join("mods");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    play::open_with_shell(&dir)
+}
+
 #[tauri::command]
 fn open_setup_log(app: AppHandle) -> Result<(), String> {
     let cfg = load_config(&app);
@@ -542,6 +558,7 @@ fn main() {
             game_status,
             open_game_file,
             open_game_dir,
+            open_mods_dir,
             open_setup_log,
             check_update,
             update_status,

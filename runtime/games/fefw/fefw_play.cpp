@@ -312,6 +312,7 @@ void set_clock_log(int period_s) {
 
 void play_remove() {
     State& s = st();
+    wide_remove();
     for (uint32_t* h : {&s.hook, &s.movie_select, &s.movie_count, &s.step_hook}) {
         if (*h) hook_remove(*h);
         *h = 0;

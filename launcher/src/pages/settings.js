@@ -3,25 +3,47 @@ import { api, esc, icon, refreshIcons, toast, errText } from '../util.js';
 /*
  * Settings schema. Every key is described in runtime/docs/CONFIG.md.
  *   file: "game" (fefw.ini), "controls" (controls.ini, written by the game on its first start) or "config" (the launcher's own options)
- * Types: select, toggle, size, autonum, range, path, text, number.
+ * Types: select, toggle, size, autonum, range, path, text, number. A toggle with `on` / `off` writes those words instead of 1 / 0 (`off`,
+ * 0, false or no read as off, anything else as on).
  */
 const SECTIONS = [
   {
     title: 'Picture', icon: 'monitor', file: 'game',
     fields: [
       { id: 'output', type: 'select', label: 'Output resolution', sec: 'fefw', key: 'output', def: 'console',
-        options: [['console', 'Console (docked 1440p)'], ['720p', '720p'], ['1080p', '1080p'], ['1440p', '1440p'], ['2160p', '2160p (4K)'], ['window', 'Window size at start']],
+        options: [['console', 'Console (docked 1440p)'], ['720p', '720p'], ['1080p', '1080p'], ['1440p', '1440p'], ['2160p', '2160p (4K)'],
+          ['2560x1080', '2560 x 1080 (21:9)'], ['3440x1440', '3440 x 1440 (21:9)'], ['5120x1440', '5120 x 1440 (32:9, drawn at 3840 x 1080)'], ['window', 'Window size at start']],
         hint: 'The size the game draws its picture, UI and effects at. Applies at the next start.' },
+      { id: 'ultrawide', type: 'toggle', label: 'Ultrawide', sec: 'fefw', key: 'ultrawide', def: 'auto', on: 'auto', off: 'off',
+        hint: 'With an output wider than 16:9 (a wide size above, or the window size at start in a wide window) the 3D view gets wider and the menus, HUD and movies stay in the centre at 16:9. Off stretches the 16:9 picture.' },
       { id: 'render_ratio', type: 'select', label: 'Render scale', sec: 'fefw', key: 'render_ratio', def: '0',
         options: [['0', "Game's own (50%)"], ['0.5', '50%'], ['0.67', '67%'], ['0.75', '75%'], ['1.0', '100% (native, sharpest)']],
         hint: '3D render size per side, as a share of the output. The upscaler fills in the rest.' },
       { id: 'upscaler', type: 'select', label: 'Upscaler', sec: 'dlss', key: 'upscaler', def: 'taau',
-        options: [['taau', 'Built-in temporal (TAAU)'], ['fsr3', 'AMD FSR 3.1 (needs its DLLs)'], ['bilinear', 'Bilinear (no history)'], ['auto', 'Automatic']],
-        hint: "Stands in for the console's DLSS. TAAU needs no extra files." },
+        options: [['taau', 'Built-in temporal (TAAU)'], ['dlss', 'NVIDIA DLSS (RTX; needs the Streamline files)'], ['fsr3', 'AMD FSR 3.1 (needs its DLLs)'], ['bilinear', 'Bilinear (no history)'], ['auto', 'Automatic (DLSS, else FSR 3, else TAAU)']],
+        hint: "Stands in for the console's DLSS. TAAU needs no extra files. DLSS and FSR 3 need their DLLs, and a change applies at the next start." },
+      { id: 'dlss_dll', type: 'path', label: 'DLSS (Streamline) folder', sec: 'upscale', key: 'dlss_dll', def: '', placeholder: 'upscalers/streamline next to the launcher',
+        hint: 'NVIDIA files, not included: sl.interposer.dll, sl.common.dll, sl.dlss.dll and nvngx_dlss.dll from the Streamline SDK. Leave empty for upscalers/streamline next to the launcher.' },
       { id: 'quality', type: 'select', label: 'Quality', sec: 'fefw', key: 'quality', def: 'console',
         options: [['console', 'As the console picks'], ['docked', 'Always docked quality']] },
       { id: 'shadow_size', type: 'select', label: 'Shadow map size', sec: 'fefw', key: 'shadow_size', def: '0',
         options: [['0', "Game's own"], ['2048', '2048'], ['4096', '4096'], ['8192', '8192']] },
+    ],
+  },
+  {
+    // [tweaks] language of controls.ini (runtime/docs/CONFIG.md). The names are the ones the runtime reads (services/common.cpp); the list is
+    // the languages the game ships (games/fefw/fefw_data.cpp). A [system] language in fefw.ini wins over this.
+    title: 'Language', icon: 'languages', file: 'controls',
+    fields: [
+      { id: 'language', type: 'select', label: 'Game language', sec: 'tweaks', key: 'language', def: 'auto',
+        options: [
+          ['auto', 'Automatic (Windows language)'],
+          ['AmericanEnglish', 'English (US)'], ['BritishEnglish', 'English (UK)'], ['Japanese', '日本語 (Japanese)'],
+          ['French', 'Français (French)'], ['CanadianFrench', 'Français (Canada)'], ['German', 'Deutsch (German)'], ['Italian', 'Italiano (Italian)'],
+          ['Spanish', 'Español (Spain)'], ['LatinAmericanSpanish', 'Español (Latin America)'], ['Korean', '한국어 (Korean)'],
+          ['SimplifiedChinese', '简体中文 (Simplified Chinese)'], ['TraditionalChinese', '繁體中文 (Traditional Chinese)'],
+        ],
+        hint: "The language of the game's text and voices. Automatic uses your Windows display language when the game has it, else English. Applies at the next start of the game." },
     ],
   },
   {
@@ -53,7 +75,8 @@ const SECTIONS = [
       { id: 'volume', type: 'range', label: 'Master volume', sec: 'audio', key: 'volume', def: '1.0' },
       { id: 'mute_unfocused', type: 'toggle', label: 'Mute when the window is in the background', sec: 'audio', key: 'mute_unfocused', def: '0' },
       { id: 'prompt_style', type: 'select', label: 'Button prompts', sec: 'prompts', key: 'style', def: 'auto',
-        options: [['auto', 'Automatic (last device used)'], ['switch', "Switch (the game's own)"], ['xbox', 'Xbox'], ['playstation', 'PlayStation'], ['keyboard', 'Keyboard and mouse']] },
+        options: [['auto', 'Automatic (last device used)'], ['switch', "Switch (the game's own)"], ['xbox', 'Xbox'], ['playstation', 'PlayStation'], ['keyboard', 'Keyboard and mouse']],
+        hint: 'Keyboard: WASD move, arrows or IJKL camera, Enter or Space A, Esc or Backspace B, R X, F Y, Q L, E R, Z ZL, C ZR, Tab +, M -, 1-4 d-pad. F1 > Controls lists them; change them in [bindings.all] of controls.ini.' },
     ],
   },
   {
@@ -90,7 +113,7 @@ export async function render(el, ctx) {
   // ----- model: one UI value per field -----
   const READ = {
     select: (f) => get(f, f.key, f.def),
-    toggle: (f) => truthy(get(f, f.key, f.def)),
+    toggle: (f) => (f.off !== undefined ? ![f.off, '0', 'false', 'no'].includes(String(get(f, f.key, f.def)).trim().toLowerCase()) : truthy(get(f, f.key, f.def))),
     size: (f) => ({ w: get(f, f.keys[0], f.def[0]), h: get(f, f.keys[1], f.def[1]) }),
     autonum: (f) => {
       const v = String(get(f, f.key, f.def));
@@ -103,7 +126,7 @@ export async function render(el, ctx) {
   };
   const WRITE = {
     select: (f, x) => [[f.sec, f.key, x]],
-    toggle: (f, x) => [[f.sec, f.key, x ? '1' : '0']],
+    toggle: (f, x) => [[f.sec, f.key, x ? (f.on ?? '1') : (f.off ?? '0')]],
     size: (f, x) => [
       [f.sec, f.keys[0], String(clamp(parseInt(x.w, 10) || 1280, 320, 16384))],
       [f.sec, f.keys[1], String(clamp(parseInt(x.h, 10) || 720, 320, 16384))],

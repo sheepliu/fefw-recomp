@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // NVIDIA DLSS Super Resolution / DLAA through Streamline (temporal.h). Streamline (MIT headers in third_party/nvidia_streamline) is loaded at
-// run time from sl.interposer.dll; its plugins (sl.common.dll, sl.dlss.dll) and nvngx_dlss.dll (NVIDIA RTX SDK licence, not bundled: the launcher downloads it) sit next to it
-// (release package: upscalers\streamline\).
+// run time from sl.interposer.dll; its plugins (sl.common.dll, sl.dlss.dll) and nvngx_dlss.dll sit next to it. None of NVIDIA's files is part of
+// this project: the player puts the four DLLs of NVIDIA's Streamline SDK (bin/x64) in upscalers\streamline\ next to the executable (the launcher's
+// folder in the release package), or in the run folder, or names their folder in [upscale] dlss_dll.
 // Nothing is linked. Streamline has to see vkCreateInstance / vkCreateDevice / the swapchain calls, so with DLSS or DLAA selected at start-up
 // the Vulkan loader functions come from its vkGetInstanceProcAddr (streamline_preinit, called by vk_device.cpp before volk is initialised).
 // Choosing DLSS later in the F1 page takes effect at the next start.
@@ -47,8 +48,12 @@ std::string narrow(const std::wstring& w) {
 }
 bool exists(const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
 
-// The folder holding sl.interposer.dll: [upscale] dlss_dll (a folder, or the path of sl.interposer.dll / any file in it); unset: the release
-// package's upscalers\streamline\ next to the executable when it holds sl.interposer.dll, else the executable's own folder.
+// The Streamline files a DLSS run needs (frame generation adds more, see streamline_preinit).
+constexpr const wchar_t* kRequired[] = {L"sl.interposer.dll", L"sl.common.dll", L"sl.dlss.dll", L"nvngx_dlss.dll"};
+
+// The folder holding sl.interposer.dll: [upscale] dlss_dll (a folder, or the path of sl.interposer.dll / any file in it); unset: the folder
+// upscalers\streamline next to the executable (the release package: next to the launcher), else the same in the run folder (the working directory), else the
+// executable's own folder.
 std::wstring sl_dir() {
     std::wstring p = widen(settings().upscale.dlss_dll);
     if (p.empty()) {
@@ -57,8 +62,15 @@ std::wstring sl_dir() {
         p.assign(buf, n);
         const size_t s = p.find_last_of(L"\\/");
         const std::wstring exe = s == std::wstring::npos ? std::wstring() : p.substr(0, s + 1);
-        const std::wstring pkg = exe + L"upscalers\\streamline\\";
-        return exists(pkg + L"sl.interposer.dll") ? pkg : exe;
+        wchar_t cwd[MAX_PATH];
+        const DWORD cn = GetCurrentDirectoryW(MAX_PATH, cwd);
+        std::wstring run(cwd, cn);
+        if (!run.empty() && run.back() != L'\\') run += L'\\';
+        for (const std::wstring& base : {exe, run}) {
+            const std::wstring pkg = base + L"upscalers\\streamline\\";
+            if (exists(pkg + L"sl.interposer.dll")) return pkg;
+        }
+        return exe;
     }
     const DWORD a = GetFileAttributesW(p.c_str());
     if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) return p.back() == L'\\' || p.back() == L'/' ? p : p + L"\\";
@@ -251,7 +263,9 @@ private:
 
 bool temporal_dlss_available() {
     const std::wstring dir = sl_dir();
-    return exists(dir + L"sl.interposer.dll") && exists(dir + L"sl.dlss.dll") && exists(dir + L"nvngx_dlss.dll");
+    for (const wchar_t* f : kRequired)
+        if (!exists(dir + f)) return false;
+    return true;
 }
 bool temporal_dlss_started() { return sl_state().started; }
 
@@ -275,9 +289,19 @@ PFN_vkGetInstanceProcAddr streamline_preinit() {
     const std::wstring dir = sl_dir();
     const std::wstring dll = dir + L"sl.interposer.dll";
     if (!exists(dll)) {
-        NXLOG_W(kTag, "DLSS selected but %s is missing: put the Streamline DLLs (sl.interposer.dll, sl.common.dll, sl.dlss.dll, nvngx_dlss.dll) there (the "
-                      "release package uses upscalers\\streamline) or name their folder in [upscale] dlss_dll", narrow(dll).c_str());
+        NXLOG_W(kTag, "DLSS selected but %s is missing: put the Streamline DLLs (sl.interposer.dll, sl.common.dll, sl.dlss.dll, nvngx_dlss.dll) in "
+                      "upscalers\\streamline next to the launcher, or name their folder in [upscale] dlss_dll", narrow(dll).c_str());
         return nullptr;
+    }
+    {
+        std::string missing;
+        for (const wchar_t* f : kRequired)
+            if (!exists(dir + f)) missing += (missing.empty() ? "" : ", ") + narrow(f);
+        if (!missing.empty()) {
+            NXLOG_W(kTag, "DLSS selected but %s lacks %s: copy all four Streamline files (sl.interposer.dll, sl.common.dll, sl.dlss.dll, nvngx_dlss.dll) "
+                          "there; the built-in upscaler is used", narrow(dir).c_str(), missing.c_str());
+            return nullptr;
+        }
     }
     if (!sl::security::verifyEmbeddedSignature(dll.c_str())) {
         NXLOG_E(kTag, "%s has no valid NVIDIA signature: not loaded", narrow(dll).c_str());

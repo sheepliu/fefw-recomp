@@ -93,12 +93,15 @@ pub fn apply(dir: &Path, edits: &[Edit]) -> Result<(), String> {
     Ok(())
 }
 
-/// The ini values setup owns: where the game code, the romfs, the shader cache and the texture cache are.
+/// The ini values setup owns: where the game code, the romfs, the dumped add-on content, the mods, the shader cache and the texture
+/// cache are. With no dlc/ in the dump, [aoc] dir is empty: no add-on content.
 fn owned(p: &Paths) -> Vec<(&'static str, &'static str, String)> {
     vec![
         ("fs", "exefs", crate::dump::fwd(&p.plain_exefs())),
         ("fs", "main", p.runtime_main()),
         ("fs", "romfs", crate::dump::fwd(&p.romfs)),
+        ("fs", "mods", crate::dump::fwd(&p.mods())),
+        ("aoc", "dir", p.dlc.as_deref().map(crate::dump::fwd).unwrap_or_default()),
         ("nvn", "shader_cache", crate::dump::fwd(&p.spirv())),
         ("nvn", "bc7_cache", crate::dump::fwd(&p.bc7())),
     ]
@@ -114,9 +117,10 @@ pub fn ensure_play_paths(dir: &Path, p: &Paths) -> Result<(), String> {
     let path = dir.join(GAME_INI);
     let new = !path.exists();
     let mut ini = load(&path).unwrap_or_else(|| {
-        Ini::parse("; fefw.ini: settings of fefw.exe. Every key is described in runtime/docs/CONFIG.md. The launcher writes [fs] and [nvn] paths.\n")
+        Ini::parse("; fefw.ini: settings of fefw.exe. Every key is described in runtime/docs/CONFIG.md. The launcher writes [fs], [aoc] and [nvn] paths.\n")
     });
     let mut changed = new;
+    let _ = fs::create_dir_all(p.mods());
     for (s, k, v) in owned(p) {
         if ini.get(s, k).unwrap_or_default().replace('\\', "/") != v {
             ini.set(s, k, &v);

@@ -63,15 +63,20 @@ export async function render(el, ctx) {
           <dl class="kv">
             <dt>Game files</dt>
             <dd>${chosen ? `${chosen.kind === 'update' ? 'Update ' + esc(chosen.version) : chosen.kind === 'base' ? 'Base game' : 'Folder'}<div class="path">${esc(chosen.path)}</div>` : '<span class="faint">not set</span>'}</dd>
+            <dt>DLC</dt>
+            <dd>${report && report.dlc && report.dlc.length ? `${report.dlc.length} add-on${report.dlc.length === 1 ? '' : 's'} from your dump<div class="path">${esc(report.dlc_dir)}</div>` : '<span class="faint">none in your dump (dlc/&lt;title id&gt;/romfs)</span>'}</dd>
             <dt>Setup</dt>
             <dd>${setup && setup.complete ? 'complete' : `<span class="faint">${left.length ? 'to do: ' + esc(left.join(', ')) : 'not started'}</span>`}</dd>
             <dt>fefw.exe</dt>
             <dd>${ov.exe_exists ? 'built' : '<span class="faint">not built yet</span>'}<div class="path">${esc(ov.exe)}</div></dd>
             <dt>Run folder</dt>
             <dd><span class="faint">fefw.ini, controls.ini, fefw.log and save/</span><div class="path">${esc(ov.game_dir)}</div></dd>
+            <dt>Mods</dt>
+            <dd><span class="faint">RomFS mods in mods/&lt;name&gt;/romfs, the layout emulators use. A name starting with - or _ turns a mod off; when two mods change the same file, the name sorted last wins. ExeFS (code) patches do not apply.</span></dd>
           </dl>
           <div class="row" style="margin-top: var(--space-4)">
             <button class="btn" id="open-dir" ${ov.repo_ok ? '' : 'disabled'}>${icon('folder-open')}Open run folder</button>
+            <button class="btn" id="open-mods" ${ov.repo_ok ? '' : 'disabled'}>${icon('package')}Open mods folder</button>
           </div>
         </div>
         <p class="faint">In the game: F1 opens the runtime's settings overlay. Settings here edit fefw.ini and controls.ini and apply at the next start.</p>
@@ -80,6 +85,7 @@ export async function render(el, ctx) {
     el.querySelector('#play')?.addEventListener('click', () => api('play').catch((e) => toast(errText(e), 'error')));
     el.querySelector('#to-setup')?.addEventListener('click', () => ctx.go('setup'));
     el.querySelector('#open-dir')?.addEventListener('click', () => api('open_game_dir').catch((e) => toast(errText(e), 'error')));
+    el.querySelector('#open-mods')?.addEventListener('click', () => api('open_mods_dir').catch((e) => toast(errText(e), 'error')));
     el.querySelectorAll('[data-open]').forEach((b) =>
       b.addEventListener('click', () => api('open_game_file', { name: b.dataset.open }).catch((e) => toast(errText(e), 'error'))),
     );

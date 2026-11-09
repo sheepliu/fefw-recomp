@@ -72,10 +72,12 @@ set_target_properties(nxrt_volk PROPERTIES C_STANDARD 11)
 add_library(nxrt_vma INTERFACE)
 target_include_directories(nxrt_vma SYSTEM INTERFACE "${vma_SOURCE_DIR}/include")
 
+include("${CMAKE_CURRENT_LIST_DIR}/imgui_checked.cmake")
+
 # Dear ImGui core + its Vulkan backend (the platform side is fed from the nxrt input queue, so no SDL backend).
 add_library(nxrt_imgui STATIC
     "${imgui_SOURCE_DIR}/imgui.cpp" "${imgui_SOURCE_DIR}/imgui_draw.cpp" "${imgui_SOURCE_DIR}/imgui_tables.cpp"
-    "${imgui_SOURCE_DIR}/imgui_widgets.cpp" "${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp")
+    "${imgui_SOURCE_DIR}/imgui_widgets.cpp" "${CMAKE_CURRENT_BINARY_DIR}/imgui_impl_vulkan_checked.cpp")
 target_include_directories(nxrt_imgui SYSTEM PUBLIC "${imgui_SOURCE_DIR}" "${imgui_SOURCE_DIR}/backends")
 target_compile_definitions(nxrt_imgui PUBLIC IMGUI_IMPL_VULKAN_USE_VOLK)
 target_link_libraries(nxrt_imgui PUBLIC nxrt_volk)

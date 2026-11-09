@@ -14,8 +14,9 @@ software and draws with Vulkan. It is not an emulator.
 
 - Runs natively on Windows, with no emulator in between
 - 60 or 120 FPS modes, any output resolution, render scale and a temporal upscaler
+- Ultrawide (21:9, 32:9 or any wider shape): a wider view with the menus and HUD kept at 16:9 in the centre
 - Windowed, borderless or fullscreen
-- Keyboard and mouse or any controller, with matching button prompts
+- Keyboard or any controller, with matching button prompts
 - An in-game settings overlay (**F1**)
 - A launcher that sets everything up from your dump, with nothing else to install
 
@@ -52,10 +53,82 @@ patch also requires a rebuild. The original game dump is not modified. The curre
 patches only; supported runtime packages appear in the in-game F1 Mods tab after restarting the game. Runtime packages
 require a matching game runtime implementation; a manifest alone does not execute arbitrary code. See
 [tools/mods/README.md](tools/mods/README.md) for the manifest format, validation limits and checkout build layout.
+### Game language
+
+**Settings > Language** (or **F1 > Game**) picks the language of the game's text and voices: Japanese, English (US or UK), French,
+German, Italian, Spanish, Korean and Chinese (Simplified or Traditional). *Automatic*, the default, follows your Windows display
+language and uses English when the game has no translation for it. The change applies the next time the game starts.
+
+### DLSS (NVIDIA RTX only)
+
+NVIDIA's files cannot be shipped here, so DLSS stays off until you add them. Take them from NVIDIA's
+[Streamline SDK](https://github.com/NVIDIAGameWorks/Streamline) (v2.x, the `bin/x64` folder of the release, not the development one) and
+put these four files in a folder named `upscalers\streamline` next to `fefw-launcher.exe`:
+
+```
+sl.interposer.dll   sl.common.dll   sl.dlss.dll   nvngx_dlss.dll
+```
+
+Then choose **DLSS** (or **Automatic**, which picks DLSS when the files and an RTX GPU are there) as the Upscaler in **Settings**, and
+restart the game. `fefw.log` says `Streamline ... started` and `DLSS (Streamline)` when it works. The folder can be somewhere else:
+set it under **Settings > Picture > DLSS (Streamline) folder**.
+
+### Keyboard and controller
+
+Any controller works, and so does the keyboard, with no setup. The button prompts in the game follow the one you used last: press a
+key and they show keys, touch the controller and they show its buttons. The keyboard drives the Switch buttons the game knows:
+
+| Keys | Switch | |
+|---|---|---|
+| W A S D | Left stick | Move |
+| Arrow keys, I J K L | Right stick | Camera |
+| Enter, Space | A | Confirm |
+| Esc, Backspace | B | Back |
+| R | X | |
+| F | Y | |
+| Q / E | L / R | E: dash in town |
+| Z / C | ZL / ZR | C: map in town |
+| Tab | + | Menu |
+| M | - | |
+| 1 2 3 4, or numpad 8 2 4 6 | D-pad up, down, left, right | |
+| V / B | Left / right stick click | |
+
+The movement keys push the stick all the way. **F1** (settings), **F2** (frame rate counter) and **Alt+Enter** (full screen) are
+the runtime's own keys. **F1 > Controls** lists the keys as they are now.
+
+To change a key, close the game and edit `[bindings.all]` in `controls.ini` in the run folder (the game creates it on its first
+start). Each line is `key = action`:
+
+```
+[bindings.all]
+W = move_forward
+Return = btn_a
+G = btn_x
+X = none
+```
+
+Left side: a key name (`Return`, `Space`, `Left Shift`, `Up`, `Keypad 8` ...). Right side: `move_*`, `look_*`, `dpad_*`, `btn_a`,
+`btn_b`, `btn_x`, `btn_y`, `btn_l`, `btn_r`, `btn_zl`, `btn_zr`, `btn_plus`, `btn_minus`, `btn_lstick`, `btn_rstick`, or `none` to
+switch a key off. An older `controls.ini` gets the keys above added at the next start (only keys you have not bound yourself; the
+old file is kept as `controls.ini.bak`). To go back to the default keys, delete the `[bindings.*]` sections. Controller options (stick dead zones,
+button mapping, prompts) are under **Settings** and **F1 > Controls**.
+
+### DLC
+
+DLC is used when you dump it from your own copy, like the game. Put each add-on in `dlc\<title id>\romfs` of your dump folder (next
+to `exefs\` and `romfs\`, or next to `base\` and `updates\`). A `.nup` with add-ons is unpacked that way on its own. The **Play**
+page lists the DLC it found.
+
+### RomFS mods
+
+RomFS mods go in the `mods\` folder next to the launcher (**Play** > **Open mods folder**), in the layout emulators use:
+`mods\<mod name>\romfs\...`. Files in a mod replace the game's files at the same path. If two mods change the same file, the mod
+whose name sorts last wins, so you can name them `01-...` and `02-...`. Rename a mod to start with `-` or `_` to turn it off.
+ExeFS patches and compatible runtime packages are managed separately through the launcher's **Mods** page and F1 Mods tab above.
 
 ### Updating to a new release
 
-Extract the new zip to a new folder, copy your `save\` folder into it, and run **Set up** again.
+Extract the new zip to a new folder, copy your `save\` folder (and `mods\`, if you use mods) into it, and run **Set up** again.
 
 ## Troubleshooting
 
@@ -84,9 +157,13 @@ This project stands on the work of others. Thank you.
 - [drakolordx7/switch2-recomp](https://github.com/drakolordx7/switch2-recomp): the launcher design this launcher follows.
 - [nxnative-penis6](https://git.eden-emu.dev/penis6/nxnative-penis6) by seedds (MIT): the movie decoder front end, its dav1d copy and
   several hardware facts (notices in `runtime/THIRD_PARTY_NOTICES.md`).
+- [Kompas9's Switch-Game-Patches](https://github.com/Kompas9/Switch-Game-Patches) (MIT): the Fortune's Weave ultrawide patch, whose sites and
+  findings `[fefw] ultrawide` re-implements as runtime hooks.
 - [Ryujinx / Ryubing](https://git.ryujinx.app/ryubing/ryujinx) (MIT): the shader translator and tiling code; [Mesa](https://gitlab.freedesktop.org/mesa/mesa) NAK (MIT).
 - SuperMarioWonderRecomp (MIT); smo-recomp, ScarletNX and ssbu-recomp (GPL-3.0); [yuzu and Eden](https://git.eden-emu.dev/eden-emu/eden)
   (GPL); libnx (ISC); LLVM libc++abi (Apache-2.0 with LLVM exceptions).
+- [Hookshot](https://github.com/NotRexed/Hookshot) (GPL-3.0) and SkyboundTotk: the RomFS mod folder layout and rules followed here, so
+  mods work the same in both.
 - [zbic](https://github.com/kinnay/zbic) by Yannik Marchand (GPLv2; installed by pip at setup, not included here): ZBIC decompression.
 - [dav1d](https://code.videolan.org/videolan/dav1d) (BSD-2-Clause), [libvpx](https://chromium.googlesource.com/webm/libvpx) (BSD-3-Clause),
   [Zstandard](https://github.com/facebook/zstd) (BSD), [SDL3](https://github.com/libsdl-org/SDL) (zlib), volk, VulkanMemoryAllocator, Dear ImGui (MIT),

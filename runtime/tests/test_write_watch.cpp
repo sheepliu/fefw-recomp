@@ -229,3 +229,66 @@ NXTEST(writers_race_for_the_same_armed_pages) {
     CHECK(ww::faults() > faults0);
     teardown(r);
 }
+
+// More live pools than the old 512-entry cap, including faults and mapping changes
+// in later blocks. Repeat with holes so destruction/recreation exercises slot reuse.
+NXTEST(region_table_grows_and_reuses_slots) {
+    mem::shutdown();
+    REQUIRE(mem::init() && mem::heap_create(kHeap));
+    constexpr size_t count = 1537;
+    REQUIRE(mem::heap_commit(0, count * kPg));
+    std::vector<ww::Region*> regions(count);
+    for (size_t round = 0; round < 2; ++round) {
+        for (size_t i = 0; i < count; ++i) {
+            if (regions[i]) continue;
+            regions[i] = ww::region_create(mem::kHeapBase + i * kPg, kPg);
+            REQUIRE(regions[i] != nullptr);
+        }
+        for (size_t i = 0; i < count; ++i) {
+            CHECK(ww::arm(regions[i], 0, 1));
+            *reinterpret_cast<volatile uint32_t*>(mem::kHeapBase + i * kPg) = static_cast<uint32_t>(i);
+            CHECK(!ww::page_valid(regions[i], 0));
+            std::vector<uint64_t> written;
+            ww::take_written(regions[i], written);
+            CHECK(written.size() == 1 && written[0] == 0);
+            CHECK(ww::arm(regions[i], 0, 1));
+        }
+        // Mapping changes must invalidate every block, not just the first 512.
+        ww::forget(mem::kHeapBase, count * kPg, false);
+        for (size_t i = 0; i < count; ++i) CHECK(!ww::page_valid(regions[i], 0));
+        for (size_t i = 0; i < count; i += 2) {
+            ww::region_destroy(regions[i]);
+            regions[i] = nullptr;
+        }
+    }
+    for (auto* r : regions) ww::region_destroy(r);
+    mem::shutdown();
+}
+
+NXTEST(region_table_growth_while_faulting) {
+    ww::Region* r = setup();
+    REQUIRE(r != nullptr);
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> writes{0};
+    std::thread writer([&] {
+        while (!stop.load()) {
+            *reinterpret_cast<volatile uint32_t*>(mem::kHeapBase) = 42;
+            writes.fetch_add(1);
+        }
+    });
+    // Region creation and destruction race with faults on a separate, stable page.
+    std::vector<ww::Region*> regions;
+    for (size_t i = 0; i < 2305; ++i) {
+        regions.push_back(ww::region_create(mem::kHeapBase + kPg, kPg));
+        CHECK(regions.back() != nullptr);
+        ww::arm(r, 0, 1);
+    }
+    for (auto* region : regions) {
+        ww::region_destroy(region);
+        ww::arm(r, 0, 1);
+    }
+    stop.store(true);
+    writer.join();
+    CHECK(writes.load() != 0);
+    teardown(r);
+}

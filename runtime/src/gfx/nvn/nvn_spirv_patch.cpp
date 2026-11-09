@@ -866,3 +866,183 @@ bool spirv_init_outputs(const std::vector<uint32_t>& in, std::vector<uint32_t>& 
 }
 
 }  // namespace nxrt::nvn::be::gpu
+
+namespace nxrt::nvn::be::gpu {
+
+bool spirv_int_samplers(const std::vector<uint32_t>& in, const std::vector<SpvIntSampler>& slots, std::vector<uint32_t>& out) {
+    enum : uint32_t { OpTypeIntOp = 21, OpTypeFloatOp = 22, OpTypeVectorOp = 23, OpTypeImageOp = 25, OpTypeSampledImageOp = 27,
+                      OpTypePointerOp = 32, OpFunctionOp = 54, OpVariableOp = 59, OpLoadOp = 61, OpDecorateOp = 71,
+                      OpImageSampleImplicitLodOp = 87, OpImageSampleExplicitLodOp = 88, OpImageSampleProjImplicitLodOp = 91,
+                      OpImageSampleProjExplicitLodOp = 92, OpImageFetchOp = 95, OpImageGatherOp = 96, OpImageOp = 100,
+                      OpImageQuerySizeLodOp = 103, OpImageQuerySizeOp = 104, OpImageQueryLodOp = 105, OpImageQueryLevelsOp = 106,
+                      OpImageQuerySamplesOp = 107, OpBitcastOp = 124, DecBinding = 33, DecDescriptorSet = 34, StorageUniformConstant = 0 };
+    if (slots.empty() || in.size() < 5) return false;
+    std::vector<Inst> insts;
+    for (size_t i = 5; i < in.size();) {
+        const uint32_t len = in[i] >> 16;
+        if (!len || i + len > in.size()) return false;
+        insts.push_back({i, in[i] & 0xffff, len});
+        i += len;
+    }
+    uint32_t bound = in[3];
+    uint32_t f32 = 0, int_type[2] = {0, 0};                        // [0] uint, [1] int (32-bit)
+    std::map<uint32_t, uint32_t> set_of, binding_of, sampled_of, ptr_pointee, var_ptr;
+    std::map<uint32_t, std::vector<uint32_t>> image_words;         // OpTypeImage id -> its operands after the result id
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t> vec_of;      // (component type, count) -> vector type
+    std::map<uint32_t, std::pair<uint32_t, uint32_t>> vec_parts;   // vector type -> (component type, count)
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t> ptr_of;      // (storage, pointee) -> pointer type
+    size_t first_function = 0;
+    for (const Inst& n : insts) {
+        const uint32_t* w = &in[n.at];
+        if (n.op == OpFunctionOp) { if (!first_function) first_function = n.at; continue; }
+        if (first_function) continue;
+        if (n.op == OpDecorateOp && n.len >= 4 && w[2] == DecDescriptorSet) set_of[w[1]] = w[3];
+        else if (n.op == OpDecorateOp && n.len >= 4 && w[2] == DecBinding) binding_of[w[1]] = w[3];
+        else if (n.op == OpTypeFloatOp && n.len >= 3 && w[2] == 32) f32 = w[1];
+        else if (n.op == OpTypeIntOp && n.len == 4 && w[2] == 32) int_type[w[3] ? 1 : 0] = w[1];
+        else if (n.op == OpTypeVectorOp && n.len == 4) { vec_of[{w[2], w[3]}] = w[1]; vec_parts[w[1]] = {w[2], w[3]}; }
+        else if (n.op == OpTypeImageOp && n.len >= 9) image_words[w[1]] = std::vector<uint32_t>(w + 2, w + n.len);
+        else if (n.op == OpTypeSampledImageOp && n.len == 3) sampled_of[w[1]] = w[2];
+        else if (n.op == OpTypePointerOp && n.len == 4) { ptr_pointee[w[1]] = w[3]; ptr_of.emplace(std::make_pair(w[2], w[3]), w[1]); }
+        else if (n.op == OpVariableOp && n.len >= 4 && w[3] == StorageUniformConstant) var_ptr[w[2]] = w[1];
+    }
+    if (!f32 || !first_function) return false;
+
+    // New declarations go right before the first function: every existing type is declared by then, and the variables that change move
+    // there behind their new types. SPIR-V allows no second OpTypeInt / OpTypeVector / OpTypeImage / OpTypeSampledImage with the same
+    // operands, so the existing ones are taken when they exist.
+    std::vector<uint32_t> decls;
+    auto scalar_for = [&](int sign) -> uint32_t {
+        if (!int_type[sign]) {
+            int_type[sign] = bound++;
+            decls.insert(decls.end(), {(4u << 16) | OpTypeIntOp, int_type[sign], 32u, static_cast<uint32_t>(sign)});
+        }
+        return int_type[sign];
+    };
+    auto vec_for = [&](uint32_t comp, uint32_t count) -> uint32_t {
+        auto it = vec_of.find({comp, count});
+        if (it != vec_of.end()) return it->second;
+        const uint32_t id = bound++;
+        decls.insert(decls.end(), {(4u << 16) | OpTypeVectorOp, id, comp, count});
+        vec_of[{comp, count}] = id;
+        vec_parts[id] = {comp, count};
+        return id;
+    };
+    auto image_for = [&](const std::vector<uint32_t>& ops) -> uint32_t {
+        for (const auto& [id, o] : image_words) if (o == ops) return id;
+        const uint32_t id = bound++;
+        decls.push_back(((static_cast<uint32_t>(ops.size()) + 2u) << 16) | OpTypeImageOp);
+        decls.push_back(id);
+        decls.insert(decls.end(), ops.begin(), ops.end());
+        image_words[id] = ops;
+        return id;
+    };
+    auto sampled_for = [&](uint32_t image) -> uint32_t {
+        for (const auto& [id, img] : sampled_of) if (img == image) return id;
+        const uint32_t id = bound++;
+        decls.insert(decls.end(), {(3u << 16) | OpTypeSampledImageOp, id, image});
+        sampled_of[id] = image;
+        return id;
+    };
+    auto ptr_for = [&](uint32_t pointee) -> uint32_t {
+        auto it = ptr_of.find({StorageUniformConstant, pointee});
+        if (it != ptr_of.end()) return it->second;
+        const uint32_t id = bound++;
+        decls.insert(decls.end(), {(4u << 16) | OpTypePointerOp, id, StorageUniformConstant, pointee});
+        ptr_of[{StorageUniformConstant, pointee}] = id;
+        return id;
+    };
+
+    struct Work { uint32_t new_si, new_img; int sign; };
+    std::map<uint32_t, Work> work;                                 // by variable
+    for (const SpvIntSampler& sl : slots) {
+        uint32_t var = 0;
+        for (const auto& [v, p] : var_ptr)
+            if (set_of.count(v) && binding_of.count(v) && set_of[v] == sl.set && binding_of[v] == sl.binding) var = v;
+        if (!var || work.count(var) || !ptr_pointee.count(var_ptr[var])) return false;
+        const uint32_t si = ptr_pointee[var_ptr[var]];
+        if (!sampled_of.count(si)) return false;                   // an array of samplers, a storage image, ...: not handled
+        auto iw = image_words.find(sampled_of[si]);
+        // OpTypeImage operands: sampled type, Dim, Depth, Arrayed, MS, Sampled, format. A float, non-depth, sampled image only.
+        if (iw == image_words.end() || iw->second.size() < 7 || iw->second[0] != f32 || iw->second[2] == 1 || iw->second[5] != 1) return false;
+        const int sign = sl.is_signed ? 1 : 0;
+        std::vector<uint32_t> ops = iw->second;
+        ops[0] = scalar_for(sign);
+        const uint32_t new_img = image_for(ops);
+        work[var] = {sampled_for(new_img), new_img, sign};
+    }
+    std::vector<uint32_t> var_decls;
+    for (const auto& [var, wk] : work) var_decls.insert(var_decls.end(), {(4u << 16) | OpVariableOp, ptr_for(wk.new_si), var, StorageUniformConstant});
+
+    // The function bodies: loads of the variables get the new sampled image type, OpImage of those the new image type; each sample,
+    // gather and fetch through them returns the integer vector, and an OpBitcast hands the shader the same bits in the float vector it
+    // declared (the console's registers hold the integer texel bits). Any other use of these ids: not handled, the module is left alone.
+    std::map<uint32_t, const Work*> vars, loaded, images;          // variable / loaded sampled image / OpImage result -> its work
+    for (const auto& [var, wk] : work) vars[var] = &wk;
+    struct Edit { uint32_t new_type = 0, new_result = 0, cast_type = 0; };
+    std::map<size_t, Edit> edits;                                  // by instruction position
+    auto mentions = [&](const uint32_t* w, uint32_t len, const std::map<uint32_t, const Work*>& ids, uint32_t from) {
+        for (uint32_t k = from; k < len; ++k) if (ids.count(w[k])) return true;
+        return false;
+    };
+    for (const Inst& n : insts) {
+        if (n.at < first_function) continue;
+        const uint32_t* w = &in[n.at];
+        if (n.op == OpLoadOp && n.len >= 4 && vars.count(w[3])) {
+            loaded[w[2]] = vars[w[3]];
+            edits[n.at].new_type = vars[w[3]]->new_si;
+            continue;
+        }
+        if (n.op == OpImageOp && n.len == 4 && loaded.count(w[3])) {
+            images[w[2]] = loaded[w[3]];
+            edits[n.at].new_type = loaded[w[3]]->new_img;
+            continue;
+        }
+        const bool sample = n.op == OpImageSampleImplicitLodOp || n.op == OpImageSampleExplicitLodOp || n.op == OpImageSampleProjImplicitLodOp ||
+                            n.op == OpImageSampleProjExplicitLodOp || n.op == OpImageGatherOp;
+        const Work* wk = nullptr;
+        if (sample && n.len >= 5 && loaded.count(w[3])) wk = loaded[w[3]];
+        else if (n.op == OpImageFetchOp && n.len >= 5 && images.count(w[3])) wk = images[w[3]];
+        if (wk) {
+            auto vp = vec_parts.find(w[1]);
+            if (vp == vec_parts.end() || vp->second.first != f32) return false;
+            if (mentions(w, n.len, loaded, 4) || mentions(w, n.len, images, 4) || mentions(w, n.len, vars, 1)) return false;
+            Edit& e = edits[n.at];
+            e.new_type = vec_for(int_type[wk->sign], vp->second.second);
+            e.new_result = bound++;
+            e.cast_type = w[1];
+            continue;
+        }
+        const bool query = n.op == OpImageQuerySizeLodOp || n.op == OpImageQuerySizeOp || n.op == OpImageQueryLodOp || n.op == OpImageQueryLevelsOp ||
+                           n.op == OpImageQuerySamplesOp;
+        if (query && n.len >= 4 && (loaded.count(w[3]) || images.count(w[3])) && !mentions(w, n.len, loaded, 4) && !mentions(w, n.len, images, 4)) continue;
+        // a use the rewrite does not know (OpCopyObject, OpPhi, a function argument, a depth-compare sample, ...)
+        if (mentions(w, n.len, vars, 1) || mentions(w, n.len, loaded, 1) || mentions(w, n.len, images, 1)) return false;
+    }
+    if (edits.empty()) return false;
+
+    out.clear();
+    out.reserve(in.size() + decls.size() + var_decls.size() + 4 * edits.size());
+    out.insert(out.end(), in.begin(), in.begin() + 5);
+    for (const Inst& n : insts) {
+        const uint32_t* w = &in[n.at];
+        if (n.at == first_function) {
+            out.insert(out.end(), decls.begin(), decls.end());
+            out.insert(out.end(), var_decls.begin(), var_decls.end());
+        }
+        if (n.at < first_function && n.op == OpVariableOp && n.len >= 4 && work.count(w[2])) continue;   // declared again above
+        const size_t start = out.size();
+        out.insert(out.end(), w, w + n.len);
+        auto e = edits.find(n.at);
+        if (e == edits.end()) continue;
+        out[start + 1] = e->second.new_type;
+        if (e->second.new_result) {
+            out[start + 2] = e->second.new_result;
+            out.insert(out.end(), {(4u << 16) | OpBitcastOp, e->second.cast_type, w[2], e->second.new_result});
+        }
+    }
+    out[3] = bound;
+    return true;
+}
+
+}  // namespace nxrt::nvn::be::gpu

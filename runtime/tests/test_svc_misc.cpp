@@ -2,6 +2,8 @@
 // Small services of the title's Service Access Control list (S3c): csrng, ldr:ro, mm:u, hwopus, aoc:u, caps:u, mii:u, irs,
 // nfc:user, nfp:user, ectx:aw, banana, htc, htcs. Request bytes and expected results are written out from Switchbrew (command tables
 // and the Error_codes page), not read from the implementation.
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <vector>
 #include <windows.h>
@@ -99,6 +101,7 @@ NXTEST(misc_hwopus_size_and_refusal) {
 NXTEST(misc_aoc_base_id_and_empty_list) {
     nxsvc::Env env;
     config_clear();
+    config_set("aoc", "dir", "nxrt_test_no_such_dlc_folder");
     services::profile_reload();
     nxsvc::Session s = nxsvc::connect("aoc:u");
     REQUIRE(s.valid());
@@ -114,6 +117,53 @@ NXTEST(misc_aoc_base_id_and_empty_list) {
     nxsvc::Reply ev = s.call(8);
     CHECK(ev.ok());
     CHECK_EQ(ev.copy.size(), 1u);
+    config_clear();
+    services::profile_reload();
+}
+
+NXTEST(misc_aoc_lists_supplied_dlc) {
+    nxsvc::Env env;
+    config_clear();
+    services::profile_reload();
+    const uint64_t base = services::profile().program_id + 0x1000ull;
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("nxrt_aoc_" + std::to_string(GetCurrentProcessId()));
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    char name[17];
+    auto id_dir = [&](uint64_t id) {
+        std::snprintf(name, sizeof name, "%016llX", static_cast<unsigned long long>(id));
+        return dir / name;
+    };
+    std::filesystem::create_directories(id_dir(base + 2) / "romfs", ec);        // "<id>/romfs"
+    std::filesystem::create_directories(id_dir(base + 1) / "0" / "romfs", ec);  // "<id>/<n>/romfs"
+    std::filesystem::create_directories(id_dir(base + 3), ec);                  // no romfs/: not installed
+    std::filesystem::create_directories(id_dir(base) / "romfs", ec);            // the base id itself is not an add-on
+    std::filesystem::create_directories(id_dir(base + 0x10000) / "romfs", ec);  // another title's add-on
+    std::filesystem::create_directories(dir / "notes" / "romfs", ec);
+    config_set("aoc", "dir", dir.string().c_str());
+    nxsvc::Session s = nxsvc::connect("aoc:u");
+    REQUIRE(s.valid());
+    nxsvc::Reply cnt = s.call(2, nxsvc::Args().with_pid());
+    REQUIRE(cnt.ok());
+    CHECK_EQ(cnt.get<int32_t>(0), 2);
+    // ListAddOnContent (cmd 3): u32 offset, u32 count, PID-descriptor; output buffer of u32 indices, sorted.
+    uint32_t idx[4];
+    std::memset(idx, 0xEE, sizeof idx);
+    nxsvc::Reply list = s.call(3, nxsvc::Args().with_pid().u32(0).u32(4).buf_b(idx, sizeof idx));
+    REQUIRE(list.ok());
+    CHECK_EQ(list.get<int32_t>(0), 2);
+    CHECK_EQ(idx[0], 1u);
+    CHECK_EQ(idx[1], 2u);
+    CHECK_EQ(idx[2], 0u);
+    // from offset 1, at most 1
+    list = s.call(3, nxsvc::Args().with_pid().u32(1).u32(1).buf_b(idx, sizeof idx));
+    REQUIRE(list.ok());
+    CHECK_EQ(list.get<int32_t>(0), 1);
+    CHECK_EQ(idx[0], 2u);
+    // CountAddOnContentByApplicationId (cmd 0): only this title's application id counts.
+    CHECK_EQ(s.call(0, nxsvc::Args().u64(services::profile().program_id)).get<int32_t>(0), 2);
+    CHECK_EQ(s.call(0, nxsvc::Args().u64(services::profile().program_id + 0x10000)).get<int32_t>(0), 0);
+    std::filesystem::remove_all(dir, ec);
     config_clear();
     services::profile_reload();
 }

@@ -562,6 +562,27 @@ NXTEST(initialize_getters_and_finalize) {
     a.finalize(&tex);             // a second finalize does nothing
 }
 
+NXTEST(downsample_chain_keeps_nonzero_storage) {
+    setup();
+    Api a;
+    Pool pool(1 << 16);
+    // A low-resolution post-effect chain reaches 1x0 before its fixed final pass.
+    // The allocation query and the initialized texture must describe the same 1x1 image.
+    for (int height : {0, 1}) {
+        NVNtextureBuilder bld;
+        NVNtexture tex{};
+        build(a, bld, pool, NVN_TEXTURE_TARGET_2D, 1, height, 1, 1, NVN_FORMAT_RGBA8);
+        const size_t bytes = a.bget_size(&bld);
+        CHECK(bytes > 0);
+        CHECK(a.bget_align(&bld) > 0);
+        CHECK_EQ(a.init(&tex, &bld), 1);
+        CHECK_EQ(a.width(&tex), 1);
+        CHECK_EQ(a.height(&tex), 1);
+        CHECK_EQ(static_cast<size_t>(a.storage_size(&tex)), bytes);
+        a.finalize(&tex);
+    }
+}
+
 NXTEST(initialize_rejects_bad_builders) {
     setup();
     Api a;

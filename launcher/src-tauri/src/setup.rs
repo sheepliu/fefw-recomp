@@ -49,6 +49,8 @@ pub struct Paths {
     pub repo: PathBuf,
     pub exefs: PathBuf,
     pub romfs: PathBuf,
+    /// the dump's dlc/ folder (add-on content the player dumped), when it holds any
+    pub dlc: Option<PathBuf>,
     pub game_dir: PathBuf,
     /// the release package's tools/ folder (tools/build/fefw_build.py next to the launcher); None in a checkout
     pub package: Option<PathBuf>,
@@ -69,6 +71,10 @@ impl Paths {
             Some(_) => self.in_game(&["exefs"]),
             None => self.repo.join("game").join("dump").join("exefs"),
         }
+    }
+    /// RomFS mods ([fs] mods): <run folder>/mods/<name>/romfs
+    pub fn mods(&self) -> PathBuf {
+        self.in_game(&["mods"])
     }
     pub fn libs(&self) -> PathBuf {
         self.repo.join("work").join("build").join("fefw")

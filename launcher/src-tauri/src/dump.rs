@@ -3,6 +3,8 @@
 //!
 //! Accepted layouts: a folder with `exefs/` and `romfs/` (one title version, e.g. the update), or a dump root with `base/` and
 //! `updates/<version>/`, each holding `exefs/` and `romfs/`. The newest complete candidate whose `main` is a supported build is used.
+//! Add-on content (DLC) the player dumped sits in `dlc/<16-hex-digit title id>/romfs` (or `dlc/<id>/<n>/romfs`) of that folder. The
+//! runtime is pointed at that `dlc/` folder ([aoc] dir) and serves only what is there.
 
 use serde::Serialize;
 use std::fs;
@@ -36,6 +38,10 @@ pub struct DumpReport {
     pub errors: Vec<String>,
     pub candidates: Vec<Candidate>,
     pub chosen: Option<Candidate>,
+    /// the folder's `dlc/`, when it holds at least one add-on
+    pub dlc_dir: Option<String>,
+    /// title ids of the add-ons found there (upper-case hex), sorted
+    pub dlc: Vec<String>,
 }
 
 pub fn fwd(p: &Path) -> String {
@@ -87,6 +93,40 @@ fn check_candidate(kind: &str, version: &str, dir: &Path, builds: &[(String, Str
     Candidate { kind: kind.into(), version: version.into(), path: fwd(dir), exefs: fwd(&exefs), romfs: fwd(&romfs), ok, checks }
 }
 
+fn is_title_id(s: &str) -> bool {
+    s.len() == 16 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn has_romfs(addon: &Path) -> bool {
+    if addon.join("romfs").is_dir() {
+        return true;
+    }
+    // one level down, a numbered folder: dlc/<id>/<n>/romfs
+    fs::read_dir(addon).map_or(false, |rd| {
+        rd.filter_map(|e| e.ok()).any(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && e.path().join("romfs").is_dir()
+        })
+    })
+}
+
+/// The add-ons in `dlc`: folders named by a title id that hold a `romfs/`. Upper-case ids, sorted.
+pub fn scan_dlc(dlc: &Path) -> Vec<String> {
+    let mut out: Vec<String> = fs::read_dir(dlc)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    (is_title_id(&name) && has_romfs(&e.path())).then(|| name.to_uppercase())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
 fn version_order(a: &str, b: &str) -> std::cmp::Ordering {
     match (a.parse::<u64>(), b.parse::<u64>()) {
         (Ok(x), Ok(y)) => y.cmp(&x),
@@ -98,7 +138,8 @@ fn version_order(a: &str, b: &str) -> std::cmp::Ordering {
 
 pub fn scan(path: &str, builds: &[(String, String)]) -> DumpReport {
     let root = PathBuf::from(path.trim());
-    let mut report = DumpReport { path: fwd(&root), exists: root.is_dir(), errors: vec![], candidates: vec![], chosen: None };
+    let mut report =
+        DumpReport { path: fwd(&root), exists: root.is_dir(), errors: vec![], candidates: vec![], chosen: None, dlc_dir: None, dlc: vec![] };
     if path.trim().is_empty() {
         report.errors.push("No folder chosen yet.".into());
         return report;
@@ -128,6 +169,11 @@ pub fn scan(path: &str, builds: &[(String, String)]) -> DumpReport {
         return report;
     }
     report.chosen = report.candidates.iter().find(|c| c.ok).cloned();
+    let dlc = root.join("dlc");
+    report.dlc = scan_dlc(&dlc);
+    if !report.dlc.is_empty() {
+        report.dlc_dir = Some(fwd(&dlc));
+    }
     if report.chosen.is_none() {
         let wrong = report.candidates.iter().any(|c| c.checks.iter().any(|k| k.label.starts_with("supported version") && !k.ok));
         report.errors.push(if wrong {
@@ -156,6 +202,19 @@ mod tests {
         h[0] = b'X';
         fs::write(dir.join("main"), &h).unwrap();
         assert_eq!(build_id(&dir.join("main")), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dlc_folders_need_a_title_id_and_a_romfs() {
+        let dir = std::env::temp_dir().join(format!("fefw_dlc_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("04007ef01f8af002").join("romfs")).unwrap();
+        fs::create_dir_all(dir.join("04007EF01F8AF001").join("0").join("romfs")).unwrap();
+        fs::create_dir_all(dir.join("04007EF01F8AF003")).unwrap();
+        fs::create_dir_all(dir.join("notes").join("romfs")).unwrap();
+        assert_eq!(scan_dlc(&dir), vec!["04007EF01F8AF001".to_string(), "04007EF01F8AF002".to_string()]);
+        assert!(scan_dlc(&dir.join("missing")).is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

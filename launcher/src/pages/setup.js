@@ -129,13 +129,14 @@ export async function render(el, ctx) {
             </div>
             ${nupBusy ? `<p class="dim" id="nup-msg">${nupMsg(nupProgress)}</p><progress max="100" value="${nupPct(nupProgress)}"></progress>` : ''}
             <p class="faint">Or pick a <code>.nup</code> package (the NUP format of github.com/a55uka/nup): it is unpacked once into a <code>nup_dump</code> folder and used from there, so it needs the free space of the whole game.</p>
-            <p class="faint">Either the folder holding <code>exefs/</code> and <code>romfs/</code> of the supported update, or a dump root with <code>base/</code> and <code>updates/&lt;version&gt;/</code>. The ExeFS needs main, sdk, subsdk0, subsdk1, subsdk2 and rtld.</p>
+            <p class="faint">Either the folder holding <code>exefs/</code> and <code>romfs/</code> of the supported update, or a dump root with <code>base/</code> and <code>updates/&lt;version&gt;/</code>. The ExeFS needs main, sdk, subsdk0, subsdk1, subsdk2 and rtld. DLC you dumped goes in <code>dlc/&lt;title id&gt;/romfs</code> of the same folder (a <code>.nup</code> with add-ons is unpacked that way).</p>
             ${status.package ? '<p class="faint">Everything the setup needs is in this package: nothing else to install.</p>' : ''}
           </div>
         </div>
 
         ${report && report.errors.length ? `<div class="banner danger">${icon('circle-x')}<div>${report.errors.map(esc).join('<br>')}</div></div>` : ''}
         ${report && report.candidates.length ? `<div class="stack">${report.candidates.map((c) => candidateHtml(c, report.chosen)).join('')}</div>` : ''}
+        ${report && report.dlc && report.dlc.length ? `<div class="banner info">${icon('package')}<div>DLC from your dump: ${report.dlc.map(esc).join(', ')}</div></div>` : ''}
 
         <div class="row">
           <button class="btn ${ok && saved !== path ? 'primary' : ''}" id="use" ${ok && status.progress.state !== 'running' ? '' : 'disabled'}>${icon('circle-check')}Use these game files</button>

@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 #include "nxrt/game.h"
 
@@ -56,6 +57,22 @@ void mods_page();
 void res_install(uint64_t base);
 // The render-target pool's allocator was given room past the pool ([fefw] rt_pool_overflow_mb): renders above half of a 2160p output fit.
 bool res_rt_pool_extended();
+
+// fefw_wide.cpp: outputs wider than 16:9 ([fefw] ultrawide; hooks after Kompas9's ultrawide patch). res_install calls wide_install with
+// the output it gives the game; nothing is installed unless that output is wider than 16:9.
+std::string wide_mode();                             // [fefw] ultrawide: "auto" or "off"
+bool wide_aspect(int w, int h);                      // wider than 16:9 (by more than 1 %)
+void wide_install(uint64_t base, int out_w, int out_h);
+void wide_remove();
+struct WideInfo {
+    bool active = false;
+    int out_w = 0, out_h = 0;
+    float k = 1.0f;                                  // the output's width over a 16:9 picture's of the same height
+    static constexpr int kCounters = 9;
+    uint64_t counts[kCounters] = {};                 // times each hook did its work
+    const char* names[kCounters] = {};
+};
+WideInfo wide_info();
 
 // fefw_prompts.cpp: the button glyphs of the game's text follow the controller in use ([prompts] style; notes/prompts.md)
 void prompts_install(play::GameHost* host);

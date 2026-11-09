@@ -938,6 +938,24 @@ ViewRequest make_request(const DescriptorBinding& b, const TexResolved& r) {
     return q;
 }
 
+// Integer textures read through float-declared samplers (spirv_int_samplers): do_dispatch sets, for the dispatch's layout, the sampler
+// bindings (index into pl.bindings) whose texture holds 8- or 16-bit integers (2 sint, 3 uint) when the compute pipeline is the variant
+// that reads them as integer images. build_set then binds an integer view and an unfiltered sampler there. Null / empty otherwise.
+const ProgLayout* g_int_pl = nullptr;
+std::vector<uint8_t> g_int_comp;
+uint8_t int_sampler_for(const ProgLayout& pl, const BindingDesc& d) {
+    if (g_int_pl != &pl || &d < pl.bindings.data() || &d >= pl.bindings.data() + pl.bindings.size()) return 0;
+    const size_t i = static_cast<size_t>(&d - pl.bindings.data());
+    return i < g_int_comp.size() ? g_int_comp[i] : 0;
+}
+// The sampler of an integer texture: no filtering (Vulkan has no linear filtering of integer formats; Maxwell takes the nearest texel).
+SamplerInfo unfiltered(SamplerInfo s) {
+    s.mag_filter = NVN_MAG_FILTER_NEAREST;
+    s.min_filter = min_filter_uses_mips(s.min_filter) ? NVN_MIN_FILTER_NEAREST_MIPMAP_NEAREST : NVN_MIN_FILTER_NEAREST;
+    s.max_anisotropy = 1;
+    return s;
+}
+
 // The image a draw reads or writes through an image binding (nvnCommandBufferBindImage): the handle is a texture pool id.
 TexResolved resolve_image_raw(const BindingDesc& d) {
     ++g_rs.res_img;
@@ -1833,7 +1851,8 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
             w.pBufferInfo = &binfo.back();
             mix(reinterpret_cast<uint64_t>(bi.buffer)); mix(bi.offset); mix(bi.range);
         } else if (d.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
-            const int component = b.image.component == ScalarType::Sint ? 2 : b.image.component == ScalarType::Uint ? 3 : 1;
+            const uint8_t int_comp = int_sampler_for(pl, d);    // the integer sampler variant of a compute shader (do_dispatch)
+            const int component = int_comp ? int_comp : b.image.component == ScalarType::Sint ? 2 : b.image.component == ScalarType::Uint ? 3 : 1;
             VkDescriptorImageInfo ii = {dummy_sampler(), dummy_view(view_type_for(b), b.image.depth, component), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             TexResolved r = resolve_texture(d);
             if (r.tex && !g_fb_use.empty()) {
@@ -1857,20 +1876,22 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
             // a compute dispatch is never inside the graphics pass: a colour attachment of the last pass is an ordinary texture to it
             const bool feedback = r.tex && d.nvn_stage != kCompute && is_color_feedback(r.tex);
             if (r.tex && tex_gpu(r.tex) && !feedback) {
-                VkImageView v = tex_sampled_view(r.tex, make_request(b, r));
+                ViewRequest q = make_request(b, r);
+                if (int_comp) q.component = int_comp;
+                VkImageView v = tex_sampled_view(r.tex, q);
                 if (v) {
                     ii.imageView = v;
                     // GENERAL: the op also writes it as a storage image (prepare_textures left it there)
                     ii.imageLayout = tex_layout(r.tex) == VK_IMAGE_LAYOUT_GENERAL ? VK_IMAGE_LAYOUT_GENERAL : tex_sampled_layout(r.tex);
-                    if (r.has_sampler) ii.sampler = sampler_for(r.smp);
+                    if (r.has_sampler) ii.sampler = sampler_for(int_comp ? unfiltered(r.smp) : r.smp);
                     if (r.tex == g_su_tex && g_su_view) {            // the upscaled scene replaces the small one for this draw (S14)
                         ii.imageView = g_su_view;
                         ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
                     }
                 } else if (first_time_key("dummy-view " + d.shader->hash + " " + b.name + " " + std::to_string(r.tex->id))) {
-                    NXLOG_W(kTag, "sampled texture %u (%s, target %d, %dx%dx%d) has no view of the shader's type %d: shader %s binding %s (NVN slot %d, set %u binding %u) gets the dummy view",
+                    NXLOG_W(kTag, "sampled texture %u (%s, target %d, %dx%dx%d) has no view of the shader's view type %d, sampled type %d: shader %s binding %s (NVN slot %d, set %u binding %u) gets the dummy view",
                             r.tex->id, r.tex->fmt ? r.tex->fmt->name : "?", r.tex->b.target, r.tex->b.width, r.tex->b.height, r.tex->b.depth,
-                            static_cast<int>(view_type_for(b)), d.shader->hash.c_str(), b.name.c_str(), b.nvn.index, d.set, d.binding);
+                            static_cast<int>(view_type_for(b)), static_cast<int>(q.component), d.shader->hash.c_str(), b.name.c_str(), b.nvn.index, d.set, d.binding);
                 }
             } else if (feedback) {
                 log_once("color-feedback", "a texture is sampled while it is a colour attachment of the pass: the dummy texture is bound");
@@ -3214,7 +3235,27 @@ void do_dispatch(uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
             }
         }
     }
-    VkPipeline pipe = compute_pipeline(cs, *pl);
+    // Float-declared samplers over 8- or 16-bit integer textures (the light probe shader's RGBA8UI cubes): the variant that reads them
+    // as integer images, so the shader gets the integer bits as on the console (spirv_int_samplers). 32-bit integer textures keep the
+    // translated module: their float alias gives the bits (tex_sampled_view).
+    std::vector<SpvIntSampler> ints;
+    g_int_pl = nullptr;
+    g_int_comp.assign(pl->bindings.size(), 0);
+    for (size_t i = 0; i < pl->bindings.size(); ++i) {
+        const BindingDesc& d = pl->bindings[i];
+        if (d.type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) continue;
+        const DescriptorBinding& b = d.shader->refl.bindings[d.index];
+        if (b.image.component != ScalarType::Float || b.image.depth || b.count != 1) continue;
+        const TexResolved r = resolve_texture(d);
+        if (!r.tex || !tex_gpu(r.tex)) continue;
+        const uint8_t c = tex_int_sampler_component(r.tex, make_request(b, r).format);
+        if (!c) continue;
+        g_int_comp[i] = c;
+        ints.push_back({b.set, b.binding, c == 2});
+    }
+    VkPipeline pipe = compute_pipeline(cs, *pl, ints);
+    if (pipe && !ints.empty()) g_int_pl = pl;
+    else if (!pipe && !ints.empty()) pipe = compute_pipeline(cs, *pl);     // no variant: the translated module, float views (or the dummy)
     if (!pipe) return;
     vkCmdBindPipeline(F->cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     g_bound_pipeline = VK_NULL_HANDLE;
@@ -3240,6 +3281,7 @@ void do_dispatch(uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
         }
     }
     bind_sets(*pl, VK_PIPELINE_BIND_POINT_COMPUTE);
+    g_int_pl = nullptr;
     if (g_sh_copied) {
         memory_barrier(F->cb);     // the copies into the shadows before the dispatch reads them
         gstamp("shadow in");

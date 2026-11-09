@@ -57,6 +57,20 @@ bool spirv_int_attributes(const std::vector<uint32_t>& in, const std::vector<Spv
 // so the patched variant can be compiled before the first draw; a draw whose real integer slots differ builds its own variant.
 std::vector<SpvIntSlot> spirv_predict_int_inputs(const std::vector<uint32_t>& in);
 
+// Sampled textures that hold integers. The translator declares every sampled image as float; on the console a TEX of an integer
+// texture (RGBA8UI, say) puts the raw integer texel values in the registers, and the translated code bitcasts them where it wants the
+// integers (Fortune's Weave's light probe compute shader packs four RGBA8UI bytes that way). A 32-bit integer format reads the same
+// bits through its float alias (tex_sampled_view); an 8- or 16-bit one has no float format of the same bits, and a UINT view of a
+// float OpTypeImage is invalid (VUID-RuntimeSpirv-OpTypeImage-07753; AMD reads garbage). For each slot the variable at (set, binding)
+// becomes an image of 32-bit uint (int when is_signed), and every sample, gather and fetch through it returns that integer vector and is
+// bitcast back to the float vector the shader declared: the shader sees the console's bits. False (out untouched) when the variable is not
+// a single float, non-depth sampled image or is used in a way the rewrite does not follow.
+struct SpvIntSampler {
+    uint32_t set = 0, binding = 0;
+    bool is_signed = false;
+};
+bool spirv_int_samplers(const std::vector<uint32_t>& in, const std::vector<SpvIntSampler>& slots, std::vector<uint32_t>& out);
+
 // A geometry shader the translator made for a console "passthrough" geometry shader (the hardware copies every attribute of the input
 // vertices to the output vertices; the shader code only sets the position and gl_Layer, so its translation writes no Location output at
 // all). Adds the outputs for `slots` like spirv_add_outputs and makes the k-th OpEmitVertex copy the input at the same Location of vertex k.

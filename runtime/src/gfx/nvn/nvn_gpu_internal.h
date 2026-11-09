@@ -254,6 +254,10 @@ uint32_t tex_layers(Texture* t);
 bool tex_is_depth(Texture* t);
 // Sampled image view for a binding (cached). Null when impossible (the caller binds the dummy view).
 VkImageView tex_sampled_view(Texture* t, const ViewRequest& req);
+// A float-declared sampler over this texture (the view format `requested`, UNDEFINED: the image's own): 0 when a float view gives the
+// shader the texel bits (float formats; 32-bit integer ones through their float alias), else 2 / 3: signed / unsigned integers that only
+// an integer view can read, so the shader needs its sampler retyped (spirv_int_samplers) and the binding an integer view.
+uint8_t tex_int_sampler_component(Texture* t, VkFormat requested);
 // Single-level, single-layer (or all layers when layer_count > 1) view for use as an attachment.
 VkImageView tex_attachment_view(Texture* t, uint32_t level, uint32_t layer, uint32_t layer_count, VkFormat view_format);
 // The format colour attachments of this texture are rendered through (integer 32-bit formats as their float alias).
@@ -327,6 +331,12 @@ bool keep_aspect();
 
 // After a traced frame ([nvn] trace_frame): dumps the targets it drew to (PNG next to the log: trace_<texture id>_<format>.png) and logs their statistics.
 void trace_dump_targets();
+
+// Coherent copy fallback for rejected host imports. Completion includes copy-back to guest memory.
+void pool_copy_retire(PoolGpu*);
+bool pool_copy_pending();
+void pool_copy_begin();
+void pool_copy_end();
 
 // ---- present -----------------------------------------------------------------------------------------------------------
 void present_on_render_thread(Window* w, int index, bool again = false);   // again: present_again (not counted as a game present)

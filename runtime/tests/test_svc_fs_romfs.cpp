@@ -778,3 +778,35 @@ NXTEST(romfs_from_nup_package) {
         o.check_layout(2, 2);
     }
 }
+
+// RomFS mods: overlays laid over the game's tree. A file at the same path (ignoring ASCII case) takes the overlay's data and keeps the
+// game's spelling, new paths are added, a later overlay wins over an earlier one, and a missing overlay is skipped.
+NXTEST(romfs_overlays_replace_and_add) {
+    TempTree base, mod1, mod2;
+    write_host(base.root, {{"/Data/Unit.bin", false, pattern(100, 1)}, {"/Data/Keep.bin", false, pattern(50, 2)}, {"/top.txt", false, pattern(7, 3)}});
+    write_host(mod1.root,
+               {{"/data/unit.bin", false, pattern(300, 4)}, {"/Data/New/added.bin", false, pattern(20, 5)}, {"/top.txt", false, pattern(9, 6)}});
+    write_host(mod2.root, {{"/top.txt", false, pattern(11, 7)}});
+    RomfsImage img;
+    std::string err;
+    const std::vector<std::string> overlays{utf8(mod1.root), utf8(base.root / L"does_not_exist"), utf8(mod2.root)};
+    REQUIRE(img.build(utf8(base.root), &err, overlays));
+    CHECK_EQ(img.stats().overlay_files, 4u);   // unit.bin, added.bin and top.txt from mod1, top.txt again from mod2
+    check_tree(img, {{"/Data/Unit.bin", false, pattern(300, 4)},
+                     {"/Data/Keep.bin", false, pattern(50, 2)},
+                     {"/Data/New/added.bin", false, pattern(20, 5)},
+                     {"/top.txt", false, pattern(11, 7)}});
+    uint64_t off = 0, sz = 0;
+    CHECK(!img.file_extent("/data/unit.bin", &off, &sz));   // the game's spelling is kept
+}
+
+// An overlay file where the game has a folder replaces the folder.
+NXTEST(romfs_overlay_file_replaces_folder) {
+    TempTree base, mod;
+    write_host(base.root, {{"/a/b.bin", false, pattern(10, 1)}, {"/c.bin", false, pattern(10, 2)}});
+    write_host(mod.root, {{"/a", false, pattern(5, 3)}});
+    RomfsImage img;
+    std::string err;
+    REQUIRE(img.build(utf8(base.root), &err, {utf8(mod.root)}));
+    check_tree(img, {{"/a", false, pattern(5, 3)}, {"/c.bin", false, pattern(10, 2)}});
+}

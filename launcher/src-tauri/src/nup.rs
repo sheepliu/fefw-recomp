@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Reads a `.nup` package (https://github.com/a55uka/nup, format 1) and unpacks it into the folder layout the rest
-//! of the launcher expects: `<out>/base/{exefs,romfs}` and `<out>/updates/<version>/{exefs,romfs}`.
-//! Add-on (DLC) packages are skipped. Only the exefs and romfs subtrees of each package are written.
+//! of the launcher expects: `<out>/base/{exefs,romfs}`, `<out>/updates/<version>/{exefs,romfs}` and, for the add-on content (DLC)
+//! in the package, `<out>/dlc/<title id>/romfs`. Only the exefs and romfs subtrees of each package are written.
 
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -10,9 +10,11 @@ use std::path::{Path, PathBuf};
 const NO_DIR: u32 = 0xFFFF_FFFF;
 const KIND_BASE: u8 = 0;
 const KIND_UPDATE: u8 = 1;
+const KIND_ADDON: u8 = 2;
 const MARKER: &str = ".nup_done";
 
 struct Package {
+    title_id: u64,
     root_dir: u32,
     exefs_dir: u32,
     romfs_dir: u32,
@@ -92,6 +94,7 @@ fn parse(f: &mut File) -> Result<Nup, String> {
     let mut packages = Vec::with_capacity(pkg_count);
     for _ in 0..pkg_count {
         packages.push(Package {
+            title_id: u64_at(&toc, pos)?,
             root_dir: u32_at(&toc, pos + 0x08)?,
             exefs_dir: u32_at(&toc, pos + 0x0C)?,
             romfs_dir: u32_at(&toc, pos + 0x10)?,
@@ -213,7 +216,9 @@ fn uuid_hex(u: &[u8; 16]) -> String {
 pub fn extract(nup_path: &Path, out: &Path, progress: &mut dyn FnMut(u64, u64, &str), cancel: &dyn Fn() -> bool) -> Result<PathBuf, String> {
     let mut file = File::open(nup_path).map_err(|e| format!("cannot open {}: {}", nup_path.display(), e))?;
     let nup = parse(&mut file)?;
-    let stamp = format!("{}:{}", uuid_hex(&nup.uuid), nup.file_size);
+    // ":dlc" marks unpacks that include the add-ons: a package with add-ons unpacked before they were extracted is unpacked again.
+    let has_addons = nup.packages.iter().any(|p| p.kind == KIND_ADDON);
+    let stamp = format!("{}:{}{}", uuid_hex(&nup.uuid), nup.file_size, if has_addons { ":dlc" } else { "" });
     if fs::read_to_string(out.join(MARKER)).map(|s| s.trim() == stamp).unwrap_or(false) {
         return Ok(out.to_path_buf());
     }
@@ -222,16 +227,17 @@ pub fn extract(nup_path: &Path, out: &Path, progress: &mut dyn FnMut(u64, u64, &
     }
     fs::create_dir_all(out).map_err(|e| format!("cannot create {}: {}", out.display(), e))?;
 
-    // (package, destination) pairs for the base and updates; DLC is not used by the game build.
+    // (package, destination) pairs for the base, the updates and the add-ons (the runtime serves dlc/ as [aoc] dir).
     let mut jobs: Vec<(&Package, PathBuf)> = Vec::new();
     for p in &nup.packages {
         match p.kind {
             KIND_BASE => jobs.push((p, out.join("base"))),
             KIND_UPDATE => jobs.push((p, out.join("updates").join(p.version.to_string()))),
+            KIND_ADDON => jobs.push((p, out.join("dlc").join(format!("{:016X}", p.title_id)))),
             _ => {}
         }
     }
-    if jobs.is_empty() {
+    if !jobs.iter().any(|(p, _)| p.kind != KIND_ADDON) {
         return Err("This .nup has no base game or update in it.".into());
     }
     let mut ex = Extractor { nup: &nup, src: BufReader::with_capacity(1 << 20, file), done: 0, total: 0, progress, cancel };

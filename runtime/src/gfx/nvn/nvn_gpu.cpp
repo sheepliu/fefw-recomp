@@ -134,10 +134,15 @@ struct Gpu {
 Gpu* g = nullptr;
 void flush_batch();   // [nvn] submit_batch, below
 std::mutex g_install_mu;
+std::atomic<uint64_t> g_copy_inflight{0};
+std::mutex g_copy_done_mu;
+std::condition_variable g_copy_done_cv;
 
 uint64_t read_completed() {
     uint64_t v = 0;
     if (g && g->timeline) vkGetSemaphoreCounterValue(g->dev->device(), g->timeline, &v);
+    const uint64_t copying = g_copy_inflight.load();
+    if (copying && v >= copying) v = copying - 1;
     if (v > g->completed.load()) g->completed.store(v);
     return g->completed.load();
 }
@@ -625,6 +630,7 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
         if (g->reserved.load() == g->submitted) serial = g->reserved.fetch_add(1) + 1;
         else { serial = g->submitted; unsignalled = true; }
     }
+    pool_copy_begin();
     g->recording = serial;
     Frame f;
     f.cb = s.cb;
@@ -671,7 +677,15 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
         g->last_submitted.store(serial);
         g->recording = 0;
         g->batch.push_back(&s);
-        if (g->batch.size() >= g->batch_max) flush_batch();
+        if (pool_copy_pending()) g_copy_inflight.store(serial);
+        if (g->batch.size() >= g->batch_max || pool_copy_pending()) flush_batch();
+        if (pool_copy_pending()) {
+            wait_serial_blocking(serial);
+            pool_copy_end();
+            { std::lock_guard<std::mutex> lock(g_copy_done_mu); g_copy_inflight.store(0); }
+            g_copy_done_cv.notify_all();
+            read_completed();
+        }
         g->ctr.submit_replay_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()));
         return serial;
     }
@@ -690,6 +704,7 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
         r = vkQueueSubmit2(g->dev->queue(), 1, &si, VK_NULL_HANDLE);
         if (r == VK_SUCCESS) vkQueueWaitIdle(g->dev->queue());   // nothing else tells when it is done
     }
+    if (pool_copy_pending()) pool_copy_end();
     g->recording = 0;
     s.serial = 0;
     return serial;
@@ -860,7 +875,16 @@ bool wait_serial(uint64_t serial, uint64_t timeout_ns) {
     wi.semaphoreCount = 1;
     wi.pSemaphores = &g->timeline;
     wi.pValues = &serial;
-    const VkResult r = vkWaitSemaphores(g->dev->device(), &wi, timeout_ns);
+    VkResult r = vkWaitSemaphores(g->dev->device(), &wi, timeout_ns);
+    if (r == VK_SUCCESS && !on_render_thread()) {
+        std::unique_lock<std::mutex> lock(g_copy_done_mu);
+        auto ready = [serial] { const auto copying = g_copy_inflight.load(); return !copying || copying > serial; };
+        if (timeout_ns == UINT64_MAX) g_copy_done_cv.wait(lock, ready);
+        else {
+            const auto deadline = tw0 + std::chrono::nanoseconds(std::min<uint64_t>(timeout_ns, INT64_MAX));
+            if (!g_copy_done_cv.wait_until(lock, deadline, ready)) r = VK_TIMEOUT;
+        }
+    }
     read_completed();
     const auto tw1 = std::chrono::steady_clock::now();
     w_n[kind].fetch_add(1, std::memory_order_relaxed);
@@ -1011,6 +1035,7 @@ void release_texture_gpu(Texture* t) {
 }
 
 void destroy_pool_gpu(PoolGpu* p) {
+    pool_copy_retire(p);
     if (!p) return;
     if (!g) { pool_gpu_destroy(p); return; }
     defer_destroy([p] { pool_gpu_destroy(p); });

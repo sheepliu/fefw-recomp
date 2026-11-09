@@ -5,6 +5,9 @@
 //     OpenDataFileSystemByCurrentProcess serves the same folder as a read-only IFileSystem.
 //   * Save data: account, device and cache saves live in folders under [fs] save_dir (default %APPDATA%\<game save_folder>\save, nxrt/game.h; MPRRecomp for Metroid Prime Remastered) with the journal
 //     semantics of fs_volume.h: writes are invisible to the committed state until IFileSystem::Commit.
+//   * Mods: the RomFS mods under [fs] mods (installed_mods(), services_internal.h) are laid over that image (LayeredFS style).
+//   * Add-on content: OpenDataStorageByDataId serves the RomFS of the DLC the player supplied from their own dump ([aoc] dir, default
+//     game/dlc; installed_aoc() in services_internal.h).
 //   * SD card, game card, BIS: absent (the results of a console without them).
 // Command ids, argument layouts: Switchbrew "Filesystem services", ScarletNX fs.swipc (GPL-3.0-or-later), Ryujinx IFileSystemProxy (MIT).
 // The commit/recovery design is smo-recomp runtime/fs/nnfs.c (GPL-3.0), see fs_volume.h.
@@ -48,6 +51,7 @@ struct FsState {
     std::mutex mu;
     std::shared_ptr<fs::RomfsImage> rom;
     bool rom_failed = false;
+    std::map<uint64_t, std::shared_ptr<fs::RomfsImage>> aoc_rom;   // add-on content data id -> its RomFS image
     std::map<std::string, std::weak_ptr<Volume>> saves;   // key -> open volume (one at a time per save)
     std::map<uint64_t, std::string> ids;                  // SaveDataId -> key, for the commands that name a save by id
 };
@@ -429,7 +433,15 @@ std::shared_ptr<fs::RomfsImage> rom_image() {
     auto img = std::make_shared<fs::RomfsImage>();
     std::string err;
     const std::string dir = romfs_dir();
-    if (!img->build(dir, &err)) {
+    std::vector<std::string> overlays;
+    for (const RomfsMod& m : installed_mods()) {
+        if (m.has_exefs) NXLOG_W("mods", "%s: exefs patches are left out (the game code is compiled ahead of time)", m.name.c_str());
+        if (!m.romfs.empty()) {
+            NXLOG_I("mods", "%s: RomFS from %s", m.name.c_str(), m.romfs.c_str());
+            overlays.push_back(m.romfs);
+        }
+    }
+    if (!img->build(dir, &err, overlays)) {
         NXLOG_E("fs", "RomFS folder '%s' cannot be served: %s (set [fs] romfs)", dir.c_str(), err.c_str());
         st().rom_failed = true;
         return nullptr;
@@ -437,8 +449,34 @@ std::shared_ptr<fs::RomfsImage> rom_image() {
     const fs::RomfsImage::Stats s = img->stats();
     NXLOG_I("fs", "RomFS image from %s: %u files, %u directories, %llu bytes of data, image size %llu", dir.c_str(), s.files, s.dirs,
             static_cast<unsigned long long>(s.data_bytes), static_cast<unsigned long long>(img->size()));
+    if (!overlays.empty()) NXLOG_I("mods", "%zu RomFS mod(s), %u files from mods", overlays.size(), s.overlay_files);
     st().rom = img;
     return img;
+}
+
+// The RomFS image of the add-on content with data id `id` (installed_aoc()), built on first use. Null when it is not installed or its
+// folder cannot be served.
+std::shared_ptr<fs::RomfsImage> aoc_image(uint64_t id) {
+    std::lock_guard<std::mutex> lk(st().mu);
+    auto it = st().aoc_rom.find(id);
+    if (it != st().aoc_rom.end()) return it->second;
+    for (const AddOnContent& a : installed_aoc()) {
+        if (a.data_id != id) continue;
+        auto img = std::make_shared<fs::RomfsImage>();
+        std::string err;
+        if (!img->build(a.romfs, &err)) {
+            NXLOG_E("fs", "Add-on content %016llX: folder '%s' cannot be served: %s", static_cast<unsigned long long>(id), a.romfs.c_str(),
+                    err.c_str());
+            return nullptr;
+        }
+        const fs::RomfsImage::Stats s = img->stats();
+        NXLOG_I("fs", "Add-on content %016llX (index %u) from %s: %u files, image size %llu", static_cast<unsigned long long>(id), a.index,
+                a.romfs.c_str(), s.files, static_cast<unsigned long long>(img->size()));
+        st().aoc_rom[id] = img;
+        return img;
+    }
+    NXLOG_W("fs", "Add-on content %016llX is not installed (see [aoc] dir)", static_cast<unsigned long long>(id));
+    return nullptr;
 }
 
 std::shared_ptr<Service> make_event_notifier() {
@@ -713,7 +751,13 @@ std::shared_ptr<Service> make_fsp() {
     };
     s->add_cmd(200, "OpenDataStorageByCurrentProcess", rom_storage);
     s->add_cmd(201, "OpenDataStorageByProgramId", [](Request&, Response&) -> uint32_t { return fs::rc::kTargetNotFound; });
-    s->add_cmd(202, "OpenDataStorageByDataId", [](Request&, Response&) -> uint32_t { return fs::rc::kTargetNotFound; });
+    // OpenDataStorageByDataId(u8 storage id, u64 data id): nn::fs::MountAddOnContent. Only installed add-on content is served.
+    s->add_cmd(202, "OpenDataStorageByDataId", [](Request& req, Response& rsp) -> uint32_t {
+        auto img = aoc_image(req.arg<uint64_t>(8));
+        if (!img) return fs::rc::kTargetNotFound;
+        rsp.push_object(make_storage_rom(img));
+        return 0;
+    });
     s->add_cmd(203, "OpenPatchDataStorageByCurrentProcess", [](Request&, Response&) -> uint32_t { return fs::rc::kTargetNotFound; });
     s->add_cmd(205, "OpenDataStorageWithProgramIndex", rom_storage);
     s->add_cmd(400, "OpenDeviceOperator", [](Request&, Response& rsp) -> uint32_t {
@@ -778,13 +822,15 @@ std::shared_ptr<Service> make_fsp() {
 
 void register_fs() {
     add("fsp-srv", [] { return make_fsp(); });
-    NXLOG_I("fs", "fsp-srv: RomFS from '%s', save data in '%s'", romfs_dir().c_str(), save_dir().c_str());
+    NXLOG_I("fs", "fsp-srv: RomFS from '%s', save data in '%s', %zu add-on content(s) in '%s'", romfs_dir().c_str(), save_dir().c_str(),
+            installed_aoc().size(), aoc_dir().c_str());
 }
 
 void fs_reset() {
     std::lock_guard<std::mutex> lk(st().mu);
     st().rom.reset();
     st().rom_failed = false;
+    st().aoc_rom.clear();
     st().saves.clear();
     st().ids.clear();
 }

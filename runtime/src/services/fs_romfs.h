@@ -22,7 +22,10 @@ public:
     // Scans `host_dir` (recursively; names are taken as UTF-8 from the host paths) and builds the tables. `host_dir` may also name a .nup
     // package (nxrt/nup.h): its RomFS is served from the package file. False with *err set when the
     // folder does not exist or an entry cannot be described. Replaces an earlier build.
-    bool build(const std::string& host_dir, std::string* err = nullptr);
+    // `overlays` are host folders laid over the tree in order (RomFS mods, LayeredFS style; a later one wins): a file at the same path
+    // replaces the game's, a new path is added. Names match the game's ignoring ASCII case and keep the game's spelling. An overlay that
+    // cannot be read is skipped with a warning; it never fails the build.
+    bool build(const std::string& host_dir, std::string* err = nullptr, const std::vector<std::string>& overlays = {});
     bool built() const;
     uint64_t size() const;                                  // total image size in bytes
     // Copies [offset, offset + len) of the image into dst. False when the range is outside the image or a host file cannot be read
@@ -32,6 +35,7 @@ public:
         uint32_t files = 0, dirs = 0;                       // dirs counts the root
         uint64_t data_bytes = 0;                            // sum of file sizes
         uint64_t data_offset = 0;                           // header.file_partition_ofs
+        uint32_t overlay_files = 0;                         // files served from overlays (replaced or added)
     };
     Stats stats() const;
     // Image offset and size of a file by its path inside the image ("/a/b.bin", case sensitive), for tests and logs. False when absent.

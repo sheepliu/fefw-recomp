@@ -22,6 +22,7 @@
 #include "nxrt/log.h"
 #include "nxrt/platform.h"
 #include "vk_gauges.h"
+#include <unordered_map>
 #include "extras/framegen.h"
 #include "extras/framegen_ffx.h"
 #include "extras/temporal.h"
@@ -29,6 +30,46 @@
 #include <vk_mem_alloc.h>
 
 namespace nxrt {
+
+// Count actual driver allocations, including VMA blocks and the overlay backend.
+namespace {
+PFN_vkAllocateMemory driver_allocate_memory;
+PFN_vkFreeMemory driver_free_memory;
+std::mutex memory_count_mu;
+std::unordered_map<VkDeviceMemory, VkDeviceSize> memory_sizes;
+VKAPI_ATTR VkResult VKAPI_CALL counted_allocate_memory(VkDevice d, const VkMemoryAllocateInfo* info,
+                                                      const VkAllocationCallbacks* cb, VkDeviceMemory* out) {
+    *out = VK_NULL_HANDLE;
+    static const bool inject = config_get_bool("diag", "fail_small_vk_allocation", false);
+    static std::atomic<bool> injected{false};
+    const bool fail = inject && !info->pNext && info->allocationSize <= 65536 && !injected.exchange(true);
+    if (fail) NXLOG_W("vk.memory", "diagnostic small allocation failure injected");
+    const VkResult r = fail ? VK_ERROR_OUT_OF_DEVICE_MEMORY : driver_allocate_memory(d, info, cb, out);
+    if (r == VK_SUCCESS) {
+        std::lock_guard<std::mutex> lock(memory_count_mu);
+        memory_sizes[*out] = info->allocationSize;
+        vk_gauge_memory_allocs().add(1);
+        vk_gauge_memory_bytes().add(static_cast<int64_t>(info->allocationSize));
+    } else {
+        *out = VK_NULL_HANDLE;
+        NXLOG_E("vk.memory", "allocation failed (%d), bytes %llu, live %lld", int(r),
+                (unsigned long long)info->allocationSize, (long long)vk_gauge_memory_allocs().get());
+    }
+    return r;
+}
+VKAPI_ATTR void VKAPI_CALL counted_free_memory(VkDevice d, VkDeviceMemory memory, const VkAllocationCallbacks* cb) {
+    {
+        std::lock_guard<std::mutex> lock(memory_count_mu);
+        auto i = memory_sizes.find(memory);
+        if (i != memory_sizes.end()) {
+            vk_gauge_memory_bytes().sub(static_cast<int64_t>(i->second));
+            vk_gauge_memory_allocs().sub(1);
+            memory_sizes.erase(i);
+        }
+    }
+    driver_free_memory(d, memory, cb);
+}
+}
 
 // ---- live-object gauges (declared in vk_gauges.h) -------------------------------------------------------------------------------
 nxrt::GaugeCounter& vk_gauge_images() { static nxrt::GaugeCounter g("vk.images"); return g; }
@@ -761,6 +802,12 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
         vkGetDeviceProcAddr = sl_gdpa;
     }
     volkLoadDevice(device_);
+    driver_allocate_memory = vkAllocateMemory;
+    driver_free_memory = vkFreeMemory;
+    vkAllocateMemory = counted_allocate_memory;
+    vkFreeMemory = counted_free_memory;
+    NXLOG_I(kTag, "memory limits: maxMemoryAllocationCount %u, minImportedHostPointerAlignment %llu, external host %d",
+            limits_.max_memory_allocation_count, (unsigned long long)limits_.min_imported_host_alignment, features_.external_memory_host);
     vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
     if (fg_queues) extras::ffx_fg_install(*this, fg_queues);
 
@@ -773,6 +820,8 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     VmaVulkanFunctions vf = {};
     vf.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
     vf.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+    vf.vkAllocateMemory = counted_allocate_memory;
+    vf.vkFreeMemory = counted_free_memory;
     VmaAllocatorCreateInfo aci = {};
     aci.physicalDevice = physical_;
     aci.device = device_;

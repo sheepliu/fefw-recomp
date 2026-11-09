@@ -347,7 +347,25 @@ std::shared_ptr<Service> make_hwopus() {
 }
 
 // ---- aoc:u ------------------------------------------------------------------------------------------------------------------------
-// No add-on content is installed. The base id of the title's add-on content is its program id + 0x1000.
+// Add-on content comes from the player's own dump (installed_aoc()). The base id of the title's add-on content is its program id + 0x1000.
+// The installed indices from u32 offset (arg 0) on, at most u32 count (arg 4) and what the output buffer holds; the rest of the buffer
+// is zeroed. Answers the number written.
+int32_t list_aoc(Request& req, bool ours) {
+    const ipc::Buffer b = req.out_buf(0);
+    zero_buffer(b);
+    if (!ours || !b.addr) return 0;
+    const uint32_t offset = req.arg<uint32_t>(0);
+    const uint64_t cap = std::min<uint64_t>(req.arg<uint32_t>(4), b.size / 4);
+    const std::vector<AddOnContent> all = installed_aoc();
+    int32_t n = 0;
+    for (uint64_t i = offset; i < all.size() && static_cast<uint64_t>(n) < cap; ++i, ++n) {
+        const uint32_t idx = all[i].index;
+        std::memcpy(buf_mut(b) + 4ull * n, &idx, 4);
+    }
+    NXLOG_I("aoc", "ListAddOnContent(offset %u): %d of %zu", offset, n, all.size());
+    return n;
+}
+
 std::shared_ptr<Service> make_purchase_manager() {
     return make_iface("IPurchaseEventManager", [](Service& s) {
         s.add_cmd(2, "GetPurchasedEventReadableHandle", [](Request&, Response& rsp) -> uint32_t {
@@ -366,23 +384,25 @@ std::shared_ptr<Service> make_contents_manager() {
 }
 std::shared_ptr<Service> make_aoc() {
     return make_iface("IAddOnContentManager", [](Service& s) {
-        // Count and list answer zero entries. The list commands also zero their index buffer.
-        s.add_cmd(0, "CountAddOnContentByApplicationId", [](Request&, Response& rsp) -> uint32_t {
-            rsp.push<int32_t>(0);
+        // Count and list answer the add-on content the player supplied (installed_aoc(), services_internal.h). The list commands
+        // write u32 indices from `offset` into the output buffer, at most `count` of them, and answer how many were written.
+        s.add_cmd(0, "CountAddOnContentByApplicationId", [](Request& req, Response& rsp) -> uint32_t {
+            rsp.push<int32_t>(req.arg<uint64_t>(0) == profile().program_id ? static_cast<int32_t>(installed_aoc().size()) : 0);
             return 0;
         });
         s.add_cmd(1, "ListAddOnContentByApplicationId", [](Request& req, Response& rsp) -> uint32_t {
-            zero_buffer(req.out_buf(0));
-            rsp.push<int32_t>(0);
+            const bool ours = req.arg<uint64_t>(8) == profile().program_id;
+            rsp.push<int32_t>(list_aoc(req, ours));
             return 0;
         });
         s.add_cmd(2, "CountAddOnContent", [](Request&, Response& rsp) -> uint32_t {
-            rsp.push<int32_t>(0);
+            const int32_t n = static_cast<int32_t>(installed_aoc().size());
+            NXLOG_I("aoc", "CountAddOnContent: %d", n);
+            rsp.push<int32_t>(n);
             return 0;
         });
         s.add_cmd(3, "ListAddOnContent", [](Request& req, Response& rsp) -> uint32_t {
-            zero_buffer(req.out_buf(0));
-            rsp.push<int32_t>(0);
+            rsp.push<int32_t>(list_aoc(req, true));
             return 0;
         });
         s.add_cmd(4, "GetAddOnContentBaseIdByApplicationId", [](Request& req, Response& rsp) -> uint32_t {

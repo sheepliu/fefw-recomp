@@ -26,7 +26,7 @@ nxrt::GaugeCounter& vk_gauge_fences();                  // vk.fences            
 nxrt::GaugeCounter& vk_gauge_semaphores();              // vk.semaphores        VkSemaphore
 nxrt::GaugeCounter& vk_gauge_query_pools();             // vk.query_pools       VkQueryPool
 nxrt::GaugeCounter& vk_gauge_swapchains();              // vk.swapchains        VkSwapchainKHR
-nxrt::GaugeCounter& vk_gauge_memory_allocs();           // vk.memory_allocs     VkDeviceMemory from vkAllocateMemory (not VMA's own blocks)
+nxrt::GaugeCounter& vk_gauge_memory_allocs();           // vk.memory_allocs     all VkDeviceMemory, including VMA blocks and overlay
 nxrt::GaugeCounter& vk_gauge_memory_bytes();            // vk.memory_bytes      bytes of those allocations
 
 namespace gfx {

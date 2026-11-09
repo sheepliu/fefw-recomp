@@ -10,6 +10,7 @@
 // Not here: nvnTextureBuilderGetStorageSize, GetStorageAlignment, GetStorageClass, GetSparseTileLayout and
 // GetZCullStorageSize (the manager). nvnTextureBuilderGetDevice, GetPackagedTextureLayout and GetRawStorageClass have no NVN1
 // signature (the table says '?'); they follow the NVN2 driver (sdk 0x5EE2A0, 0x5EE380, 0x5EE9A0), see each.
+#include <algorithm>
 #include <cstring>
 
 #include "nvn_impl.h"
@@ -59,18 +60,20 @@ void nvnTextureBuilderSetFlags(NVNtextureBuilder* b, int flags) { edit_b(b, [&](
 void nvnTextureBuilderSetTarget(NVNtextureBuilder* b, NVNtextureTarget target) {
     edit_b(b, [&](TexBuilderData& d) { d.target = static_cast<int32_t>(target); });
 }
-void nvnTextureBuilderSetWidth(NVNtextureBuilder* b, int width) { edit_b(b, [&](TexBuilderData& d) { d.width = width; }); }
-void nvnTextureBuilderSetHeight(NVNtextureBuilder* b, int height) { edit_b(b, [&](TexBuilderData& d) { d.height = height; }); }
+// Downsample chains can reach zero at small host resolutions. Normalize at the
+// builder boundary so storage queries, allocation and image creation agree.
+void nvnTextureBuilderSetWidth(NVNtextureBuilder* b, int width) { edit_b(b, [&](TexBuilderData& d) { d.width = std::max(1, width); }); }
+void nvnTextureBuilderSetHeight(NVNtextureBuilder* b, int height) { edit_b(b, [&](TexBuilderData& d) { d.height = std::max(1, height); }); }
 void nvnTextureBuilderSetDepth(NVNtextureBuilder* b, int depth) { edit_b(b, [&](TexBuilderData& d) { d.depth = depth; }); }
 // Sizes as smo: 1D sets height and depth to 1; 2D sets depth to 1; the target is left as it was set.
 void nvnTextureBuilderSetSize1D(NVNtextureBuilder* b, int width) {
-    edit_b(b, [&](TexBuilderData& d) { d.width = width; d.height = 1; d.depth = 1; });
+    edit_b(b, [&](TexBuilderData& d) { d.width = std::max(1, width); d.height = 1; d.depth = 1; });
 }
 void nvnTextureBuilderSetSize2D(NVNtextureBuilder* b, int width, int height) {
-    edit_b(b, [&](TexBuilderData& d) { d.width = width; d.height = height; d.depth = 1; });
+    edit_b(b, [&](TexBuilderData& d) { d.width = std::max(1, width); d.height = std::max(1, height); d.depth = 1; });
 }
 void nvnTextureBuilderSetSize3D(NVNtextureBuilder* b, int width, int height, int depth) {
-    edit_b(b, [&](TexBuilderData& d) { d.width = width; d.height = height; d.depth = depth; });
+    edit_b(b, [&](TexBuilderData& d) { d.width = std::max(1, width); d.height = std::max(1, height); d.depth = depth; });
 }
 void nvnTextureBuilderSetLevels(NVNtextureBuilder* b, int levels) { edit_b(b, [&](TexBuilderData& d) { d.levels = levels; }); }
 void nvnTextureBuilderSetFormat(NVNtextureBuilder* b, NVNformat format) {

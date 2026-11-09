@@ -7,8 +7,8 @@
 // The fault handler and before_os_write may run on any thread at any time; they only use atomics, VirtualProtect and the region's
 // slim reader/writer lock: whoever makes pages writable holds it shared, arm() and region_destroy() hold it exclusive, so a page's bit
 // and its protection change together as seen by everybody else (no page ends up read-only without its bit, or armed and writable). Regions are
-// published in a fixed table; a reader counts itself in g_busy while it looks at a region, and region_destroy waits for that count to
-// drop after taking the region out of the table.
+// published in stable, dynamically appended slot blocks. Readers count themselves in g_busy while looking at a region;
+// region_destroy takes the region out of the table, then waits for that count to drop.
 #include "nxrt/write_watch.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -43,7 +43,7 @@ struct Region {
     uint64_t nwords = 0;
     std::unique_ptr<std::atomic<uint64_t>[]> prot, valid, written, ban;
     std::unique_ptr<std::atomic<uint64_t>[]> guard;     // PAGE_NOACCESS because of guard() (a subset of prot)
-    int slot = -1;
+    std::atomic<Region*>* slot = nullptr;
     SRWLOCK lock = SRWLOCK_INIT;
     std::unique_ptr<std::atomic<uint16_t>[]> releasing;   // per page: releasers that saw it armed and have not finished its VirtualProtect (release_page)
 };
@@ -62,9 +62,33 @@ struct ExclusiveLock {
 namespace {
 
 constexpr const char* kTag = "mem.ww";
-constexpr int kSlots = 512;
-std::atomic<Region*> g_slots[kSlots];
-std::atomic<int> g_hi{0};              // slots [0, g_hi) may be in use
+// Blocks never move or disappear while fault handlers can run. Growth allocates only
+// on region_create, under g_mu; readers need neither allocation nor a table lock.
+// Empty slots are reused, bounding table storage by peak live regions (2 KiB/block).
+constexpr int kSlotsPerBlock = 256;
+struct SlotBlock {
+    std::atomic<Region*> slots[kSlotsPerBlock]{};
+    std::atomic<int> hi{0};
+    std::atomic<SlotBlock*> next{nullptr};
+};
+SlotBlock g_slots;
+
+// Caller participates in g_busy until done using the returned Region pointers.
+struct RegionCursor {
+    SlotBlock* block = &g_slots;
+    int index = 0;
+    int hi = block->hi.load(std::memory_order_seq_cst);
+    Region* next() {
+        while (block) {
+            while (index < hi)
+                if (Region* r = block->slots[index++].load(std::memory_order_seq_cst)) return r;
+            block = block->next.load(std::memory_order_acquire);
+            index = 0;
+            if (block) hi = block->hi.load(std::memory_order_seq_cst);
+        }
+        return nullptr;
+    }
+};
 std::atomic<int> g_busy{0};            // fault handlers and os-write calls looking at the table
 std::atomic<int> g_live{0};
 std::atomic<uint64_t> g_faults{0};
@@ -233,10 +257,9 @@ void unguard_locked(Region* r, uint64_t first, uint64_t count) {
 bool guarded_at(uint64_t addr) {
     bool any = false;
     g_busy.fetch_add(1, std::memory_order_seq_cst);
-    const int hi = g_hi.load(std::memory_order_seq_cst);
-    for (int i = 0; i < hi && !any; ++i) {
-        Region* r = g_slots[i].load(std::memory_order_seq_cst);
-        if (!r || addr < r->base || addr >= r->base + r->npages * kPage) continue;
+    for (RegionCursor cursor; Region* r = cursor.next();) {
+        if (any) break;
+        if (addr < r->base || addr >= r->base + r->npages * kPage) continue;
         any = test(r->guard.get(), (addr - r->base) / kPage);
     }
     g_busy.fetch_sub(1, std::memory_order_seq_cst);
@@ -267,11 +290,11 @@ LONG CALLBACK on_fault(EXCEPTION_POINTERS* ep) {
         const DWORD pr = page_protect(addr) & 0xff;
         if (pr == PAGE_READONLY || pr == PAGE_READWRITE || pr == PAGE_EXECUTE_READ || pr == PAGE_EXECUTE_READWRITE) {
             bool in_region = false;
-            const int hi0 = g_hi.load(std::memory_order_seq_cst);
-            for (int i = 0; i < hi0 && !in_region; ++i) {
-                Region* r = g_slots[i].load(std::memory_order_seq_cst);
-                in_region = r && addr >= r->base && addr < r->base + r->npages * kPage;
+            g_busy.fetch_add(1, std::memory_order_seq_cst);
+            for (RegionCursor cursor; Region* r = cursor.next();) {
+                if (addr >= r->base && addr < r->base + r->npages * kPage) { in_region = true; break; }
             }
+            g_busy.fetch_sub(1, std::memory_order_seq_cst);
             if (in_region) return EXCEPTION_CONTINUE_EXECUTION;
         }
         if (pr == PAGE_NOACCESS && guarded_at(addr)) {    // dropped and guarded again since the check above
@@ -284,14 +307,12 @@ LONG CALLBACK on_fault(EXCEPTION_POINTERS* ep) {
     }
     bool ours = false, guarded_now = false;
     g_busy.fetch_add(1, std::memory_order_seq_cst);
-    const int hi = g_hi.load(std::memory_order_seq_cst);
     // Pass 0 releases the page in the regions that armed it (usually one). Only when none did (another thread released it meanwhile) does
     // pass 1 ask release_page's slow path in every region: a VirtualQuery over the heap view (milliseconds), which the whole-heap texture
     // region paid for every fault on a pool copy's page, under its shared lock (notes/pacing.md).
     for (int pass = 0; pass < 2 && !ours && !guarded_now; ++pass) {
-        for (int i = 0; i < hi; ++i) {
-            Region* r = g_slots[i].load(std::memory_order_seq_cst);
-            if (!r || addr < r->base || addr >= r->base + r->npages * kPage) continue;
+        for (RegionCursor cursor; Region* r = cursor.next();) {
+            if (addr < r->base || addr >= r->base + r->npages * kPage) continue;
             SharedLock lk(r);
             const uint64_t pg = (addr - r->base) / kPage;
             // guard() (exclusive lock) may have guarded the page since guarded_at above: under the shared lock the bit is final. Releasing a
@@ -312,9 +333,8 @@ LONG CALLBACK on_fault(EXCEPTION_POINTERS* ep) {
     }
     if (!ours) {   // a write fault in a tracked region that no region claims: what each one holds for the page (the crash report follows)
         const DWORD pr = page_protect(addr);
-        for (int i = 0; i < hi; ++i) {
-            Region* r = g_slots[i].load(std::memory_order_seq_cst);
-            if (!r || addr < r->base || addr >= r->base + r->npages * kPage) continue;
+        for (RegionCursor cursor; Region* r = cursor.next();) {
+            if (addr < r->base || addr >= r->base + r->npages * kPage) continue;
             const uint64_t pg = (addr - r->base) / kPage;
             NXLOG_E(kTag, "unclaimed write fault at %llx (protection %lx): region %llx (+%llu pages) prot %d valid %d guard %d ban %d releasing %d",
                     static_cast<unsigned long long>(addr), static_cast<unsigned long>(pr), static_cast<unsigned long long>(r->base),
@@ -333,10 +353,7 @@ template <class Fn>
 void for_regions(uint64_t addr, uint64_t size, Fn&& fn) {
     if (g_live.load(std::memory_order_acquire) == 0 || size == 0) return;
     g_busy.fetch_add(1, std::memory_order_seq_cst);
-    const int hi = g_hi.load(std::memory_order_seq_cst);
-    for (int i = 0; i < hi; ++i) {
-        Region* r = g_slots[i].load(std::memory_order_seq_cst);
-        if (!r) continue;
+    for (RegionCursor cursor; Region* r = cursor.next();) {
         const uint64_t lo = std::max(addr, r->base), end = std::min(addr + size, r->base + r->npages * kPage);
         if (lo >= end) continue;
         const uint64_t first = (lo - r->base) / kPage, last = (end - 1 - r->base) / kPage;
@@ -349,10 +366,7 @@ void for_regions(uint64_t addr, uint64_t size, Fn&& fn) {
 void drop_guard(uint64_t addr, uint64_t size) {
     if (g_live.load(std::memory_order_acquire) == 0 || size == 0) return;
     g_busy.fetch_add(1, std::memory_order_seq_cst);
-    const int hi = g_hi.load(std::memory_order_seq_cst);
-    for (int i = 0; i < hi; ++i) {
-        Region* r = g_slots[i].load(std::memory_order_seq_cst);
-        if (!r) continue;
+    for (RegionCursor cursor; Region* r = cursor.next();) {
         const uint64_t lo = std::max(addr, r->base), end = std::min(addr + size, r->base + r->npages * kPage);
         if (lo >= end) continue;
         const uint64_t first = (lo - r->base) / kPage, last = (end - 1 - r->base) / kPage;
@@ -398,16 +412,23 @@ Region* region_create(uint64_t addr, uint64_t size) {
             NXLOG_W(kTag, "AddVectoredExceptionHandler failed: no write tracking");
             return nullptr;
         }
-        int slot = -1;
-        for (int i = 0; i < kSlots; ++i)
-            if (!g_slots[i].load()) { slot = i; break; }
-        if (slot < 0) {
-            NXLOG_W(kTag, "region table full (%d): no write tracking for %llx", kSlots, static_cast<unsigned long long>(start));
-            return nullptr;
+        SlotBlock* block = &g_slots;
+        for (;;) {
+            int slot = 0;
+            while (slot < kSlotsPerBlock && block->slots[slot].load(std::memory_order_seq_cst)) ++slot;
+            if (slot < kSlotsPerBlock) {
+                r->slot = &block->slots[slot];
+                r->slot->store(r.get(), std::memory_order_seq_cst);
+                if (slot >= block->hi.load()) block->hi.store(slot + 1, std::memory_order_seq_cst);
+                break;
+            }
+            SlotBlock* next = block->next.load(std::memory_order_acquire);
+            if (!next) {
+                next = new SlotBlock;
+                block->next.store(next, std::memory_order_release);
+            }
+            block = next;
         }
-        r->slot = slot;
-        g_slots[slot].store(r.get(), std::memory_order_seq_cst);
-        if (slot >= g_hi.load()) g_hi.store(slot + 1, std::memory_order_seq_cst);
         g_live.fetch_add(1, std::memory_order_seq_cst);
     }
     // Pages that another view shows can never be tracked. Published first, so an alias made from now on bans them through ban_section.
@@ -438,7 +459,7 @@ void region_destroy(Region* r) {
     }
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        g_slots[r->slot].store(nullptr, std::memory_order_seq_cst);
+        r->slot->store(nullptr, std::memory_order_seq_cst);
         g_live.fetch_sub(1, std::memory_order_seq_cst);
     }
     while (g_busy.load(std::memory_order_seq_cst) != 0) std::this_thread::yield();
@@ -468,10 +489,9 @@ bool arm(Region* r, uint64_t first, uint64_t count) {
         if (any_set(r->guard.get(), first, count)) return false;
         bool other = false;
         g_busy.fetch_add(1, std::memory_order_seq_cst);
-        const int hi = g_hi.load(std::memory_order_seq_cst);
-        for (int i = 0; i < hi && !other; ++i) {
-            Region* o = g_slots[i].load(std::memory_order_seq_cst);
-            if (!o || o == r) continue;
+        for (RegionCursor cursor; Region* o = cursor.next();) {
+            if (other) break;
+            if (o == r) continue;
             const uint64_t lo = std::max(a, o->base), end = std::min(a + n, o->base + o->npages * kPage);
             if (lo < end) other = any_set(o->prot.get(), (lo - o->base) / kPage, (end - lo) / kPage);
         }

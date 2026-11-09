@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Shared pieces of the service library: registration, events, shared memory, the title profile and the host folders.
+#define _SILENCE_CXX20_U8PATH_DEPRECATION_WARNING
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <filesystem>
 #include <mutex>
 #include <set>
 
@@ -15,8 +17,12 @@
 #include "nxrt/services.h"
 #include "services_internal.h"
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 
 namespace nxrt::services {
@@ -373,6 +379,86 @@ std::string save_dir() {
     const char* appdata = std::getenv("APPDATA");
     const char* folder = game::info().save_folder;
     return std::string(appdata && *appdata ? appdata : ".") + "\\" + (folder && *folder ? folder : "nxrt") + "\\save";
+}
+
+std::string mods_dir() { return config_get_str("fs", "mods", "mods"); }
+
+namespace {
+std::string u8str(const std::filesystem::path& p) {
+    const std::u8string u = p.u8string();
+    return std::string(reinterpret_cast<const char*>(u.data()), u.size());
+}
+bool is_hex_id(const std::string& s) {
+    return s.size() == 16 && std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isxdigit(c) != 0; });
+}
+void find_mods(const std::filesystem::path& dir, const std::string& name, int depth, std::vector<RomfsMod>& out) {
+    namespace stdfs = std::filesystem;
+    std::error_code ec;
+    const bool romfs = stdfs::is_directory(dir / "romfs", ec), exefs = stdfs::is_directory(dir / "exefs", ec);
+    if (depth > 0 && (romfs || exefs)) {
+        out.push_back({name, romfs ? u8str(dir / "romfs") : std::string(), exefs});
+        return;
+    }
+    if (depth >= 4) return;
+    for (const stdfs::directory_entry& e : stdfs::directory_iterator(dir, ec)) {
+        if (!e.is_directory(ec)) continue;
+        const std::string sub = u8str(e.path().filename());
+        if (sub.empty() || sub[0] == '-' || sub[0] == '_' || sub[0] == '.') {
+            if (!sub.empty() && sub[0] != '.') NXLOG_I("mods", "%s%s%s is off (its name starts with %c)", name.c_str(), name.empty() ? "" : "/", sub.c_str(), sub[0]);
+            continue;
+        }
+        if (is_hex_id(sub) && std::strtoull(sub.c_str(), nullptr, 16) != profile().program_id) continue;   // another title's mods
+        find_mods(e.path(), name.empty() ? sub : name + "/" + sub, depth + 1, out);
+    }
+}
+}  // namespace
+
+std::vector<RomfsMod> installed_mods() {
+    std::vector<RomfsMod> out;
+    std::error_code ec;
+    const std::filesystem::path root = std::filesystem::u8path(mods_dir());
+    if (mods_dir().empty() || !std::filesystem::is_directory(root, ec)) return out;
+    find_mods(root, "", 0, out);
+    std::sort(out.begin(), out.end(), [](const RomfsMod& a, const RomfsMod& b) { return _stricmp(a.name.c_str(), b.name.c_str()) < 0; });
+    return out;
+}
+
+std::string aoc_dir() { return config_get_str("aoc", "dir", "game/dlc"); }
+
+std::vector<AddOnContent> installed_aoc() {
+    namespace stdfs = std::filesystem;
+    std::vector<AddOnContent> out;
+    const uint64_t base = profile().program_id + 0x1000ull;
+    std::error_code ec;
+    const stdfs::path root = stdfs::u8path(aoc_dir());
+    if (!stdfs::is_directory(root, ec)) return out;
+    for (const stdfs::directory_entry& e : stdfs::directory_iterator(root, ec)) {
+        if (!e.is_directory(ec)) continue;
+        const std::string name = e.path().filename().string();
+        if (name.size() != 16 || !std::all_of(name.begin(), name.end(), [](unsigned char c) { return std::isxdigit(c) != 0; })) continue;
+        const uint64_t id = std::strtoull(name.c_str(), nullptr, 16);
+        if ((id & ~0xFFFull) != base || (id & 0xFFFull) == 0) continue;
+        stdfs::path rom = e.path() / "romfs";
+        if (!stdfs::is_directory(rom, ec)) {
+            // one level down: "<id>/<n>/romfs", the highest numbered folder that has a romfs/
+            rom.clear();
+            long best = -1;
+            for (const stdfs::directory_entry& sub : stdfs::directory_iterator(e.path(), ec)) {
+                const std::string sn = sub.path().filename().string();
+                if (sn.empty() || !std::all_of(sn.begin(), sn.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) continue;
+                const long n = std::strtol(sn.c_str(), nullptr, 10);
+                if (n > best && stdfs::is_directory(sub.path() / "romfs", ec)) {
+                    best = n;
+                    rom = sub.path() / "romfs";
+                }
+            }
+            if (rom.empty()) continue;
+        }
+        const std::u8string u = rom.u8string();
+        out.push_back({id, static_cast<uint32_t>(id & 0xFFFull), std::string(reinterpret_cast<const char*>(u.data()), u.size())});
+    }
+    std::sort(out.begin(), out.end(), [](const AddOnContent& a, const AddOnContent& b) { return a.index < b.index; });
+    return out;
 }
 
 }  // namespace nxrt::services

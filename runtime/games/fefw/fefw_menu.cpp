@@ -81,6 +81,7 @@ struct IniKey {
 };
 constexpr IniKey kIni[] = {
     {"fefw", "output", "console", Norm::Text, true, "output size"},
+    {"fefw", "ultrawide", "auto", Norm::Text, true, "ultrawide"},
     {"fefw", "render_ratio", "0", Norm::Number, true, "render scale"},
     {"fefw", "render", "", Norm::Text, true, "fixed render size"},
     {"fefw", "shadow_size", "0", Norm::Number, true, "shadow resolution"},
@@ -473,8 +474,11 @@ void display_page(UiHost& host, Menu& m, const play::LiveStatus& live) {
 
 // ---- Graphics ---------------------------------------------------------------------------------------------------------------------------
 constexpr const char* kOutputNames[] = {"Console (the game's choice: 1440p docked)", "1280 x 720", "1920 x 1080", "2560 x 1440", "3840 x 2160",
-                                        "The window's size at start"};
-constexpr const char* kOutputVals[] = {"console", "720p", "1080p", "1440p", "2160p", "window"};
+                                        "2560 x 1080 (21:9)", "3440 x 1440 (21:9)", "5120 x 1440 (32:9, drawn at 3840 x 1080)", "The window's size at start"};
+constexpr const char* kOutputVals[] = {"console", "720p", "1080p", "1440p", "2160p", "2560x1080", "3440x1440", "5120x1440", "window"};
+constexpr int kOutputCount = static_cast<int>(std::size(kOutputVals));
+constexpr const char* kWideNames[] = {"Auto (outputs wider than 16:9)", "Off (16:9, stretched)"};
+constexpr const char* kWideVals[] = {"auto", "off"};
 constexpr const char* kRatioNames[] = {"Game default (half per side)", "33% (ultra performance)", "50% (performance)", "59% (balanced)",
                                        "67% (quality)", "75%", "85%", "100% (native: anti-aliasing only)"};
 constexpr const char* kRatioVals[] = {"0", "0.33", "0.5", "0.59", "0.67", "0.75", "0.85", "1.0"};
@@ -490,16 +494,29 @@ constexpr const char* kFgVals[] = {"0", "dlss", "fsr3"};
 constexpr const char* kHdrModeNames[] = {"Off", "Auto", "On", "Native"};
 constexpr const char* kHdrFormatNames[] = {"Auto", "HDR10", "scRGB"};
 
-// The output size an [fefw] output value means (0 x 0: the config's own).
-void output_size(const std::string& v, int* w, int* h) {
+// The output size an [fefw] output value means (0 x 0: the config's own), as fefw_res.cpp works it out: a window is fitted to 16:9 unless
+// it is wider and ultrawide is on; with ultrawide on a narrower size gets 16:9 inside it.
+void output_size(const std::string& v, bool wide, int* w, int* h) {
     *w = *h = 0;
     const std::string o = lower(v);
     if (o == "720p") *w = 1280, *h = 720;
     else if (o == "1080p") *w = 1920, *h = 1080;
     else if (o == "1440p") *w = 2560, *h = 1440;
     else if (o == "2160p" || o == "4k") *w = 3840, *h = 2160;
-    else if (o == "window") platform::pixel_size(w, h);
-    else std::sscanf(o.c_str(), "%dx%d", w, h);
+    else if (o == "window") {
+        platform::pixel_size(w, h);
+        if (*w > 0 && *h > 0 && !(wide && wide_aspect(*w, *h))) {
+            const int fw = std::min(*w, *h * 16 / 9);
+            *w = fw & ~1;
+            *h = (fw * 9 / 16) & ~1;
+        }
+    } else std::sscanf(o.c_str(), "%dx%d", w, h);
+    if (wide && *w > 0 && *h > 0 && static_cast<double>(*w) * 9.0 * 1.01 < static_cast<double>(*h) * 16.0) *h = (*w * 9 / 16) & ~1;
+    if (wide && wide_aspect(*w, *h) && (*w > 3840 || *h > 2160)) {   // the shape within the 3840x2160 window textures
+        const double s = std::min(3840.0 / *w, 2160.0 / *h);
+        *w = 2 * static_cast<int>(std::lround(*w * s / 2));
+        *h = 2 * static_cast<int>(std::lround(*h * s / 2));
+    }
 }
 
 void resolution_group(Menu& m) {
@@ -512,17 +529,22 @@ void resolution_group(Menu& m) {
             const std::string v = lower(ini_now(out));
             const char* cur = v == "4k" ? "2160p" : v.c_str();
             row(m, "Output size", When::Restart,
-                "The size the game renders its picture, UI and post effects at (its DLSS output). Up to 3840 x 2160. The window scales it "
-                "(Display > Scaling to the window).");
+                "The size the game renders its picture, UI and post effects at (its DLSS output). Up to 3840 x 2160 at 16:9; wider shapes "
+                "need Ultrawide. The window scales it (Display > Scaling to the window).");
             if (!env_locked(out)) {
                 int idx = -1;
-                for (int i = 0; i < 6; ++i)
+                for (int i = 0; i < kOutputCount; ++i)
                     if (cur == std::string(kOutputVals[i])) idx = i;
                 const std::string other = "Custom: " + ini_now(out);
-                if (combo(m, "##out", &idx, kOutputNames, 6, other.c_str())) ini_put(m, out, kOutputVals[idx]);
+                if (combo(m, "##out", &idx, kOutputNames, kOutputCount, other.c_str())) ini_put(m, out, kOutputVals[idx]);
                 pending_note(ini_pending(m, out), ini_boot(m, out));
             }
         }
+        ini_combo_row(m, *ini_key("fefw", "ultrawide"), "Ultrawide",
+                      "An output wider than 16:9 (21:9, 32:9, or a wide window with Output size = the window's size) widens the 3D view and "
+                      "keeps the menus, HUD, text and movies in the centred 16:9 area, after Kompas9's ultrawide patch. A narrower output "
+                      "(16:10) gets the 16:9 picture letterboxed. Off: the game's 16:9 picture is stretched to a wide output.",
+                      kWideNames, kWideVals, 2);
         ini_combo_row(m, *ini_key("fefw", "render_ratio"), "Render scale",
                       "The 3D render size per side as a share of the output; the game's upscaler (Graphics > Upscaler) fills the rest. "
                       "100% renders at the output size and only anti-aliases.",
@@ -549,16 +571,22 @@ void resolution_group(Menu& m) {
     }
     // what the chosen sizes mean
     int ow = 0, oh = 0;
-    output_size(ini_now(*ini_key("fefw", "output")), &ow, &oh);
+    const bool wide_next = lower(ini_now(*ini_key("fefw", "ultrawide"))) != "off";
+    output_size(ini_now(*ini_key("fefw", "output")), wide_next, &ow, &oh);
     const double ratio = std::atof(ini_now(*ini_key("fefw", "render_ratio")).c_str());
     if (ow > 0 && oh > 0) {
         int rw = ratio > 0 ? 2 * static_cast<int>(std::lround(ow * std::clamp(ratio, 0.25, 1.0) / 2)) : (ow + 1) / 2;
         int rh = ratio > 0 ? 2 * static_cast<int>(std::lround(oh * std::clamp(ratio, 0.25, 1.0) / 2)) : (oh + 1) / 2;
         const bool capped = !res_rt_pool_extended() && static_cast<int64_t>(ow) * oh > 2560 * 1440 && (rw > (ow + 1) / 2 || rh > (oh + 1) / 2);
         if (capped) rw = (ow + 1) / 2, rh = (oh + 1) / 2;
-        ImGui::TextDisabled("Next start: %d x %d rendered into %d x %d%s", rw, rh, ow, oh,
-                            capped ? " (above 1440p the game's render-target pool holds half per side at most)" : "");
+        ImGui::TextDisabled("Next start: %d x %d rendered into %d x %d%s%s", rw, rh, ow, oh,
+                            capped ? " (above 1440p the game's render-target pool holds half per side at most)" : "",
+                            wide_next && wide_aspect(ow, oh) ? ", ultrawide" : "");
     }
+    const WideInfo wi = wide_info();
+    if (wi.active)
+        ImGui::TextDisabled("Ultrawide now: %d x %d, %.2fx a 16:9 picture's width; UI in the centred %d x %d", wi.out_w, wi.out_h,
+                            static_cast<double>(wi.k), static_cast<int>(std::lround(wi.out_h * 16.0 / 9.0)), wi.out_h);
 }
 
 void upscaler_group(Menu& m) {
@@ -567,7 +595,8 @@ void upscaler_group(Menu& m) {
         const IniKey& up = *ini_key("dlss", "upscaler");
         ini_combo_row(m, up, "Upscaler",
                       "What answers the game's DLSS calls. TAAU needs nothing; DLSS needs an RTX GPU and the Streamline DLLs ([upscale] dlss_dll); "
-                      "FSR 3 the FidelityFX DLLs ([upscale] fsr_dll). One that cannot run falls back to TAAU and says so in the log.",
+                      "FSR 3 the FidelityFX DLLs ([upscale] fsr_dll). One that cannot run falls back to TAAU and says so in the log. "
+                      "Choosing DLSS (or Auto with the DLLs present) takes effect at the next start.",
                       kUpscalerNames, kUpscalerVals, 5);
         const std::string u = lower(ini_now(up));
         if (u == "fsr3")
@@ -820,6 +849,61 @@ constexpr const char* kPromptNames[] = {"Switch (the game's own)", "Xbox", "Play
 
 uint64_t pad_choice_value(int c) { return c == 0 ? play::kPadDefault : c == 1 ? 0 : static_cast<uint64_t>(hid::btn(kPadChoiceBits[c - 2])); }
 
+// The keys of controls.ini's [bindings.*] sections, by the Switch button or stick they drive (read only: they are changed in the file).
+struct KeyRowName {
+    play::Act act;
+    const char* label;
+};
+constexpr KeyRowName kKeyRows[] = {
+    {play::Act::MoveForward, "Move up (left stick)"},  {play::Act::MoveBack, "Move down (left stick)"},
+    {play::Act::MoveLeft, "Move left (left stick)"},   {play::Act::MoveRight, "Move right (left stick)"},
+    {play::Act::LookUp, "Camera up (right stick)"},    {play::Act::LookDown, "Camera down (right stick)"},
+    {play::Act::LookLeft, "Camera left (right stick)"}, {play::Act::LookRight, "Camera right (right stick)"},
+    {play::Act::BtnA, "A"}, {play::Act::Confirm, "A"}, {play::Act::BtnB, "B"}, {play::Act::Back, "B"}, {play::Act::BtnX, "X"},
+    {play::Act::BtnY, "Y"}, {play::Act::BtnL, "L"}, {play::Act::BtnR, "R"}, {play::Act::BtnZL, "ZL"}, {play::Act::BtnZR, "ZR"},
+    {play::Act::BtnPlus, "+ (menu)"}, {play::Act::BtnMinus, "-"}, {play::Act::DpadUp, "D-pad up"}, {play::Act::DpadDown, "D-pad down"},
+    {play::Act::DpadLeft, "D-pad left"}, {play::Act::DpadRight, "D-pad right"}, {play::Act::BtnLStick, "Left stick click"},
+    {play::Act::BtnRStick, "Right stick click"},
+};
+
+void keyboard_section(Menu& m) {
+    section("Keyboard");
+    ImGui::TextWrapped("The keys each Switch button or stick has. To change them, close the game and edit [bindings.all] in controls.ini.");
+    if (!begin_rows("keys")) return;
+    std::vector<std::pair<std::string, std::string>> rows;   // label, keys
+    auto add = [&](const std::string& label, const std::string& key) {
+        for (auto& r : rows)
+            if (r.first == label) {
+                r.second += ", " + key;
+                return;
+            }
+        rows.push_back({label, key});
+    };
+    for (const KeyRowName& k : kKeyRows)
+        for (const play::Binding& b : m.edit.bindings)
+            if (b.act == k.act) {
+                std::string key = play::input_name(b.in);
+                if (b.ctx != play::Ctx::All) key += std::string(" (") + play::ctx_name(b.ctx) + ")";
+                add(k.label, key);
+            }
+    for (const play::Binding& b : m.edit.bindings) {   // anything else bound (by its settings-file name)
+        bool listed = b.act == play::Act::None;
+        for (const KeyRowName& k : kKeyRows) listed |= k.act == b.act;
+        if (!listed) add(play::act_info(b.act).name, play::input_name(b.in));
+    }
+    for (const auto& [label, keys] : rows) {
+        row(m, label.c_str(), When::Info, nullptr);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(keys.c_str());
+    }
+    if (rows.empty()) {
+        row(m, "No keys bound", When::Info, nullptr);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("[bindings.all] in controls.ini");
+    }
+    end_rows();
+}
+
 void controls_page(UiHost& host, Menu& m, const play::LiveStatus& live) {
     play::PadSettings& p = m.edit.pad;
     section("Controller");
@@ -877,12 +961,41 @@ void controls_page(UiHost& host, Menu& m, const play::LiveStatus& live) {
         for (uint64_t& v : p.remap) v = play::kPadDefault;
         apply(host, m);
     }
+    keyboard_section(m);
     ImGui::Spacing();
     ImGui::TextDisabled("This menu: F1, or Minus and Plus together on the pad. The game gets no input while it is open.");
 }
 
 // ---- Game -------------------------------------------------------------------------------------------------------------------------------
+// The languages the game ships (games/fefw/fefw_data.cpp), by the names the settings service reads (services/common.cpp). "" is Automatic.
+// ImGui's font has no CJK glyphs, so the names are English.
+constexpr const char* kLangNames[] = {"Automatic (Windows language)", "English (US)",   "English (UK)",           "Japanese",
+                                      "French",                       "French (Canada)", "German",                 "Italian",
+                                      "Spanish (Spain)",              "Spanish (Latin America)", "Korean",         "Chinese (Simplified)",
+                                      "Chinese (Traditional)"};
+constexpr const char* kLangVals[] = {"",       "AmericanEnglish", "BritishEnglish", "Japanese", "French", "CanadianFrench", "German",
+                                     "Italian", "Spanish",        "LatinAmericanSpanish", "Korean", "SimplifiedChinese", "TraditionalChinese"};
+constexpr int kLangCount = 13;
+
 void game_page(UiHost& host, Menu& m) {
+    section("Language");
+    if (begin_rows("lang")) {
+        row(m, "Game language", When::Restart,
+            "The language of the game's text and voices. Automatic uses your Windows display language when the game has it, else English. "
+            "It applies the next time the game starts. [tweaks] language in controls.ini; [system] language in fefw.ini wins over it.");
+        std::string& lang = m.edit.fastboot.language;
+        int sel = -1;
+        for (int i = 0; i < kLangCount; ++i) {
+            const std::string want = kLangVals[i];
+            if (want.size() == lang.size() && std::equal(want.begin(), want.end(), lang.begin(), [](char a, char b) { return std::tolower(a) == std::tolower(b); }))
+                sel = i;
+        }
+        if (combo(m, "##lang", &sel, kLangNames, kLangCount, lang.c_str())) {
+            lang = kLangVals[sel];
+            apply(host, m);
+        }
+        end_rows();
+    }
     section("Movies");
     if (begin_rows("mov")) {
         constexpr const char* kNames[] = {"Play them (AV1 on the CPU)", "Skip them"};
@@ -1011,6 +1124,18 @@ void debug_page(UiHost& host, Menu& m, gfx::Overlay& ov) {
     else
         ImGui::TextDisabled("Not running yet (title or loading).");
     ImGui::TextDisabled("Hooks at start: fps60 %s, fps120 %s, smooth step %s", ck.fps60 ? "on" : "off", ck.fps120 ? "on" : "off", ck.smooth ? "on" : "off");
+
+    section("Ultrawide");
+    const WideInfo wi = wide_info();
+    if (!wi.active) {
+        ImGui::TextDisabled("Not installed: the output is 16:9 or narrower, or [fefw] ultrawide = off.");
+    } else {
+        ImGui::Text("Output %d x %d (%.4fx 16:9). Times each hook changed something:", wi.out_w, wi.out_h, static_cast<double>(wi.k));
+        for (int n = 0; n < WideInfo::kCounters; ++n) {
+            ImGui::TextDisabled("%s %llu", wi.names[n] ? wi.names[n] : "?", static_cast<unsigned long long>(wi.counts[n]));
+            if (n % 5 != 4 && n + 1 < WideInfo::kCounters) ImGui::SameLine(0, 18);
+        }
+    }
 
     section("Logging");
     if (begin_rows("log")) {

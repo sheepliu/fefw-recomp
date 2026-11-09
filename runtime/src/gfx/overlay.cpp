@@ -480,7 +480,13 @@ std::unique_ptr<Overlay> Overlay::create(const Context& ctx, std::string* error)
     ii.ImageCount = std::max(2u, ctx.renderer->image_count());
     ii.UseDynamicRendering = true;
     ii.PipelineInfoMain.PipelineRenderingCreateInfo = rci;
-    ii.CheckVkResultFn = [](VkResult r) { if (r != VK_SUCCESS) NXLOG_E(kTag, "ImGui Vulkan call failed (%d)", static_cast<int>(r)); };
+    ii.CheckVkResultFn = [](VkResult r) {
+        static bool logged = false;
+        if (r != VK_SUCCESS && !logged) {
+            logged = true;
+            NXLOG_E(kTag, "ImGui Vulkan call failed (%d); incomplete overlay draws are skipped", static_cast<int>(r));
+        }
+    };
     if (!ImGui_ImplVulkan_Init(&ii)) {
         if (error) *error = "ImGui_ImplVulkan_Init failed";
         ImGui::DestroyContext(s.imgui);
