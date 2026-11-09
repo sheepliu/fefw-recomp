@@ -59,6 +59,7 @@ jobs:
           "upstream_url=$($upstream.html_url)" >> $env:GITHUB_OUTPUT
           "source_commit=$commit" >> $env:GITHUB_OUTPUT
           Write-Host "Fork $commit; upstream $($upstream.tag_name); release $tag"
+          exit 0
 
       - name: Setup Python, Node, Rust and .NET
         if: steps.version.outputs.exists != 'true'
