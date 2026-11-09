@@ -119,6 +119,8 @@ jobs:
         shell: pwsh
         working-directory: launcher
         run: |
+          $env:RUSTFLAGS = "--remap-path-prefix=$($env:USERPROFILE)=~ --remap-path-prefix=$($env:GITHUB_WORKSPACE)=."
+          if ($env:CARGO_HOME) { $env:RUSTFLAGS += " --remap-path-prefix=$($env:CARGO_HOME)=cargo" }
           npm ci
           if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
           npm run tauri build -- --no-bundle
