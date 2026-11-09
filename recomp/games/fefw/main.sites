@@ -15,3 +15,10 @@ entryhook 0x710005d170
 # (`ldr s0, [x19, #0x168]`): s0 = the measured time since the last frame and s1 = the step the game chose (60 / target unless s0 is over it
 # by 0.1), both in frames of 1/59.94 s; the hook may replace s1
 inline 0x710180ef44
+
+# F1 runtime mod host: the native inventory commit, gift score writer, and the
+# instruction after the gift's call to that writer. These sites do no work when
+# their corresponding runtime package is not enabled.
+entryhook 0x71008a25c0
+entryhook 0x71008ec500
+inline 0x71010262cc

@@ -1,5 +1,9 @@
 # Third-party notices
 
+The F1 mod host uses nlohmann/json (MIT, copyright 2013-2022 Niels Lohmann).
+Its complete license is at `licenses/LICENSE.nlohmann-json.MIT.txt` in the
+release package and `runtime/third_party/nlohmann/LICENSE.MIT` in the source.
+
 The nxrt files below name SuperMarioWonderRecomp as a source in their header comments, and the provenance table in README.md lists them: include/nxrt/diag.h, include/nxrt/dispatch.h, include/nxrt/ipc.h, include/nxrt/kernel.h, include/nxrt/memory.h, include/nxrt/module.h, include/nxrt/svc.h, src/core/dispatch.cpp, src/diag/memguard.cpp, src/diag/watchdog.cpp, src/ipc/ipc.cpp, src/ipc/sm.cpp, src/kernel/handles.cpp, src/kernel/kernel_sync.cpp, src/kernel/svc.cpp, src/kernel/svc_info.cpp, src/kernel/svc_memory.cpp, src/kernel/svc_thread.cpp, src/kernel/thread.cpp, src/kernel/time.cpp, src/loader/module.cpp.
 
 ## SuperMarioWonderRecomp (MIT)

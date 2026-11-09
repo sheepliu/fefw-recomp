@@ -1,0 +1,198 @@
+name: Sync upstream and publish mod-host package
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-modhost-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'sheepliu/fefw-recomp'
+    runs-on: windows-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Merge latest upstream master
+        shell: bash
+        run: |
+          git remote add upstream https://github.com/Goldoire/fefw-recomp.git
+          git fetch upstream master
+          if ! git merge-base --is-ancestor upstream/master HEAD; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git merge --no-ff --no-edit upstream/master
+          fi
+
+      - name: Resolve upstream release and unique fork tag
+        id: version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $upstream = gh api repos/Goldoire/fefw-recomp/releases/latest | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot query the latest upstream release' }
+          if ($upstream.tag_name -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+([-.][a-zA-Z0-9.-]+)?$') {
+            throw "Unexpected upstream release tag: $($upstream.tag_name)"
+          }
+          $commit = (git rev-parse HEAD).Trim()
+          $short = $commit.Substring(0, 12)
+          $tag = "modhost-$($upstream.tag_name)-$short"
+          $version = "$($upstream.tag_name.TrimStart('v'))-modhost.$short"
+          $exists = (gh release view $tag --repo $env:GITHUB_REPOSITORY --json tagName 2>$null)
+          if ($LASTEXITCODE -eq 0 -and $exists) { 'exists=true' >> $env:GITHUB_OUTPUT }
+          else { 'exists=false' >> $env:GITHUB_OUTPUT }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "upstream_tag=$($upstream.tag_name)" >> $env:GITHUB_OUTPUT
+          "upstream_url=$($upstream.html_url)" >> $env:GITHUB_OUTPUT
+          "source_commit=$commit" >> $env:GITHUB_OUTPUT
+          Write-Host "Fork $commit; upstream $($upstream.tag_name); release $tag"
+
+      - name: Setup Python, Node, Rust and .NET
+        if: steps.version.outputs.exists != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        if: steps.version.outputs.exists != 'true'
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: launcher/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.version.outputs.exists != 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.version.outputs.exists != 'true'
+        with:
+          workspaces: launcher/src-tauri
+      - uses: actions/setup-dotnet@v4
+        if: steps.version.outputs.exists != 'true'
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install LLVM 23 and Ninja
+        if: steps.version.outputs.exists != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install ninja
+          if ($LASTEXITCODE -ne 0) { throw 'Ninja installation failed' }
+          $asset = 'clang+llvm-23.1.5-x86_64-pc-windows-msvc.tar.xz'
+          New-Item -ItemType Directory -Force work/toolchain | Out-Null
+          gh release download llvmorg-23.1.5 --repo llvm/llvm-project --pattern $asset --dir work/toolchain
+          if ($LASTEXITCODE -ne 0) { throw 'LLVM 23 download failed' }
+          tar -xf "work/toolchain/$asset" -C work/toolchain
+          if ($LASTEXITCODE -ne 0) { throw 'LLVM 23 extraction failed' }
+          $bin = (Resolve-Path 'work/toolchain/clang+llvm-23.1.5-x86_64-pc-windows-msvc/bin').Path
+          if (-not (Test-Path (Join-Path $bin 'clang-cl.exe'))) { throw 'LLVM 23 clang-cl.exe is missing' }
+          "NX_LLVM=$bin" >> $env:GITHUB_ENV
+          "NX_LLVM_BIN=$bin" >> $env:GITHUB_ENV
+          "LLVM_BIN=$bin" >> $env:GITHUB_ENV
+          "$bin" >> $env:GITHUB_PATH
+          cmake --version
+          ninja --version
+
+      - name: Validate mod framework
+        if: steps.version.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          python -X utf8 -m unittest discover -s tools/mods -p 'test_*.py'
+          if ($LASTEXITCODE -ne 0) { throw 'Mod framework tests failed' }
+
+      - name: Build production launcher
+        if: steps.version.outputs.exists != 'true'
+        shell: pwsh
+        working-directory: launcher
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+          npm run tauri build -- --no-bundle
+          if ($LASTEXITCODE -ne 0) { throw 'Tauri release build failed' }
+
+      - name: Build game-independent runtime DLL
+        if: steps.version.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          pwsh -File tools/textures/scripts/fetch_third_party.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Texture dependencies failed' }
+          pwsh -File game-build/scripts/build_fefw.ps1 -Target fefw_rt -BuildDir build/rtdll -CMakeArgs '-DFEFW_RT_DLL=ON' -Jobs 8
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime DLL build failed' }
+
+      - name: Stage pinned shader translator
+        if: steps.version.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          git clone --filter=blob:none --no-checkout https://git.ryujinx.app/ryubing/ryujinx.git work/refs/ryubing
+          if ($LASTEXITCODE -ne 0) { throw 'Shader translator checkout failed' }
+          git -C work/refs/ryubing checkout a82350bb774f70fcbd41c9987bf67a3775409963
+          if ($LASTEXITCODE -ne 0) { throw 'Shader translator revision unavailable' }
+          pwsh -File tools/shaders/scripts/setup_ryujinx.ps1 -Ryubing work/refs/ryubing
+          if ($LASTEXITCODE -ne 0) { throw 'Shader translator staging failed' }
+
+      - name: Build release ZIP without game data or mod packages
+        if: steps.version.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          pwsh -File game-build/scripts/make-release.ps1 -Version '${{ steps.version.outputs.version }}' -RtDir game-build/fefw/build/rtdll -Launcher launcher/src-tauri/target/release/fefw-launcher.exe -Out work/release
+          if ($LASTEXITCODE -ne 0) { throw 'Release package build failed' }
+          $zip = "work/release/fefw-recomp-${{ steps.version.outputs.version }}-win64.zip"
+          Add-Type -AssemblyName System.IO.Compression
+          $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip).Path)
+          try {
+            $entries = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+            foreach ($required in @('fefw-launcher.exe', 'fefw_rt.dll', 'tools/build/fefw_build.py', 'tools/build/modpack.py')) {
+              if (-not @($entries | Where-Object { $_.EndsWith("/$required") }).Count) { throw "Missing release file: $required" }
+            }
+            $forbidden = @($entries | Where-Object { $_ -match '(?i)(^|/)(mods|mod-packages|romfs|exefs|save|shader_cache)(/|$)|\.ips(32)?$|/fefw\.exe$' })
+            if ($forbidden.Count) { throw "Game data or mod package in release: $($forbidden[0])" }
+          } finally { $archive.Dispose() }
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path -Leaf $zip)" | Set-Content "${zip}.sha256" -Encoding ascii
+
+      - name: Push validated upstream merge
+        if: steps.version.outputs.exists != 'true'
+        shell: bash
+        run: |
+          if [ "$(git rev-parse HEAD)" != "${{ github.sha }}" ]; then
+            git push origin HEAD:master
+          fi
+
+      - name: Publish versioned release with notes
+        if: steps.version.outputs.exists != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ steps.version.outputs.tag }}'
+          $notes = @'
+          ## Version
+          - Upstream public release: [${{ steps.version.outputs.upstream_tag }}](${{ steps.version.outputs.upstream_url }})
+          - Source: upstream master merged into this fork at `${{ steps.version.outputs.source_commit }}`.
+          - This is a fork prerelease, separate from the upstream release.
+
+          ## Changes
+          - Launcher Mods page for IPS/IPS32 packages and compatible runtime mod manifests.
+          - ExeFS patches are applied to a staged copy during Setup; original game files remain unchanged.
+          - Game runtime includes an F1 Mods interface; runtime mod packages must be installed separately.
+          - The release includes the launcher, runtime and offline build tools, but no game, saves, shader cache, IPS patches, or mod packages.
+
+          ## Install
+          Extract the ZIP and start `fefw-launcher.exe`. Select your own game dump and run Setup to compile the game on your PC. See `README.txt` in the ZIP. The `.sha256` asset verifies the download.
+          '@
+          $notes | Set-Content work/release/notes.md -Encoding utf8
+          gh release create $tag "work/release/fefw-recomp-${{ steps.version.outputs.version }}-win64.zip" "work/release/fefw-recomp-${{ steps.version.outputs.version }}-win64.zip.sha256" --repo $env:GITHUB_REPOSITORY --target '${{ steps.version.outputs.source_commit }}' --title "FEFW mod host ${{ steps.version.outputs.upstream_tag }} (${{ steps.version.outputs.source_commit }})" --notes-file work/release/notes.md --prerelease
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release publishing failed' }

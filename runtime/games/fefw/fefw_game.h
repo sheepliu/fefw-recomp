@@ -48,6 +48,9 @@ void set_clock_log(int period_s);   // live
 
 // fefw_menu.cpp: the F1 menu (GamePlay::settings_menu)
 void settings_menu(play::UiHost& host, gfx::Overlay& overlay);
+void mods_install(uint64_t base);
+void mods_remove();
+void mods_page();
 
 // fefw_res.cpp: [fefw] output / render_ratio / render / shadow_size / quality (the render configs, notes/resolution.md)
 void res_install(uint64_t base);

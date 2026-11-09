@@ -76,7 +76,19 @@ impl Paths {
     pub fn exe(&self) -> PathBuf {
         match &self.package {
             Some(_) => self.in_game(&["fefw.exe"]),
+            None if self.dev_mod_build() => self.in_game(&["mod-build", "active", "fefw.exe"]),
             None => exe_path(&self.repo),
+        }
+    }
+    pub fn dev_mod_build(&self) -> bool {
+        self.package.is_none() && (self.in_game(&["mods-state.json"]).is_file()
+            || self.in_game(&["mod-build", "done.json"]).is_file())
+    }
+    pub fn runtime_main(&self) -> String {
+        if self.dev_mod_build() {
+            crate::dump::fwd(&self.in_game(&["mod-build", "active", "main"]))
+        } else {
+            String::new()
         }
     }
     pub fn harness(&self) -> PathBuf {
@@ -123,16 +135,34 @@ impl Paths {
     }
 }
 
-/// The last `fefw_build.py --check`: (done.json mtime and size, fefw.exe mtime) -> current. The tools do not change while the
-/// launcher runs and a finished build rewrites done.json, so one Python run per finished build is enough.
-type CheckKey = (Option<std::time::SystemTime>, u64, Option<std::time::SystemTime>);
+/// Cache the package check until the build output or a mod package/enablement changes.
+type CheckKey = (PathBuf, Option<std::time::SystemTime>, u64, Option<std::time::SystemTime>,
+                 Vec<(PathBuf, Option<std::time::SystemTime>, u64)>);
 static BUILD_CHECK: Mutex<Option<(CheckKey, bool)>> = Mutex::new(None);
+static DEV_BUILD_CHECK: Mutex<Option<(CheckKey, bool)>> = Mutex::new(None);
+
+fn mod_revision(game_dir: &Path) -> Vec<(PathBuf, Option<std::time::SystemTime>, u64)> {
+    let mut pending = vec![game_dir.join("mods"), game_dir.join("mods-state.json")];
+    let mut entries = Vec::new();
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path).ok();
+        entries.push((path.strip_prefix(game_dir).unwrap_or(&path).to_path_buf(),
+                      metadata.as_ref().and_then(|m| m.modified().ok()), metadata.as_ref().map_or(0, |m| m.len())));
+        if metadata.as_ref().is_some_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
+            if let Ok(children) = fs::read_dir(path) {
+                pending.extend(children.filter_map(Result::ok).map(|entry| entry.path()));
+            }
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
 
 fn package_build_ok(p: &Paths) -> bool {
     let Some(tools) = &p.package else { return false };
     let done = p.in_game(&["build", "done.json"]);
     let (Ok(dm), true) = (fs::metadata(&done), p.exe().is_file()) else { return false };
-    let key: CheckKey = (dm.modified().ok(), dm.len(), mtime(&p.exe()));
+    let key: CheckKey = (p.game_dir.clone(), dm.modified().ok(), dm.len(), mtime(&p.exe()), mod_revision(&p.game_dir));
     if let Some((k, b)) = BUILD_CHECK.lock().unwrap().as_ref() {
         if *k == key {
             return *b;
@@ -212,6 +242,9 @@ fn exefs_ok(p: &Paths) -> bool {
 }
 
 fn libs_ok(p: &Paths) -> bool {
+    if p.dev_mod_build() {
+        return dev_build_ok(p);
+    }
     let main = mtime(&p.plain_exefs().join("main"));
     MODULES.iter().all(|m| {
         let lib = p.libs().join(format!("fefw_{m}.lib"));
@@ -220,8 +253,57 @@ fn libs_ok(p: &Paths) -> bool {
 }
 
 fn exe_ok(p: &Paths) -> bool {
+    if p.dev_mod_build() {
+        return dev_build_ok(p);
+    }
     let exe = mtime(&p.exe());
     exe.is_some() && MODULES.iter().all(|m| mtime(&p.libs().join(format!("fefw_{m}.lib"))) <= exe)
+}
+
+fn dev_build_ok(p: &Paths) -> bool {
+    if !p.python().is_file() {
+        return false;
+    }
+    let done = p.in_game(&["mod-build", "done.json"]);
+    let mut revisions = mod_revision(&p.game_dir);
+    for name in MODULES {
+        let path = p.plain_exefs().join(name);
+        let meta = fs::metadata(&path).ok();
+        revisions.push((path, meta.as_ref().and_then(|m| m.modified().ok()), meta.as_ref().map_or(0, |m| m.len())));
+    }
+    for path in [p.in_game(&["mod-build", "active", "main"]),
+                 p.exe(), p.repo.join("tools").join("mods").join("dev_build.py"),
+                 p.repo.join("tools").join("mods").join("modpack.py")] {
+        let meta = fs::metadata(&path).ok();
+        revisions.push((path, meta.as_ref().and_then(|m| m.modified().ok()), meta.as_ref().map_or(0, |m| m.len())));
+    }
+    for name in ["recomp/scripts/build_game.cmd", "recomp/games/fefw/CMakeLists.txt",
+                 "recomp/games/fefw/main.sites", "game-build/scripts/build_fefw.ps1",
+                 "game-build/fefw/CMakeLists.txt", "runtime/games/fefw/CMakeLists.txt",
+                 "runtime/games/fefw/fefw_game.cpp", "runtime/games/fefw/fefw_game.h",
+                 "runtime/games/fefw/fefw_menu.cpp", "runtime/games/fefw/fefw_mods.cpp",
+                 "runtime/games/fefw/fefw_mods.h", "runtime/games/fefw/fefw_mods_menu.cpp",
+                 "runtime/src/gfx/overlay.cpp", "runtime/third_party/nlohmann/json.hpp"] {
+        let path = p.repo.join(name);
+        let meta = fs::metadata(&path).ok();
+        revisions.push((path, meta.as_ref().and_then(|m| m.modified().ok()), meta.as_ref().map_or(0, |m| m.len())));
+    }
+    let dm = fs::metadata(&done).ok();
+    let key: CheckKey = (p.game_dir.clone(), dm.as_ref().and_then(|m| m.modified().ok()),
+                         dm.as_ref().map_or(0, |m| m.len()), mtime(&p.exe()), revisions);
+    if let Some((prior, ok)) = DEV_BUILD_CHECK.lock().unwrap().as_ref() {
+        if *prior == key {
+            return *ok;
+        }
+    }
+    let mut cmd = Command::new(p.python());
+    cmd.arg("-I").arg(p.repo.join("tools").join("mods").join("dev_build.py"))
+        .arg("check").arg("--repo").arg(&p.repo).arg("--game").arg(&p.game_dir);
+    quiet(&mut cmd);
+    let ok = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false);
+    *DEV_BUILD_CHECK.lock().unwrap() = Some((key, ok));
+    ok
 }
 
 fn textures_ok(p: &Paths) -> bool {
@@ -315,6 +397,7 @@ pub struct Runner<'a> {
     pub emit: &'a (dyn Fn(Progress) + Sync),
     pub emit_log: &'a (dyn Fn(Vec<String>) + Sync),
     pub log_file: Mutex<Option<fs::File>>,
+    pub llvm_bin: Option<PathBuf>,
 }
 
 impl Runner<'_> {
@@ -355,6 +438,9 @@ impl Runner<'_> {
         self.log(vec![format!("> {:?}", cmd)]);
         cmd.current_dir(cwd);
         cmd.env("PYTHONUNBUFFERED", "1").env("NINJA_STATUS", "[%f/%t] ");
+        if let Some(bin) = &self.llvm_bin {
+            cmd.env("NX_LLVM", bin).env("NX_LLVM_BIN", bin);
+        }
         quiet(&mut cmd);
         let mut child = cmd
             .stdin(Stdio::null())
@@ -443,6 +529,39 @@ pub fn powershell() -> PathBuf {
     find_tool(&["pwsh.exe"], &[PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe")]).unwrap_or_else(|| PathBuf::from("powershell.exe"))
 }
 
+fn workspace_llvm_bin(repo: &Path) -> Option<PathBuf> {
+    // The local compiler can live beside the checkout, outside the tracked project.
+    for toolchain in [repo.parent()?.join("toolchain"), repo.join("work").join("toolchain")] {
+        let Ok(entries) = fs::read_dir(toolchain) else { continue };
+        let mut candidates: Vec<(Vec<u32>, PathBuf)> = entries.filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let version = name.to_str()?.strip_prefix("clang+llvm-")?.split('-').next()?;
+                let parts: Vec<u32> = version.split('.').map(str::parse).collect::<Result<_, _>>().ok()?;
+                if parts.first().copied().unwrap_or(0) < 23 { return None; }
+                let bin = entry.path().join("bin");
+                bin.join("clang-cl.exe").is_file().then_some((parts, bin))
+            }).collect();
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        if let Some((_, bin)) = candidates.pop() { return Some(bin); }
+    }
+    None
+}
+
+fn find_llvm_bin(repo: Option<&Path>) -> Option<PathBuf> {
+    for candidate in [
+        std::env::var_os("NX_LLVM").map(PathBuf::from),
+        std::env::var_os("NX_LLVM_BIN").map(PathBuf::from),
+        std::env::var_os("NX_TOOLCHAIN").map(|p| PathBuf::from(p).join("llvm").join("bin")),
+    ].into_iter().flatten() {
+        if candidate.join("clang-cl.exe").is_file() { return Some(candidate); }
+    }
+    if let Some(path) = which("clang-cl.exe") { return path.parent().map(Path::to_path_buf); }
+    let installed = PathBuf::from(std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into())).join(r"LLVM\bin");
+    if installed.join("clang-cl.exe").is_file() { return Some(installed); }
+    repo.and_then(workspace_llvm_bin)
+}
+
 /// One build prerequisite and whether it was found (the page lists them before Set up).
 #[derive(Serialize, Clone)]
 pub struct Tool {
@@ -452,19 +571,18 @@ pub struct Tool {
     pub hint: String,
 }
 
-pub fn check_tools(package: bool) -> Vec<Tool> {
+pub fn check_tools(package: bool, repo: Option<&Path>) -> Vec<Tool> {
     if package {
         return vec![]; // everything the release package needs is in it
     }
     let pf = |rel: &str| PathBuf::from(std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into())).join(rel);
     let pf86 = |rel: &str| PathBuf::from(std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".into())).join(rel);
-    let llvm = std::env::var("NX_LLVM").ok().map(|d| PathBuf::from(d).join("clang-cl.exe"));
-    let tc_llvm = std::env::var("NX_TOOLCHAIN").ok().map(|d| PathBuf::from(d).join("llvm").join("bin").join("clang-cl.exe"));
+    let llvm = find_llvm_bin(repo).map(|bin| bin.join("clang-cl.exe"));
     let items: Vec<(&str, Option<PathBuf>, &str)> = vec![
         ("Visual Studio C++ tools", find_tool(&[], &[pf86(r"Microsoft Visual Studio\Installer\vswhere.exe")]),
          "Visual Studio 2022 Build Tools or newer with \"Desktop development with C++\"."),
-        ("LLVM (clang-cl)", find_tool(&["clang-cl.exe"], &[llvm.unwrap_or_default(), tc_llvm.unwrap_or_default(), pf(r"LLVM\bin\clang-cl.exe")]),
-         "LLVM 23 or newer from github.com/llvm/llvm-project/releases (or set NX_LLVM to its bin folder, or NX_TOOLCHAIN to a folder with llvm\\bin)."),
+        ("LLVM (clang-cl)", llvm,
+         "LLVM 23 or newer: place clang+llvm-23* under the workspace toolchain folder, or set NX_LLVM to its bin folder."),
         ("CMake", find_tool(&["cmake.exe"], &[pf(r"CMake\bin\cmake.exe")]), "CMake 3.25 or newer (winget install Kitware.CMake)."),
         ("Ninja", find_tool(&["ninja.exe"], &[local_appdata(r"Microsoft\WinGet\Links\ninja.exe")]), "winget install Ninja-build.Ninja"),
         ("uv (Python)", find_tool(&["uv.exe"], &[local_appdata(r"Microsoft\WinGet\Links\uv.exe")]), "winget install astral-sh.uv"),
@@ -572,7 +690,7 @@ fn run_steps(r: &Runner, p: &Paths, jobs: usize) -> Result<bool, String> {
             return Ok(false);
         }
     }
-    if !libs_ok(p) {
+    if !p.dev_mod_build() && !libs_ok(p) {
         let mut c = Command::new("cmd.exe");
         c.args(["/d", "/c", "recomp\\scripts\\build_game.cmd", "fefw"]).env("NX_JOBS", jobs.to_string());
         if !r.run("lift", "Recompiling the game code (an hour or more the first time)", c, repo)? {
@@ -586,7 +704,15 @@ fn run_steps(r: &Runner, p: &Paths, jobs: usize) -> Result<bool, String> {
             return Ok(false);
         }
     }
-    if !exe_ok(p) {
+    if p.dev_mod_build() && !dev_build_ok(p) {
+        let mut c = Command::new(&py);
+        c.arg("-I").arg(repo.join("tools").join("mods").join("dev_build.py"))
+            .arg("build").arg("--repo").arg(repo).arg("--game").arg(&p.game_dir)
+            .arg("--jobs").arg(jobs.to_string());
+        if !r.run("lift", "Building the enabled ExeFS mods into a separate game", c, repo)? {
+            return Ok(false);
+        }
+    } else if !p.dev_mod_build() && !exe_ok(p) {
         let mut c = Command::new(powershell());
         c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "game-build\\scripts\\build_fefw.ps1", "-Jobs", &jobs.to_string()]);
         if !r.run("exe", "Building fefw.exe", c, repo)? {
@@ -635,7 +761,7 @@ fn run_steps(r: &Runner, p: &Paths, jobs: usize) -> Result<bool, String> {
 pub fn run(shared: &Arc<Shared>, p: &Paths, jobs: usize, emit: &(dyn Fn(Progress) + Sync), emit_log: &(dyn Fn(Vec<String>) + Sync)) -> Progress {
     let _ = fs::create_dir_all(p.repo.join("work"));
     let file = fs::OpenOptions::new().create(true).append(true).open(p.log()).ok();
-    let r = Runner { shared, emit, emit_log, log_file: Mutex::new(file) };
+    let r = Runner { shared, emit, emit_log, log_file: Mutex::new(file), llvm_bin: if p.package.is_some() { None } else { find_llvm_bin(Some(&p.repo)) } };
     r.log(vec![format!("--- setup: dump exefs {}, romfs {}", crate::dump::fwd(&p.exefs), crate::dump::fwd(&p.romfs))]);
     let end = match run_steps(&r, p, jobs) {
         Ok(true) => Progress { state: "done".into(), message: "Setup finished. Press Play.".into(), ..Default::default() },
@@ -659,5 +785,17 @@ mod tests {
         assert_eq!(ninja_progress("[ 3/ 9] x"), Some((3, 9)));
         assert_eq!(ninja_progress("no"), None);
         assert_eq!(tool_progress("scan: 5 10"), Some((5, 10)));
+    }
+
+    #[test]
+    fn finds_workspace_llvm_without_environment_variable() {
+        let root = std::env::temp_dir().join(format!("fefw-llvm-test-{}", std::process::id()));
+        let repo = root.join("checkout");
+        let bin = root.join("toolchain").join("clang+llvm-23.1.5-x86_64-pc-windows-msvc").join("bin");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("clang-cl.exe"), []).unwrap();
+        assert_eq!(workspace_llvm_bin(&repo), Some(bin));
+        fs::remove_dir_all(root).unwrap();
     }
 }

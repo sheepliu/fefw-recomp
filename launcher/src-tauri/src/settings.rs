@@ -97,7 +97,7 @@ pub fn apply(dir: &Path, edits: &[Edit]) -> Result<(), String> {
 fn owned(p: &Paths) -> Vec<(&'static str, &'static str, String)> {
     vec![
         ("fs", "exefs", crate::dump::fwd(&p.plain_exefs())),
-        ("fs", "main", String::new()),
+        ("fs", "main", p.runtime_main()),
         ("fs", "romfs", crate::dump::fwd(&p.romfs)),
         ("nvn", "shader_cache", crate::dump::fwd(&p.spirv())),
         ("nvn", "bc7_cache", crate::dump::fwd(&p.bc7())),

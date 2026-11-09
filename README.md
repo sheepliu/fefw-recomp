@@ -44,6 +44,15 @@ Your saves are in the `save\` folder next to the launcher.
 The launcher's **Settings** page covers resolution, frame rate, upscaling, window mode, sound and controls. Press **F1** in game for
 the overlay. Every option is described in [runtime/docs/CONFIG.md](runtime/docs/CONFIG.md).
 
+### Mods
+
+The launcher's **Mods** page imports `.ips` / `.ips32` patches or folders containing a mod manifest. Patches must match the
+selected game's Build ID. Importing leaves a mod disabled; enable it, then return to **Setup** to rebuild the PC game. Disabling a
+patch also requires a rebuild. The original game dump is not modified. The current interface supports ExeFS `main` instruction
+patches only; supported runtime packages appear in the in-game F1 Mods tab after restarting the game. Runtime packages
+require a matching game runtime implementation; a manifest alone does not execute arbitrary code. See
+[tools/mods/README.md](tools/mods/README.md) for the manifest format, validation limits and checkout build layout.
+
 ### Updating to a new release
 
 Extract the new zip to a new folder, copy your `save\` folder into it, and run **Set up** again.

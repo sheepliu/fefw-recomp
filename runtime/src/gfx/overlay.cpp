@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
@@ -449,6 +450,16 @@ std::unique_ptr<Overlay> Overlay::create(const Context& ctx, std::string* error)
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;      // set_menu_pad feeds it
     ImGui::StyleColorsDark();
     io.Fonts->AddFontDefaultVector();          // the scalable default font: stays sharp at every UI scale (update_scale)
+    // Item catalogs include Japanese and Chinese names. Keep the vector font as
+    // the default and merge an installed Windows CJK face when available.
+    ImFontConfig cjk;
+    cjk.MergeMode = true;
+    cjk.OversampleH = 1;
+    cjk.OversampleV = 1;
+    if (std::filesystem::exists(L"C:\\Windows\\Fonts\\msyh.ttc"))
+        io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/msyh.ttc", 16.0f, &cjk, io.Fonts->GetGlyphRangesChineseFull());
+    else if (std::filesystem::exists(L"C:\\Windows\\Fonts\\meiryo.ttc"))
+        io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/meiryo.ttc", 16.0f, &cjk, io.Fonts->GetGlyphRangesJapanese());
     ImGui::GetStyle().FontSizeBase = 16.0f;
     s.base_style = ImGui::GetStyle();
     const VkExtent2D e = ctx.renderer->extent();

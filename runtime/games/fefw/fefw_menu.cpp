@@ -65,8 +65,8 @@ const ImVec4 kGreen(0.55f, 0.86f, 0.55f, 1.0f);
 const ImVec4 kRed(1.0f, 0.42f, 0.38f, 1.0f);
 const ImVec4 kAccent(0.42f, 0.78f, 0.96f, 1.0f);
 
-enum Tab { kTabDisplay, kTabGraphics, kTabFrameRate, kTabAudio, kTabControls, kTabGame, kTabDebug, kTabCount };
-constexpr const char* kTabNames[kTabCount] = {"Display", "Graphics", "Frame rate", "Audio", "Controls", "Game", "Debug"};
+enum Tab { kTabDisplay, kTabGraphics, kTabFrameRate, kTabAudio, kTabControls, kTabGame, kTabMods, kTabDebug, kTabCount };
+constexpr const char* kTabNames[kTabCount] = {"Display", "Graphics", "Frame rate", "Audio", "Controls", "Game", "Mods", "Debug"};
 
 // ---- the fefw.ini keys the menu edits -------------------------------------------------------------------------------------------------
 // The value read at start is kept (boot) so a restart-only row can show what is in force and the bottom bar can list what waits.
@@ -1142,6 +1142,7 @@ void settings_menu(play::UiHost& host, gfx::Overlay& ov) {
                     case kTabAudio: audio_page(host, m); break;
                     case kTabControls: controls_page(host, m, live); break;
                     case kTabGame: game_page(host, m); break;
+                    case kTabMods: mods_page(); break;
                     case kTabDebug: debug_page(host, m, ov); break;
                 }
                 ImGui::PopItemWidth();

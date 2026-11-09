@@ -18,9 +18,11 @@ constexpr uint64_t kPresentWrapper = 0x5d170;
 // play mode's install / remove / frame: the game hooks (fefw_play.cpp) and the button glyphs (fefw_prompts.cpp)
 void install_all(uint64_t base, play::GameHost* host, const play::Settings& s) {
     play_install(base, host, s);
+    mods_install(base);
     prompts_install(host);
 }
 void remove_all() {
+    mods_remove();
     prompts_remove();
     play_remove();
 }

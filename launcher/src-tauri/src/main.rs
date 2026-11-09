@@ -5,6 +5,7 @@
 
 mod dump;
 mod ini;
+mod mods;
 mod nup;
 mod play;
 mod settings;
@@ -145,7 +146,14 @@ fn get_overview(app: AppHandle) -> Overview {
     let cfg = load_config(&app);
     match repo_of(&cfg) {
         Some(repo) => {
-            let exe = if package_tools().is_some() { game_dir_of(&cfg, &repo).join("fefw.exe") } else { setup::exe_path(&repo) };
+            let game = game_dir_of(&cfg, &repo);
+            let exe = if package_tools().is_some() {
+                game.join("fefw.exe")
+            } else if game.join("mods-state.json").is_file() || game.join("mod-build").join("done.json").is_file() {
+                game.join("mod-build").join("active").join("fefw.exe")
+            } else {
+                setup::exe_path(&repo)
+            };
             Overview {
                 repo_dir: dump::fwd(&repo),
                 repo_ok: true,
@@ -174,6 +182,64 @@ async fn pick_nup(app: AppHandle, start: Option<String>) -> Option<String> {
         dlg = dlg.set_directory(s);
     }
     dlg.blocking_pick_file().and_then(|p| p.into_path().ok()).map(|p| dump::fwd(&p))
+}
+
+#[tauri::command]
+async fn pick_mod_file(app: AppHandle) -> Option<String> {
+    app.dialog().file().set_title("Choose an IPS or IPS32 patch")
+        .add_filter("ExeFS patch", &["ips", "ips32"])
+        .blocking_pick_file().and_then(|p| p.into_path().ok()).map(|p| dump::fwd(&p))
+}
+
+fn mod_paths(app: &AppHandle) -> Result<mods::ModPaths, String> {
+    let p = paths(&load_config(app))?;
+    let script = match &p.package {
+        Some(tools) => tools.join("build").join("modpack.py"),
+        None => p.repo.join("tools").join("mods").join("modpack.py"),
+    };
+    Ok(mods::ModPaths {
+        python: p.python(),
+        script,
+        main: p.exefs.join("main"),
+        mods: p.game_dir.join("mods"),
+    })
+}
+
+#[tauri::command]
+async fn list_mods(app: AppHandle) -> Result<serde_json::Value, String> {
+    let p = mod_paths(&app)?;
+    tauri::async_runtime::spawn_blocking(move || mods::invoke(p, &["list".into()]))
+        .await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn import_mod(app: AppHandle, state: State<'_, Arc<setup::Shared>>, source: String,
+                    id: Option<String>, name: Option<String>) -> Result<serde_json::Value, String> {
+    if state.progress.lock().unwrap().state == "running" {
+        return Err("Setup is running. Pause it before importing a mod.".into());
+    }
+    let p = mod_paths(&app)?;
+    let mut args = vec!["import".into(), source];
+    if let Some(id) = id.filter(|v| !v.trim().is_empty()) {
+        args.extend(["--id".into(), id]);
+    }
+    if let Some(name) = name.filter(|v| !v.trim().is_empty()) {
+        args.extend(["--name".into(), name]);
+    }
+    tauri::async_runtime::spawn_blocking(move || mods::invoke(p, &args))
+        .await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn set_mod_enabled(app: AppHandle, state: State<'_, Arc<setup::Shared>>,
+                         id: String, enabled: bool) -> Result<serde_json::Value, String> {
+    if state.progress.lock().unwrap().state == "running" {
+        return Err("Setup is running. Pause it before changing mods.".into());
+    }
+    let p = mod_paths(&app)?;
+    let args = vec![if enabled { "enable" } else { "disable" }.into(), id];
+    tauri::async_runtime::spawn_blocking(move || mods::invoke(p, &args))
+        .await.map_err(|e| e.to_string())?
 }
 
 #[derive(Serialize, Clone)]
@@ -268,7 +334,7 @@ fn setup_status(app: AppHandle, state: State<Arc<setup::Shared>>) -> SetupStatus
         complete: !steps.is_empty() && steps.iter().all(|s| s.state == "done"),
         steps,
         progress,
-        tools: setup::check_tools(package_tools().is_some()),
+        tools: setup::check_tools(package_tools().is_some(), repo_of(&cfg).as_deref()),
         package: package_tools().is_some(),
         log: state.log.lock().unwrap().iter().cloned().collect(),
         jobs: jobs_of(&cfg),
@@ -460,6 +526,10 @@ fn main() {
             get_overview,
             pick_folder,
             pick_nup,
+            pick_mod_file,
+            list_mods,
+            import_mod,
+            set_mod_enabled,
             import_nup,
             validate_dump,
             save_dump,
