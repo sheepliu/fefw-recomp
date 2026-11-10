@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <condition_variable>
@@ -64,6 +65,7 @@ struct TexGpu {
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;   // tracked layout (the same for every level and layer)
     bool failed = false;                                // no image: the texture is not usable on the GPU (logged once)
     bool transcoded = false;                            // ASTC stored as BC7
+    uint32_t drop = 0;                                  // NVN levels left out at the top ([gfx] texture_detail): image level i is NVN level i + drop
     bool mutable_fmt = false;                           // sRGB and UNORM views of the image are allowed
     bool cube = false;                                  // created with CUBE_COMPATIBLE
     bool depth = false;                                 // depth and/or stencil aspect
@@ -83,6 +85,10 @@ struct TexGpu {
     bool streamed = false;                              // rewritten by the CPU frame after frame: not write-watched, read again once per present
     uint32_t streamed_at = 0;                           // present count of the last read in that mode
     bool untiled = false;                               // the last upload went through gpu_untile (cheap enough to repeat every frame)
+    // the nvn.tex.* gauges (tex_census): what the image costs, what its ASTC source would cost on a GPU that samples ASTC, and when a
+    // draw last asked for a sampled view of it
+    uint64_t est_bytes = 0, est_native_bytes = 0;
+    std::atomic<uint32_t> sampled_at{0};                // present count + 1 at the last tex_sampled_view; 0: never
 };
 
 // A virtual-pool texture too big to back fully (Mario Kart World's terrain virtual texture caches: 8192x8192 arrays of 68 layers, 1.4 to
@@ -510,8 +516,119 @@ bool create_sparse_texture(Texture* t, TexGpu* g, const Shape& s, std::string* w
 }
 
 
+// ---- texture detail --------------------------------------------------------------------------------------------------------
+// The game's ASTC textures are 8x8 blocks (2 bits per texel); stored as BC7 (8 bits) they take four times the console's memory, about
+// 2.5 GB in the capital. [gfx] texture_detail = half leaves out their largest level: the image starts at the second one, a quarter of the
+// memory (what the console spends). Only mipmapped 2D textures from kDropMinSize texels up (UI and other single-level textures keep every
+// texel). auto (the default): half on a GPU whose video memory heap is under kDropAutoHeap, full otherwise. Read once: images keep their shape.
+constexpr uint32_t kDropMinSize = 512;
+constexpr uint64_t kDropAutoHeap = 9ull << 30;
+bool texture_detail_half() {
+    static const bool half = [] {
+        std::string v = nxrt::config_get_str("gfx", "texture_detail", "auto");
+        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        VkPhysicalDeviceMemoryProperties mp{};
+        vkGetPhysicalDeviceMemoryProperties(device().physical(), &mp);
+        uint64_t heap = 0;
+        for (uint32_t i = 0; i < mp.memoryHeapCount; ++i)
+            if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) heap = std::max<uint64_t>(heap, mp.memoryHeaps[i].size);
+        bool h = false;
+        if (v == "half") h = true;
+        else if (v == "full") h = false;
+        else {
+            if (v != "auto") NXLOG_W(kTag, "[gfx] texture_detail '%s' is not auto, full or half: using auto", v.c_str());
+            v = "auto";
+            h = heap != 0 && heap < kDropAutoHeap;
+        }
+        NXLOG_I(kTag, "texture detail: %s ([gfx] texture_detail = %s, video memory heap %.1f GiB)%s", h ? "half" : "full", v.c_str(),
+                static_cast<double>(heap) / (1024.0 * 1024.0 * 1024.0),
+                h ? ": transcoded ASTC textures of 512 texels and more are stored without their largest level" : "");
+        return h;
+    }();
+    return half;
+}
+
 // ---- creation -------------------------------------------------------------------------------------------------------------
 // Makes the image of t (or the failed marker when no format works). Stores the result in t->gpu, which is never null afterwards.
+// ---- the texture census (gauges nvn.tex.*, read by the soak sampler) ---------------------------------------------------------------
+// Estimated device memory of an image: every level, layer and sample at the format's size (alignment and allocator overhead not counted).
+// `block_w`, `block_h`, `unit`: texels per block and bytes per block (1, 1 and the bytes of a texel for an uncompressed format).
+uint64_t estimate_image_bytes(VkExtent3D e, uint32_t levels, uint32_t layers, uint32_t samples, uint32_t block_w, uint32_t block_h, uint32_t unit) {
+    if (!block_w || !block_h) return 0;
+    uint64_t total = 0;
+    for (uint32_t l = 0; l < levels; ++l) {
+        const uint64_t w = std::max<uint32_t>(1, e.width >> l), h = std::max<uint32_t>(1, e.height >> l), d = std::max<uint32_t>(1, e.depth >> l);
+        total += ((w + block_w - 1) / block_w) * ((h + block_h - 1) / block_h) * d * unit;
+    }
+    return total * std::max<uint32_t>(1, layers) * std::max<uint32_t>(1, samples);
+}
+
+struct TexCensus {
+    int64_t astc = 0;          // bytes of the images that stand in for ASTC textures (BC7, or RGBA8 / BC5 from a cache entry)
+    int64_t astc_native = 0;   // what those textures occupy as ASTC (the console's cost, and this GPU's if it sampled ASTC)
+    int64_t compressed = 0;    // other block-compressed textures
+    int64_t plain = 0;         // uncompressed colour images (render targets among them)
+    int64_t depth = 0;
+    int64_t never = 0;         // images no draw has asked a sampled view of
+    int64_t idle_600 = 0;      // sampled, but not in the last 600 presents (10 s at 60 fps)
+    int64_t idle_3600 = 0;     // ... not in the last 3600 presents (a minute)
+    int64_t count_never = 0, count_idle_3600 = 0;
+};
+
+// One walk of the live images serves all the gauges of a sampler pass (they are read back to back).
+TexCensus tex_census() {
+    static std::mutex mu;
+    static TexCensus cached;
+    static std::chrono::steady_clock::time_point at{};
+    std::lock_guard<std::mutex> lk(mu);
+    const auto now = std::chrono::steady_clock::now();
+    if (at != std::chrono::steady_clock::time_point{} && now - at < std::chrono::seconds(1)) return cached;
+    TexCensus c;
+    const uint32_t presents = static_cast<uint32_t>(counters().presents.load(std::memory_order_relaxed));
+    {
+        std::lock_guard<std::mutex> lk2(g_live_mu);
+        for (const TexGpu* g : g_live_set) {
+            if (g->failed || !g->img) continue;
+            const int64_t b = static_cast<int64_t>(g->est_bytes);
+            if (g->transcoded) { c.astc += b; c.astc_native += static_cast<int64_t>(g->est_native_bytes); }
+            else if (g->depth) c.depth += b;
+            else if (g->fmt && g->fmt->compressed) c.compressed += b;
+            else c.plain += b;
+            const uint32_t sa = g->sampled_at.load(std::memory_order_relaxed);
+            if (!sa) { c.never += b; ++c.count_never; }
+            else {
+                const uint32_t age = presents + 1 - sa;
+                if (age > 600) c.idle_600 += b;
+                if (age > 3600) { c.idle_3600 += b; ++c.count_idle_3600; }
+            }
+        }
+    }
+    cached = c;
+    at = now;
+    return c;
+}
+
+struct TexCensusGauges {
+    TexCensusGauges() {
+        nxrt::gauge_register("nvn.tex.astc_mb", [] { return tex_census().astc >> 20; });
+        nxrt::gauge_register("nvn.tex.astc_native_mb", [] { return tex_census().astc_native >> 20; });
+        nxrt::gauge_register("nvn.tex.compressed_mb", [] { return tex_census().compressed >> 20; });
+        nxrt::gauge_register("nvn.tex.plain_mb", [] { return tex_census().plain >> 20; });
+        nxrt::gauge_register("nvn.tex.depth_mb", [] { return tex_census().depth >> 20; });
+        nxrt::gauge_register("nvn.tex.never_sampled_mb", [] { return tex_census().never >> 20; });
+        nxrt::gauge_register("nvn.tex.idle_600_mb", [] { return tex_census().idle_600 >> 20; });
+        nxrt::gauge_register("nvn.tex.idle_3600_mb", [] { return tex_census().idle_3600 >> 20; });
+        nxrt::gauge_register("nvn.tex.never_sampled", [] { return tex_census().count_never; });
+        nxrt::gauge_register("nvn.tex.idle_3600", [] { return tex_census().count_idle_3600; });
+    }
+    ~TexCensusGauges() {
+        for (const char* n : {"nvn.tex.astc_mb", "nvn.tex.astc_native_mb", "nvn.tex.compressed_mb", "nvn.tex.plain_mb", "nvn.tex.depth_mb",
+                              "nvn.tex.never_sampled_mb", "nvn.tex.idle_600_mb", "nvn.tex.idle_3600_mb", "nvn.tex.never_sampled", "nvn.tex.idle_3600"})
+            nxrt::gauge_unregister(n);
+    }
+};
+TexCensusGauges g_tex_census_gauges;
+
 TexGpu* create_texture_gpu(Texture* t, float want_scale) {
     auto* g = new TexGpu();
     { std::lock_guard<std::mutex> lk(g_live_mu); g_live_set.insert(g); }
@@ -633,9 +750,28 @@ TexGpu* create_texture_gpu(Texture* t, float want_scale) {
                         s.base.height, static_cast<unsigned>(t->b.flags), s.levels, s.layers, s.samples, w, h, want_scale);
         }
     }
+    if (g->transcoded && !t->vpool && s.type == VK_IMAGE_TYPE_2D && s.samples == 1 && s.levels >= 2 &&
+        std::max(s.base.width, s.base.height) >= kDropMinSize && texture_detail_half()) {
+        g->drop = 1;
+        is.base = level_extent(s.base, 1);
+        is.levels = s.levels - 1;
+        g->base = is.base;
+        g->levels = is.levels;
+    }
     std::string why2;
     if (device().create_image(make_desc(is, chosen, usage, flags), &g->img, &why2) != VK_SUCCESS)
         return fail("create_image: " + why2);
+    {   // the census: the image's size in its format, and for an ASTC stand-in the size of the ASTC it replaces
+        const bool bc8 = chosen >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && chosen <= VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+        const bool bc4 = chosen == VK_FORMAT_BC4_UNORM_BLOCK || chosen == VK_FORMAT_BC4_SNORM_BLOCK;
+        if (is_block_format(chosen) && (g->transcoded || !g->fmt->compressed))
+            g->est_bytes = estimate_image_bytes(is.base, s.levels, s.layers, s.samples, 4, 4, bc8 || bc4 ? 8 : 16);
+        else if (g->transcoded || g->promoted)   // RGBA8 for an ASTC texture BC7 cannot reproduce; RGBA16F for a promoted target
+            g->est_bytes = estimate_image_bytes(is.base, s.levels, s.layers, s.samples, 1, 1, g->promoted ? 8 : 4);
+        else
+            g->est_bytes = estimate_image_bytes(is.base, s.levels, s.layers, s.samples, g->fmt->block_w, g->fmt->block_h, g->fmt->bytes);
+        if (g->transcoded) g->est_native_bytes = estimate_image_bytes(is.base, s.levels, s.layers, s.samples, g->fmt->block_w, g->fmt->block_h, g->fmt->bytes);
+    }
     g_live_images.fetch_add(1);
     counters().textures_created.fetch_add(1);
     return g;
@@ -1240,7 +1376,7 @@ mem::ww::Region* tex_ww() {
     if (!g_tex_ww_tried) {
         g_tex_ww_tried = true;
         if (nxrt::config_get_bool("nvn", "tex_write_watch", true) && mem::heap_exists())
-            g_tex_ww = mem::ww::region_create(mem::kHeapBase, mem::heap_reserved());
+            g_tex_ww = mem::ww::region_create(mem::kHeapBase, mem::heap_reserved(), "texture heap");
     }
     return g_tex_ww;
 }
@@ -1401,8 +1537,10 @@ float tex_scale(Texture* t) {
 
 VkExtent3D tex_image_extent(Texture* t, uint32_t level) {
     TexGpu* g = tex_or_null(t);
-    return g ? level_extent(g->base, level) : tex_extent(t, level);
+    return g ? level_extent(g->base, level > g->drop ? level - g->drop : 0) : tex_extent(t, level);
 }
+
+uint32_t tex_level_drop(Texture* t) { return (t && t->gpu && !t->gpu->failed) ? t->gpu->drop : 0; }
 
 float tex_scale_wanted(Texture* t) {
     TexGpu* g = tex_or_null(t);
@@ -1828,11 +1966,11 @@ void tex_ensure_current(Texture* t, Frame& f) {
     if (!staged) std::memcpy(st.ptr, prep.data.data(), static_cast<size_t>(bytes));
     std::vector<VkBufferImageCopy> regions;
     regions.reserve(prep.level.size());
-    for (uint32_t i = 0; i < prep.level.size(); ++i) {
+    for (uint32_t i = g->drop; i < prep.level.size() && i - g->drop < g->levels; ++i) {   // the levels the image has ([gfx] texture_detail)
         const PreparedLevel& pl = prep.level[i];
         VkBufferImageCopy r = {};
         r.bufferOffset = st.offset + pl.offset;
-        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, g->layers};
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - g->drop, 0, g->layers};
         r.imageExtent = {pl.width, pl.height, pl.depth};
         regions.push_back(r);
     }
@@ -1896,11 +2034,19 @@ bool tex_is_depth(Texture* t) { return t->fmt && t->fmt->aspect != kAspectColor;
 VkImageView tex_sampled_view(Texture* t, const ViewRequest& req) {
     TexGpu* g = tex_or_null(t);
     if (!g) return VK_NULL_HANDLE;
+    g->sampled_at.store(static_cast<uint32_t>(counters().presents.load(std::memory_order_relaxed)) + 1, std::memory_order_relaxed);
     const bool is3d = g->type == VK_IMAGE_TYPE_3D;
     const uint32_t total_layers = is3d ? g->base.depth : g->layers;   // 3D images: the slices are the layers of 2D views
-    const uint32_t bl = req.base_level;
+    // NVN levels to image levels: an image stored without its top level ([gfx] texture_detail) answers a view that starts there from
+    // its own first level, with as many levels as are left of the range
+    uint32_t bl = req.base_level, want_nl = req.level_count;
+    if (g->drop) {
+        const uint32_t end = want_nl ? bl + want_nl : 0;          // NVN level past the range (0: to the last one)
+        bl = bl > g->drop ? bl - g->drop : 0;
+        if (want_nl) want_nl = end > g->drop + bl ? end - g->drop - bl : 1;
+    }
     if (bl >= g->levels) return bad_view(*t, "base level out of range");
-    const uint32_t nl = req.level_count ? req.level_count : g->levels - bl;
+    const uint32_t nl = want_nl ? want_nl : g->levels - bl;
     if (nl == 0 || bl + nl > g->levels) return bad_view(*t, "level range out of range");
     const uint32_t bly = req.base_layer;
     uint32_t nly = 1;

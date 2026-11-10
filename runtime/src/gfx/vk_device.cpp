@@ -297,6 +297,22 @@ uint64_t gpu_bytes_for_guard() {      // the device's dedicated memory in use by
     return static_cast<uint64_t>(b[g_guard_heap].usage);
 }
 
+bool g_budget_exact = false;           // VK_EXT_memory_budget is on: heap usage and budget are the driver's figures
+int g_video_heap = -1;                 // the largest device-local heap (guarded by g_guard_mu, as the allocator pointer)
+void video_for_guard(nxrt::MemGuardVideo* out) {
+    std::lock_guard<std::mutex> lk(g_guard_mu);
+    if (!g_guard_vma || g_video_heap < 0) return;
+    VmaBudget b[VK_MAX_MEMORY_HEAPS] = {};
+    vmaGetHeapBudgets(g_guard_vma, b);
+    const VkPhysicalDeviceMemoryProperties* mp = nullptr;
+    vmaGetMemoryProperties(g_guard_vma, &mp);
+    out->usage = b[g_video_heap].usage;
+    out->budget = b[g_video_heap].budget;
+    out->heap = mp ? mp->memoryHeaps[g_video_heap].size : 0;
+    out->driver_bytes = static_cast<uint64_t>(std::max<int64_t>(0, nxrt::vk_gauge_memory_bytes().get()));
+    out->exact = g_budget_exact;
+}
+
 void register_vma_gauges(VmaAllocator a, VkPhysicalDeviceType type) {
     const uint32_t heap = device_local_heap(a);
     {
@@ -305,8 +321,10 @@ void register_vma_gauges(VmaAllocator a, VkPhysicalDeviceType type) {
         std::lock_guard<std::mutex> lk(g_guard_mu);
         g_guard_heap = mp ? vk_guard_discount_heap(*mp, type) : -1;
         g_guard_vma = a;
+        g_video_heap = static_cast<int>(heap);
     }
     nxrt::memguard_set_discount(&gpu_bytes_for_guard);
+    nxrt::memguard_set_video(&video_for_guard);
     auto cache = std::make_shared<VmaStatsCache>();
     nxrt::gauge_register("vma.device_usage_mb", [a, heap] {
         VmaBudget b[VK_MAX_MEMORY_HEAPS] = {};
@@ -326,9 +344,11 @@ void register_vma_gauges(VmaAllocator a, VkPhysicalDeviceType type) {
 
 void unregister_vma_gauges() {
     nxrt::memguard_set_discount(nullptr);
+    nxrt::memguard_set_video(nullptr);
     {
         std::lock_guard<std::mutex> lk(g_guard_mu);   // waits for a guard read in flight; later reads see a null allocator
         g_guard_vma = nullptr;
+        g_video_heap = -1;
         g_guard_heap = -1;
     }
     const char* const names[] = {"vma.device_usage_mb", "vma.device_budget_mb", "vma.alloc_count", "vma.alloc_mb", "vma.block_count", "vma.block_mb"};
@@ -617,6 +637,9 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     VkPhysicalDevicePresentIdFeaturesKHR apid = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR};
     VkPhysicalDeviceAntiLagFeaturesAMD aal = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD};
     VkPhysicalDevicePipelineRobustnessFeaturesEXT aprb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR acsd = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR};
+    VkPhysicalDeviceMemoryPriorityFeaturesEXT ampri = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT};
+    VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT apage = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT};
     std::vector<const char*> dev_exts;
     void* chain = nullptr;
     auto add_ext = [&](const char* name, void* feat_struct) {
@@ -649,12 +672,25 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     const bool x_ll2 = x_pid && has_dext(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
     if (x_ll2) dev_exts.push_back(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
     const bool x_aal = !headless && add_ext(VK_AMD_ANTI_LAG_EXTENSION_NAME, &aal);
+    // the OS's video memory budget and this process' usage per heap, which vmaGetHeapBudgets (the vma.device_* gauges, the memory guard)
+    // reads: without the extension VMA only estimates them (80% of the heap as the budget, its own blocks as the usage)
+    const bool x_membudget = has_dext(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (x_membudget) dev_exts.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    // Over the budget, the OS may move this process' device-local allocations to host memory instead of the driver refusing new ones
+    // (VK_EXT_pageable_device_local_memory), and the priority of an allocation says which stay (VK_EXT_memory_priority; create_image and
+    // create_buffer set it). [gfx] pageable_memory = false: neither is enabled.
+    const bool want_pageable = config_get_bool("gfx", "pageable_memory", true);
+    const bool x_mpri = want_pageable && add_ext(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME, &ampri);
+    const bool x_page = x_mpri && add_ext(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME, &apage);
     features_.external_memory_host = has_dext(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (features_.external_memory_host) dev_exts.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (has_dext(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) { dev_exts.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME); features_.push_descriptor = true; }
     // robust access per pipeline, for the translated shaders' uniform buffers only (nvn_pipeline.cpp ubo_robustness); robustness2 is
     // enabled for its pipeline behaviour, not its device-wide features (left off: they cost speed)
     const bool x_prb = add_ext(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME, &aprb);
+    // the FSR SDK v2.4.0 upscaler builds compute shaders with derivative groups wherever the GPU offers them (it does not check that the
+    // device enabled them: VUID-VkShaderModuleCreateInfo-pCode-08740 / 08742 otherwise); the NV extension shares the feature struct
+    if (!add_ext(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME, &acsd)) add_ext(VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME, &acsd);
     bool rba2 = false;
     if (x_prb && has_dext(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
         VkPhysicalDeviceRobustness2FeaturesEXT r2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
@@ -788,6 +824,18 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     qci.queueCount = 1 + fg_queues;
     qci.pQueuePriorities = prio;
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &en};
+    // Video memory (VK_EXT_memory_budget is enabled above, with the priority and pageable extensions).
+    // AMD's driver refuses an allocation that takes this process past the size of a heap (VK_ERROR_OUT_OF_DEVICE_MEMORY) where other
+    // drivers let Windows move video memory to shared memory: slower, but the game goes on. VK_AMD_memory_overallocation_behavior asks
+    // for the same there ([gfx] amd_overallocation = false: the driver's default again).
+    VkDeviceMemoryOverallocationCreateInfoAMD overalloc = {VK_STRUCTURE_TYPE_DEVICE_MEMORY_OVERALLOCATION_CREATE_INFO_AMD};
+    const bool x_overalloc = has_dext(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME) && config_get_bool("gfx", "amd_overallocation", true);
+    if (x_overalloc) {
+        dev_exts.push_back(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME);
+        overalloc.overallocationBehavior = VK_MEMORY_OVERALLOCATION_BEHAVIOR_ALLOWED_AMD;
+        overalloc.pNext = dci.pNext;
+        dci.pNext = &overalloc;
+    }
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = static_cast<uint32_t>(dev_exts.size());
@@ -806,8 +854,23 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     driver_free_memory = vkFreeMemory;
     vkAllocateMemory = counted_allocate_memory;
     vkFreeMemory = counted_free_memory;
-    NXLOG_I(kTag, "memory limits: maxMemoryAllocationCount %u, minImportedHostPointerAlignment %llu, external host %d",
-            limits_.max_memory_allocation_count, (unsigned long long)limits_.min_imported_host_alignment, features_.external_memory_host);
+    NXLOG_I(kTag, "memory limits: maxMemoryAllocationCount %u, minImportedHostPointerAlignment %llu, external host %d, memory budget %d, overallocation allowed %d",
+            limits_.max_memory_allocation_count, (unsigned long long)limits_.min_imported_host_alignment, features_.external_memory_host, x_membudget, x_overalloc);
+    {
+        VkPhysicalDeviceMemoryProperties mp{};
+        vkGetPhysicalDeviceMemoryProperties(physical_, &mp);
+        for (uint32_t i = 0; i < mp.memoryHeapCount; ++i) {
+            std::string types;
+            for (uint32_t t = 0; t < mp.memoryTypeCount; ++t)
+                if (mp.memoryTypes[t].heapIndex == i) {
+                    char tb[24];
+                    std::snprintf(tb, sizeof tb, "%s%u:0x%x", types.empty() ? "" : " ", t, static_cast<unsigned>(mp.memoryTypes[t].propertyFlags));
+                    types += tb;
+                }
+            NXLOG_I(kTag, "memory heap %u: %.2f GiB%s, types (index:flags) %s", i, static_cast<double>(mp.memoryHeaps[i].size) / (1024.0 * 1024.0 * 1024.0),
+                    (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? " device-local" : "", types.c_str());
+        }
+    }
     vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
     if (fg_queues) extras::ffx_fg_install(*this, fg_queues);
 
@@ -828,6 +891,13 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     aci.instance = instance_;
     aci.vulkanApiVersion = VK_API_VERSION_1_3;
     aci.pVulkanFunctions = &vf;
+    if (x_membudget) aci.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+    g_budget_exact = x_membudget;
+    const bool mem_priority = x_mpri && ampri.memoryPriority;
+    if (mem_priority) aci.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT;
+    NXLOG_I(kTag, "video memory over the budget: memory priority %d, pageable device-local memory %d ([gfx] pageable_memory = %d)",
+            mem_priority, x_page && apage.pageableDeviceLocalMemory, want_pageable);
+    NXLOG_I(kTag, "video memory budget: %s", x_membudget ? "from the OS (VK_EXT_memory_budget)" : "estimated (no VK_EXT_memory_budget)");
     r = vmaCreateAllocator(&aci, &vma_);
     if (r != VK_SUCCESS) return fail("vmaCreateAllocator failed (" + std::to_string(r) + ")");
     register_vma_gauges(vma_, props_.deviceType);
@@ -964,6 +1034,9 @@ VkResult Device::create_image(const ImageDesc& d, Image* out, std::string* why) 
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VmaAllocationCreateInfo ai = {};
     ai.usage = VMA_MEMORY_USAGE_AUTO;
+    // VK_EXT_memory_priority (used for a dedicated allocation; ignored without the extension): what is rendered to stays in video memory
+    // before what is only sampled. Zero, the default, would make every large image the first to go.
+    ai.priority = (d.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) ? 1.0f : 0.5f;
     Image img;
     VkImage handle = VK_NULL_HANDLE;
     VmaAllocation alloc = nullptr;
@@ -1023,14 +1096,19 @@ VkResult Device::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, Memo
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VmaAllocationCreateInfo ai = {};
     ai.usage = VMA_MEMORY_USAGE_AUTO;
+    ai.priority = 1.0f;   // VK_EXT_memory_priority, a dedicated allocation: buffers are what draws read (pool copies among them), and small next to the images
     if (use == MemoryUse::Upload) ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    if (use == MemoryUse::Staging) {   // system memory whatever the usage: a load holds gigabytes of these at once, and video memory is for what stays
+        ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    }
     if (use == MemoryUse::Readback) ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
     VmaAllocationInfo info = {};
     Buffer b;
     VkResult r = vmaCreateBuffer(vma_, &bi, &ai, &b.buffer, &b.allocation, &info);
     if (r != VK_SUCCESS) return r;
     vk_gauge_buffers().add(1);
-    if (use == MemoryUse::Upload || use == MemoryUse::Readback) {      // S34: where host-visible buffers live (device-local host-visible = resizable BAR, else system memory)
+    if (use == MemoryUse::Upload || use == MemoryUse::Staging || use == MemoryUse::Readback) {      // S34: where host-visible buffers live (device-local host-visible = resizable BAR, else system memory)
         static std::atomic<int> logged{0};
         VkMemoryPropertyFlags mp = 0;
         vmaGetAllocationMemoryProperties(vma_, b.allocation, &mp);

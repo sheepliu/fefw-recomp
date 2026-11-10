@@ -257,9 +257,13 @@ Files: `third_party/nvidia_nis/` (`NIS_Scaler.h`, `NIS_Config.h`, unmodified). C
 
 Files: `third_party/amd_ffx_api/` (`api/include/ffx_api.h`, `ffx_api_types.h`, `ffx_api_loader.h`, `vk/ffx_api_vk.h`, `upscalers/include/ffx_upscale.h`, unmodified). Copyright (c) Advanced Micro Devices, Inc. Licence text: `third_party/amd_ffx_api/LICENSE.txt`. Source: https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, release v2.4.0. Used by `src/gfx/extras/temporal_ffx.cpp`.
 
-## AMD FidelityFX FSR 3.1 runtime (MIT)
+## AMD FidelityFX / FSR runtime DLLs (MIT)
 
-`amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` (AMD-signed, byte-identical to `Kits/FidelityFX/signedbin/` in the FidelityFX SDK v2.4.0 release; the SDK's licence, `licenses/LICENSE.FidelityFX-SDK-v2.4.0.txt` in the release, lists both under MIT) are not in this repository and this project does not distribute them. The game loads them at run time only (`LoadLibrary`) if you put them in `upscalers/fsr3/`, next to the executable or name them with `[upscale] fsr_dll`. Copyright (C) Advanced Micro Devices, Inc.
+`amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` (AMD-signed, `Kits/FidelityFX/signedbin/` of the FSR SDK v2.4.0,
+whose `Kits/FidelityFX/docs/license.md` lists them under MIT) and `amd_fidelityfx_vk.dll` (`PrebuiltSignedDLL/` of the FidelityFX SDK
+v1.1.4, MIT) are not in this repository or the release package. The game loads them at run time only (`LoadLibrary`,
+`src/gfx/extras/ffx_files.cpp`) if the player puts them in `upscalers/fsr/` or names the folder with `[upscale] fsr_dll`.
+Copyright (C) Advanced Micro Devices, Inc.
 
 ## NVIDIA Streamline SDK v2.14.16 headers (MIT)
 
