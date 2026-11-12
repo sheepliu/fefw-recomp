@@ -1,5 +1,6 @@
 import { api, esc, icon, refreshIcons, toast, errText } from '../util.js';
 import { t, getLang, listLangs, setLang } from '../i18n.js';
+import { fileDetail } from '../rusttext.js';
 
 /*
  * Settings schema. Every key is described in runtime/docs/CONFIG.md.
@@ -9,6 +10,9 @@ import { t, getLang, listLangs, setLang } from '../i18n.js';
  * Text is a key into src/locales: `label` and `hint` are always translated, and an option name that contains a dot is a key
  * too (a plain name such as "720p" or "DLAA" is shown as it is).
  */
+// The WebKitGTK launcher on Linux (the Windows one is WebView2)
+const IS_LINUX = /Linux/.test(navigator.userAgent) && !/Android/.test(navigator.userAgent);
+
 const SECTIONS = [
   {
     title: 'settings.sec.picture', icon: 'monitor', file: 'game',
@@ -99,6 +103,15 @@ const SECTIONS = [
       { id: 'face_buttons', type: 'select', label: 'settings.faceButtons.label', sec: 'pad', key: 'label_abxy', def: '1',
         options: [['1', 'settings.faceButtons.label_'], ['0', 'settings.faceButtons.position']],
         hint: 'settings.faceButtons.hint' },
+      // [pad] haptic: how the game's HD Rumble value reaches the pad (runtime/gfx/haptic.cpp). The launcher only writes the
+      // setting; the game reads it when it starts, so a change lands on the next run.
+      { id: 'haptic', type: 'select', label: 'settings.haptic.label', sec: 'pad', key: 'haptic', def: 'auto',
+        options: [['auto', 'settings.haptic.auto'], ['off', 'settings.haptic.off'], ['rumble', 'settings.haptic.rumble'],
+          ['dualsense', 'settings.haptic.dualsense']],
+        hint: 'settings.haptic.hint' },
+      // [pad] haptic_strength: 0..100 percent for the haptic backends, or -1 to keep using the rumble strength above.
+      { id: 'haptic_strength', type: 'number', label: 'settings.hapticStrength.label', sec: 'pad', key: 'haptic_strength',
+        def: '-1', min: -1, max: 100, hint: 'settings.hapticStrength.hint' },
     ],
   },
   {
@@ -120,6 +133,8 @@ const SECTIONS = [
       { id: 'game_dir', type: 'path', label: 'settings.gameDir.label', sec: '', key: 'game_dir', def: '', placeholder: 'settings.gameDir.placeholder', hint: 'settings.gameDir.hint' },
       { id: 'jobs', type: 'number', label: 'settings.jobs.label', sec: '', key: 'jobs', def: '0', min: 0, max: 256, hint: 'settings.jobs.hint' },
       { id: 'minimize_on_play', type: 'toggle', label: 'settings.minimizeOnPlay.label', sec: '', key: 'minimize_on_play', def: '0' },
+      // Linux only: fefw.exe runs through Wine/Proton (launcher/src-tauri/src/play.rs runner())
+      ...(IS_LINUX ? [{ id: 'runner', type: 'text', label: 'settings.runner.label', sec: '', key: 'runner', def: '', placeholder: 'settings.runner.placeholder', hint: 'settings.runner.hint' }] : []),
     ],
   },
 ];
@@ -134,7 +149,7 @@ const optName = (label) => (String(label).includes('.') ? t(label) : label);
 export async function render(el, ctx) {
   const [cfg, status] = await Promise.all([api('get_config'), api('game_status')]);
   const data = await api('read_settings').catch(() => ({ game_dir: '', game: {}, controls: {}, controls_exists: false }));
-  const files = { game: data.game, controls: data.controls, config: { repo_dir: cfg.repo_dir, game_dir: cfg.game_dir, jobs: String(cfg.jobs || 0), minimize_on_play: cfg.minimize_on_play ? '1' : '0' } };
+  const files = { game: data.game, controls: data.controls, config: { repo_dir: cfg.repo_dir, game_dir: cfg.game_dir, jobs: String(cfg.jobs || 0), minimize_on_play: cfg.minimize_on_play ? '1' : '0', runner: cfg.runner || '' } };
   const exists = { game: true, controls: data.controls_exists, config: true };
   const keyOf = (f, k) => (f.file === 'config' ? k : `${f.sec}.${k}`);
   const get = (f, k, def) => files[f.file][keyOf(f, k)] ?? def;
@@ -299,7 +314,7 @@ export async function render(el, ctx) {
     const seq = ++checkSeq;
     const r = await api('upscaler_files', { fsrDir: fwd(model.fsr_dll || ''), dlssDir: fwd(model.dlss_dll || '') }).catch(() => null);
     if (seq !== checkSeq || !r) return;
-    const line = (name, x) => `${t(name)}: ${x.found ? t('settings.files.found', { detail: x.detail }) : t('settings.files.notFound', { detail: x.detail })}`;
+    const line = (name, x) => `${t(name)}: ${x.found ? t('settings.files.found', { detail: x.detail }) : t('settings.files.notFound', { detail: fileDetail(x.detail) })}`;
     const put = (which, text) => el.querySelectorAll(`[data-status="${which}"]`).forEach((n) => { n.textContent = text; });
     put('fsr', `${line('settings.files.upscaling', r.fsr_upscaling)}. ${line('settings.files.frameGen', r.fsr_framegen)}.`);
     put('dlss', `${line('settings.files.dlss', r.dlss)}. ${line('settings.files.dlssFrameGen', r.dlss_framegen)}.`);
@@ -366,7 +381,7 @@ export async function render(el, ctx) {
     for (const f of dirtyFields()) {
       for (const [sec, key, value] of WRITE[f.type](f, model[f.id])) {
         if (f.file === 'config') {
-          cfgNew[key] = key === 'minimize_on_play' ? value === '1' : key === 'jobs' ? parseInt(value, 10) || 0 : fwd(value);
+          cfgNew[key] = key === 'minimize_on_play' ? value === '1' : key === 'jobs' ? parseInt(value, 10) || 0 : key === 'runner' ? String(value).trim() : fwd(value);
         } else {
           edits.push({ file: f.file, section: sec, key, value });
         }

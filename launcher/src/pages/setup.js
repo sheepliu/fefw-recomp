@@ -1,7 +1,7 @@
 import { listen } from '@tauri-apps/api/event';
 import { api, esc, icon, refreshIcons, toast, errText } from '../util.js';
 import { t } from '../i18n.js';
-import { checkText, dumpText, stepTitle } from '../rusttext.js';
+import { checkText, dumpText, stepTitle, toolText, toolHint } from '../rusttext.js';
 
 // one listener for the session; the page being shown sets the handler
 let nupHandler = null;
@@ -54,7 +54,7 @@ function toolsHtml(tools) {
       <h2>${icon('list-checks')}${esc(t('setup.toolsTitle'))}</h2>
       <p class="dim">${esc(t('setup.toolsIntro') + tail)}</p>
       <div class="tools">
-        ${tools.map((tool) => `<span class="${tool.ok ? 'ok' : 'bad'}">${icon(tool.ok ? 'circle-check' : 'circle-x')} ${esc(tool.name)}</span><span class="${tool.ok ? 'faint' : 'dim'}">${esc(tool.ok ? tool.found : tool.hint)}</span>`).join('')}
+        ${tools.map((tool) => `<span class="${tool.ok ? 'ok' : 'bad'}">${icon(tool.ok ? 'circle-check' : 'circle-x')} ${esc(toolText(tool.name))}</span><span class="${tool.ok ? 'faint' : 'dim'}">${esc(tool.ok ? tool.found : toolHint(tool.hint))}</span>`).join('')}
       </div>
     </div>`;
 }
@@ -165,6 +165,7 @@ export async function render(el, ctx) {
         </div>
 
         ${status.cpu_problem ? `<div class="banner danger" id="cpu-problem">${icon('circle-x')}<div><strong>${esc(t('setup.cpuProblem'))}</strong> ${esc(status.cpu_problem)}</div></div>` : ''}
+        ${!status.cpu_problem && status.cpu_note ? `<div class="banner info" id="cpu-note">${icon('info')}<div><strong>${esc(t('setup.cpuCompat'))}</strong> ${esc(status.cpu_note)}</div></div>` : ''}
 
         ${status.package ? '' : toolsHtml(status.tools)}
         ${ok && saved === path ? stepsHtml(status) : ''}

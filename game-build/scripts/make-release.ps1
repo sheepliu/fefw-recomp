@@ -67,6 +67,7 @@ function Fetch([string]$url, [string]$file, [string]$sha = "") {
 
 Need (Join-Path $RtDir 'fefw_rt.dll') 'fefw_rt.dll (build it with -DFEFW_RT_DLL=ON)'
 Need (Join-Path $RtDir 'fefw_rt.lib') 'fefw_rt.lib'
+Need "$root\runtime\third_party\renhdrum\renhdrum.dll" 'renhdrum.dll (runtime\third_party\renhdrum, built from the RenHDrum v0.3.0 source with a static CRT)'
 # Desktop GPUs have no ASTC: a runtime built with NXRT_ASTC2BC7=OFF renders most textures black (issue #1). Refuse to package one.
 if (Select-String -Path (Join-Path $RtDir 'fefw_rt.dll') -SimpleMatch 'NXRT_ASTC2BC7=OFF' -Quiet) {
     throw "fefw_rt.dll was built without the ASTC transcoder (NXRT_ASTC2BC7=OFF): reconfigure with -DNXRT_ASTC2BC7=ON"
@@ -84,12 +85,19 @@ if ($buildLauncher) {
 Need $Launcher 'fefw-launcher.exe'
 
 # --- built from this checkout
+# --- the haptics engine (MIT OR Apache-2.0, so it can ship, unlike the Streamline and FidelityFX DLLs). src/gfx/haptic.cpp
+# loads it at run time with LoadLibraryExW from the exe folder and falls back to the standard two-motor rumble when it is not
+# there. It is built from the RenHDrum source with a static CRT, so it does not need the Visual C++ redistributable.
+Put "$root\runtime\third_party\renhdrum\renhdrum.dll" 'renhdrum.dll'
+Put "$root\runtime\third_party\renhdrum\LICENSE-MIT" 'licenses\LICENSE.RenHDrum.MIT.txt'
+Put "$root\runtime\third_party\renhdrum\NOTICE" 'licenses\NOTICE.RenHDrum.txt'
+Put "$root\runtime\third_party\renhdrum\SHA256SUMS" 'licenses\RenHDrum.SHA256SUMS.txt'
 Put (Join-Path $RtDir 'fefw_rt.dll') 'fefw_rt.dll'
 Put (Join-Path $RtDir 'fonts\DejaVuSans.ttf') 'fonts\DejaVuSans.ttf'
 Get-ChildItem $RtDir -Filter 'astcdec-*-shared.dll' -ErrorAction SilentlyContinue | ForEach-Object { Put $_.FullName $_.Name }
 Put $Launcher 'fefw-launcher.exe'
 Put (Join-Path $RtDir 'fefw_rt.lib') 'tools\build\sdk\fefw_rt.lib'
-foreach ($f in 'fefw_rt_api.h', 'fefw_stub.cpp') { Put "$root\game-build\fefw\src\$f" "tools\build\sdk\$f" }
+foreach ($f in 'fefw_rt_api.h', 'fefw_stub.cpp', 'fefw_fma.c') { Put "$root\game-build\fefw\src\$f" "tools\build\sdk\$f" }
 foreach ($f in 'fefw.rc', 'fefw.manifest', 'fefw.ico') { Put "$root\game-build\fefw\res\$f" "tools\build\sdk\$f" }
 foreach ($f in 'fefw_build.py', 'dump_hashes.json') { Put "$root\game-build\release\$f" "tools\build\$f" }
 Put "$root\tools\mods\modpack.py" 'tools\build\modpack.py'

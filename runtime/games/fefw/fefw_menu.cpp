@@ -46,7 +46,9 @@
 #include "nxrt/lowlat.h"
 #include "nxrt/overlay.h"
 #include "nxrt/menu_i18n.h"
+#include "nxrt/haptic.h"
 #include "nxrt/platform.h"
+#include "nxrt/render_status.h"
 #include "play_types.h"
 #include "play_ui.h"
 
@@ -60,6 +62,7 @@ namespace {
 
 constexpr const char* kTag = "menu";
 namespace hid = nxrt::hid;
+namespace haptic = nxrt::gfx::haptic;
 using nxrt::gfx::tr;
 using play::UiHost;
 
@@ -237,8 +240,8 @@ void row(Menu& m, const char* label, When when, const char* help) {
     ImGui::TextUnformatted(tr(label));
     if (when == When::Restart) {
         ImGui::SameLine();
-        ImGui::TextColored(kRestartTag, tr(tr("restart")));
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr(tr("Applies on restart: the game reads this once, when it starts.")));
+        ImGui::TextColored(kRestartTag, tr("restart"));
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Applies on restart: the game reads this once, when it starts."));
     }
     ImGui::TableSetColumnIndex(1);
     ImGui::SetNextItemWidth(-FLT_MIN);
@@ -253,20 +256,21 @@ void row(Menu& m, const char* label, When when, const char* help) {
 // Under a restart-only control: what runs until the restart.
 void pending_note(bool pending, const std::string& running) {
     if (!pending) return;
-    ImGui::TextColored(kOrange, tr(tr("Applies on restart (running: %s)")), running.empty() ? tr("default") : running.c_str());
+    ImGui::TextColored(kOrange, tr("Applies on restart (running: %s)"), running.empty() ? tr("default") : running.c_str());
 }
 
 // A value row that is set by an environment variable: shown, locked.
 bool env_locked(const IniKey& k) {
     if (!ini_env(k)) return false;
-    ImGui::TextDisabled(tr(tr("%s (set by %s)")), ini_now(k).c_str(), config_env_name(k.sec, k.key).c_str());
+    ImGui::TextDisabled(tr("%s (set by %s)"), ini_now(k).c_str(), config_env_name(k.sec, k.key).c_str());
     return true;
 }
 
 // A list. *idx may be -1 (a value no entry holds): `other` is shown then. Left / right step through the entries.
-bool combo(Menu& m, const char* id, int* idx, const char* const* names, int n, const char* other = "Custom") {  // tr() at the sites
+bool combo(Menu& m, const char* id, int* idx, const char* const* names, int n, const char* other = "Custom",
+           bool other_is_text = false) {  // tr() at the sites
     bool changed = false;
-    const char* preview = *idx >= 0 && *idx < n ? tr(names[*idx]) : tr(other);
+    const char* preview = *idx >= 0 && *idx < n ? tr(names[*idx]) : other_is_text ? other : tr(other);
     if (ImGui::BeginCombo(id, preview, ImGuiComboFlags_HeightLarge)) {
         for (int i = 0; i < n; ++i) {
             const bool sel = i == *idx;
@@ -540,8 +544,8 @@ void resolution_group(Menu& m) {
                 int idx = -1;
                 for (int i = 0; i < kOutputCount; ++i)
                     if (cur == std::string(kOutputVals[i])) idx = i;
-                const std::string other = "Custom: " + ini_now(out);
-                if (combo(m, "##out", &idx, kOutputNames, kOutputCount, other.c_str())) ini_put(m, out, kOutputVals[idx]);
+                const std::string other = std::string(tr("Custom")) + ": " + ini_now(out);
+                if (combo(m, "##out", &idx, kOutputNames, kOutputCount, other.c_str(), true)) ini_put(m, out, kOutputVals[idx]);
                 pending_note(ini_pending(m, out), ini_boot(m, out));
             }
         }
@@ -717,9 +721,81 @@ void picture_group(UiHost& host, Menu& m) {
     }
 }
 
+// The tier a running render scale reads as, named the way the ratio list names it. The percent comes from the pass's own extents, so a
+// hand-written render_ratio (0.7) or a resolution the game picked itself shows its nearest tier beside the exact percent.
+const char* live_tier_name(int percent) {
+    if (percent <= 0) return "unknown";
+    if (percent >= 99) return "native (DLAA)";
+    if (percent >= 67) return "quality";
+    if (percent >= 59) return "balanced";
+    if (percent >= 50) return "performance";
+    if (percent >= 33) return "ultra performance";
+    return "below ultra performance";
+}
+
+// Graphics > Live render state (render_status.h): what ran, at which sizes, and whether frame generation really inserts frames. Read only:
+// no row writes anything, and the snapshot is a plain copy taken here (the render thread publishes at most four times a second).
+void live_status_group() {
+    const render_status::Snapshot s = render_status::snapshot();
+    // The same numbers in the log, once a second, while the page is open: what the rows say can be checked against the render thread's own
+    // lines (nvn.dlss: network 2: first evaluation ...) without a screenshot.
+    if (nxrt::log_enabled(nxrt::LogLevel::Debug)) {
+        static uint64_t last = 0;
+        const uint64_t now = FrameLimiter::now_ns();
+        if (!last || now - last >= 1000000000ull) {
+            last = now;
+            NXLOG_D(kTag,
+                    "live render state: seen %d, upscaler %s -> %s (fallback %d)%s%s, render %dx%d -> %dx%d (%d%%), screen %dx%d, "
+                    "frame generation %s (dlss %d, fsr3 %d), pause %s, status %u, %u game frames, %u shown, %u generated (%.1f -> %.1f fps), measured %d",
+                    s.seen ? 1 : 0, render_status::backend_name(s.configured), render_status::backend_name(s.actual), s.fallback ? 1 : 0,
+                    s.reason[0] ? ", reason: " : "", s.reason, s.render_w, s.render_h, s.output_w, s.output_h, s.percent, s.screen_w, s.screen_h,
+                    render_status::framegen_name(s.fg), s.fg_dlss ? 1 : 0, s.fg_ffx ? 1 : 0, render_status::pause_name(s.pause), s.status,
+                    s.game_frames, s.shown_frames, s.generated, s.game_fps, s.shown_fps, s.measured ? 1 : 0);
+        }
+    }
+    section("Live render state");
+    if (!s.seen && s.fg == render_status::FrameGen::Unknown) {
+        ImGui::TextDisabled("%s", tr("Nothing has been rendered yet."));
+        return;
+    }
+    if (s.seen) {
+        // The backend that really ran, and the one the configuration asked for when they differ.
+        if (s.fallback)
+            ImGui::Text(tr("Upscaler: %s -> %s (fell back)"), tr(render_status::backend_name(s.configured)),
+                        tr(render_status::backend_name(s.actual)));
+        else
+            ImGui::Text(tr("Upscaler: %s (%s)"), tr(render_status::backend_name(s.actual)),
+                        s.configured == render_status::Backend::Auto ? tr("chosen by Auto") : tr("as configured"));
+        if (s.fallback && s.reason[0]) ImGui::TextWrapped("%s", s.reason);
+        // The pass's own extents: the input it upscaled and the output it wrote.
+        if (s.output_w > 0)
+            ImGui::Text(tr("Render %d x %d -> %d x %d (%d%%, %s)"), s.render_w, s.render_h, s.output_w, s.output_h, s.percent,
+                        tr(live_tier_name(s.percent)));
+        if (s.screen_w > 0 && (s.screen_w != s.output_w || s.screen_h != s.output_h))
+            ImGui::Text(tr("Screen %d x %d"), s.screen_w, s.screen_h);
+    }
+    // Frame generation: the backend, its lifecycle, and the presents it counted in the last window.
+    const char* backend = s.fg_dlss ? "DLSS Frame Generation" : s.fg_ffx ? "FSR 3 frame generation" : tr("none");
+    ImGui::Text(tr("Frame generation: %s (%s)"), tr(render_status::framegen_name(s.fg)), backend);
+    if (s.fg == render_status::FrameGen::Paused && s.pause != render_status::Pause::None)
+        ImGui::TextWrapped(tr("Why it is paused: %s"), tr(render_status::pause_name(s.pause)));
+    if (s.measured && s.game_frames > 0) {
+        // Three separate numbers, because the backend's own count covers every present: the game's frames, what reached the display, and
+        // the extra frames the difference proves.
+        ImGui::Text(tr("Last window: %u game frames, %u frames shown, %u generated (%.1f -> %.1f fps)"), s.game_frames, s.shown_frames, s.generated,
+                    s.game_fps, s.shown_fps);
+        if (s.fg == render_status::FrameGen::Generating && s.generated == 0)
+            ImGui::TextColored(kOrange, "%s", tr("Set up, but no extra frame was presented in the last window: not confirmed to be inserting frames."));
+    } else if (s.fg == render_status::FrameGen::Ready) {
+        ImGui::TextColored(kOrange, "%s", tr("Set up, actual frame insertion not confirmed yet."));
+    }
+    if (s.fg_dlss && s.status) ImGui::TextDisabled(tr("Streamline status %u"), s.status);
+}
+
 void graphics_page(UiHost& host, Menu& m) {
     resolution_group(m);
     upscaler_group(m);
+    live_status_group();
     hdr_group(host, m);
     picture_group(host, m);
 }
@@ -961,6 +1037,52 @@ void mouse_section(UiHost& host, Menu& m) {
     }
 }
 
+// ---- Haptics ----------------------------------------------------------------------------------------------------------------------------
+// How the game's HD Rumble value reaches the pad. The backends live in gfx/haptic.cpp: the standard two-motor rumble always
+// works, the DualSense gets real haptics on a cable, a Switch Pro Controller gets HD Rumble packets. The state line reports
+// what is actually driving the pad, not what was asked for.
+constexpr const char* kHapticNames[] = {"Automatic", "Off", "Standard rumble", "DualSense haptics"};
+constexpr int kHapticCount = 4;
+
+void haptic_group(UiHost& host, Menu& m) {
+    play::PadSettings& p = m.edit.pad;
+    const haptic::Status st = haptic::status();
+    section("Haptics");
+    if (begin_rows("haptic")) {
+        row(m, "Vibration", When::Live,
+            "Automatic: DualSense haptics on a cable, HD Rumble for a Switch Pro Controller, the standard rumble for "
+            "anything else. A mode change applies at once; if a backend cannot start, the standard rumble takes over.");
+        int mode = std::clamp(p.haptic, 0, kHapticCount - 1);
+        if (combo(m, "##hap", &mode, kHapticNames, kHapticCount)) {
+            p.haptic = mode;
+            apply(host, m);
+        }
+        row(m, "Vibration strength", When::Live,
+            "For the haptic backends. Left at -1 the haptics follow the rumble strength above instead, so an untouched "
+            "controls.ini keeps one strength knob; 0 silences them.");
+        double strength = static_cast<double>(p.haptic_strength);
+        if (slider(m, "##haps", &strength, -1.0, 100.0, 1.0, "%.0f%%")) {
+            p.haptic_strength = static_cast<int>(std::lround(strength));
+            apply(host, m);
+        }
+        row(m, "Test", When::Info, nullptr);
+        const bool can_test = st.running && st.requested != haptic::Mode::Off;
+        ImGui::BeginDisabled(!can_test);
+        if (button(m, "Buzz once")) haptic::test_start();
+        ImGui::EndDisabled();
+        end_rows();
+    }
+    if (!st.dll) ImGui::TextDisabled("%s", tr("renhdrum.dll is not next to the game: the standard rumble only."));
+    if (st.device[0] == 0) {
+        ImGui::TextDisabled("%s", tr("No pad for the haptics yet."));
+    } else {
+        ImGui::TextDisabled(tr("%s: %s, %s"), st.device, tr(haptic::backend_name(st.backend)), tr(st.wired ? "on a cable" : "wireless"));
+        if (st.detail[0]) ImGui::TextWrapped("%s", tr(st.detail));
+        ImGui::TextDisabled(tr("Live: %s; %llu values from the game, %llu packets sent."), st.running ? tr("yes") : tr("no"),
+                            static_cast<unsigned long long>(st.pushes), static_cast<unsigned long long>(st.packets));
+    }
+}
+
 void controls_page(UiHost& host, Menu& m, const play::LiveStatus& live) {
     play::PadSettings& p = m.edit.pad;
     section("Controller");
@@ -995,6 +1117,7 @@ void controls_page(UiHost& host, Menu& m, const play::LiveStatus& live) {
     }
     if (live.pads == 0) ImGui::TextDisabled("%s", tr("No controller connected."));
     else ImGui::TextDisabled(tr("%d connected: %s (rumble %s)"), live.pads, live.pad_name.c_str(), live.pad_rumble ? "yes" : "no");
+    haptic_group(host, m);
     mouse_section(host, m);
 
     section("Button mapping");
@@ -1266,6 +1389,7 @@ void settings_menu(play::UiHost& host, gfx::Overlay& ov) {
         for (const IniKey& k : kIni) ini_boot(m, k);
         m.loaded = true;
     }
+
     const int frame = ImGui::GetFrameCount();
     const bool opened = frame != m.last_frame + 1;
     m.last_frame = frame;
