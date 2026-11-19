@@ -10,10 +10,12 @@ decrypted dump of the game (update 131072), as a folder with exefs/ and romfs/ o
 
 Updating: extract the new release over this folder and press Set up again if the launcher asks. Your saves are kept (save/).
 
-Mods: use the launcher's Mods page to import and enable manifest-based IPS/IPS32 patches or supported runtime packages.
+Mods: use the launcher's Mods page to import IPS/IPS32/pchtxt patches, patch-only ExeFS folders, or supported runtime packages.
 The mod state is stored in mods-state.json beside mods/. Press Set up again after changing enabled IPS patches: the build
 reads your original dump only, translates a separate patched copy, and keeps previous-fefw.exe / previous-main in build/
-for rollback. Only main code patches for the matching game Build ID are accepted. Supported runtime packages appear in the
+for rollback. Patch parsing/writing follows upstream; main text/rodata/data are supported, but other modules, segment gaps
+and protected hook conflicts remain unsupported. No manual patch filename changes are required in the Mods page.
+Supported runtime packages appear in the
 in-game F1 Mods tab after a restart; packages are installed separately and are not included in this release.
 
 Licences: LICENSE.txt, LEGAL.txt and licenses/.

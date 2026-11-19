@@ -234,8 +234,8 @@ async fn pick_nup(app: AppHandle, start: Option<String>) -> Option<String> {
 
 #[tauri::command]
 async fn pick_mod_file(app: AppHandle) -> Option<String> {
-    app.dialog().file().set_title("Choose an IPS or IPS32 patch")
-        .add_filter("ExeFS patch", &["ips", "ips32"])
+    app.dialog().file().set_title("Choose an ExeFS patch")
+        .add_filter("ExeFS patch", &["ips", "ips32", "pchtxt"])
         .blocking_pick_file().and_then(|p| p.into_path().ok()).map(|p| dump::fwd(&p))
 }
 

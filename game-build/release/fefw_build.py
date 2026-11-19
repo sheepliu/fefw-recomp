@@ -206,7 +206,13 @@ def manifest_patches(game, info):
     except (OSError, ValueError) as exc:
         raise Fail('invalid Mod Host packages: %s' % exc) from exc
     return [(name, '%s/manifest.json' % name, [(start, data) for start, _, data in packages[name][1]])
-            for name in sorted(enabled) if packages[name][0]['type'] == 'exefs-ips']
+            for name in sorted(enabled) if packages[name][0]['type'] in mp.PATCH_TYPES]
+
+
+def selected_patches(game, info):
+    """Native and UI-managed patches share the upstream name ordering and writer."""
+    patches = collect_exefs_patches(game, info['game_build_id']) + manifest_patches(game, info)
+    return sorted(patches, key=lambda p: p[0].lower())
 
 
 # These exact, previously tested Mod Host patches branch out at a function entry.
@@ -229,7 +235,10 @@ def compatible_manifest_entries(game, info):
     }
     packages = mp.installed(mods_dir, info)
     return {record for record in MODHOST_ENTRY_PATCHES
-            if packages.get(record[0].split('/')[0], ({},))[0].get('sha256') == known[record[0].split('/')[0]]}
+            if record[0].split('/')[0] in packages
+            and packages[record[0].split('/')[0]][0]['type'] in mp.PATCH_TYPES
+            and any(entry.get('sha256') == known[record[0].split('/')[0]]
+                    for entry in mp.patch_entries(packages[record[0].split('/')[0]][0]))}
 
 
 # FEFW_CPU_FORCE_MISSING names (as fefw_rt.dll and the launcher read them) -> Zig's feature names
@@ -296,7 +305,7 @@ def check(game, variant=None):
     try:
         info = modpack().main_info(Path(active))
         bid = info['game_build_id']
-        patch_stamp = exefs_patch_stamp(collect_exefs_patches(game, bid) + manifest_patches(game, info))
+        patch_stamp = exefs_patch_stamp(selected_patches(game, info))
         sites_stamp = mod_sites_stamp(collect_mod_sites(game, bid))
     except (Fail, OSError, ValueError) as e:
         return False, str(e)
@@ -541,6 +550,10 @@ def collect_exefs_patches(game, build_id):
     IPS files count when their name is main's build ID; pchtxt files when their @nsobid is."""
     found = []
     for name, d in find_mod_dirs(os.path.join(game, 'mods')):
+        manifest = read_json(os.path.join(d, 'manifest.json'))
+        if isinstance(manifest, dict) and manifest.get('manifest_version') == 1 and manifest.get('type') in (
+                'exefs-ips', 'exefs-patches'):
+            continue  # the UI adapter selects these; do not also apply disabled packages through the loose-folder scanner
         ex = os.path.join(d, 'exefs')
         if not os.path.isdir(ex):
             continue
@@ -1198,7 +1211,7 @@ def main():
         write_exefs(a.exefs, stage)
         main_path = os.path.join(stage, 'main')
         info = modpack().main_info(Path(main_path))
-        patches = collect_exefs_patches(game, want['main_build_id']) + manifest_patches(game, info)
+        patches = selected_patches(game, info)
         mod_sites = collect_mod_sites(game, want['main_build_id'])
         apply_exefs_patches(main_path, patches, mod_sites, compatible_manifest_entries(game, info))
         sites = write_sites(os.path.join(stage, 'main'), mod_sites, build)

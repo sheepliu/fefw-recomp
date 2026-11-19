@@ -77,13 +77,16 @@ class ModPackTests(unittest.TestCase):
                              encoding="utf-8", check=True)
         self.assertEqual(json.loads(cli.stdout)["game_build_id"], BUILD_ID)
 
-    def test_conflict_preserves_existing_state(self):
+    def test_overlaps_follow_native_mod_name_order(self):
         self.install("first", ips32((0x120, b"\x00" * 8)))
         self.install("second", ips32((0x124, b"\x11" * 4)))
         modpack.set_enabled(self.mods, self.info, "first", True)
-        with self.assertRaisesRegex(modpack.ModError, "first vs second.*main\\+0x24"):
-            modpack.set_enabled(self.mods, self.info, "second", True)
-        self.assertEqual(modpack.read_state(self.mods)["enabled"], ["first"])
+        modpack.set_enabled(self.mods, self.info, "second", True)
+        self.assertEqual(modpack.read_state(self.mods)["enabled"], ["first", "second"])
+        packages = modpack.installed(self.mods, self.info)
+        original = self.main.read_bytes() + b"\0" * 0x400
+        patched = modpack.patched_main(original, self.mods, packages, ["first", "second"], BUILD_ID)
+        self.assertEqual(patched[0x120:0x128], b"\0" * 4 + b"\x11" * 4)
 
     def test_nonoverlapping_patches_and_legacy_ips(self):
         self.install("first", ips32((0x120, b"\x00" * 8)))
@@ -96,20 +99,101 @@ class ModPackTests(unittest.TestCase):
         rle = b"PATCH" + b"\x00\x01\x20" + b"\x00\x00" + b"\x00\x04\xAA" + b"EOF"
         self.assertEqual(modpack.checked_writes(rle, self.info)[1][0][2], b"\xAA" * 4)
         invalid = [b"", b"PATCH", b"PATCH" + b"\x00\x01\x20\x00\x04\xAA" + b"EOF",
-                   ips((0x120, b"\0" * 4)) + b"\0\0\0", ips32((0x120, b"\0" * 4))[:-1],
-                   b"PATCH" + b"\x00\x01\x20\x00\x00\x00\x00\xAAEOF"]
+                   ips32((0x120, b"\0" * 4))[:-1]]
         for blob in invalid:
             with self.subTest(blob=blob), self.assertRaises(modpack.ModError):
                 modpack.parse_ips(blob)
 
-    def test_bad_ranges_alignment_self_overlap(self):
-        blobs = [ips32((0xFC, b"\0" * 4)), ips32((0x500, b"\0" * 4)),
-                 ips32((0x121, b"\0" * 4)), ips32((0x120, b"\0" * 3)),
-                 ips32((0x120, b"\0" * 8), (0x124, b"\x01" * 4)),
-                 ips32((0x120, (0x140000FF).to_bytes(4, "little")))]
+    def test_header_and_unmapped_ranges_are_rejected(self):
+        blobs = [ips32((0xFC, b"\0" * 4)), ips32((0x500, b"\0" * 4))]
         for blob in blobs:
             with self.subTest(blob=blob), self.assertRaises(modpack.ModError):
                 modpack.checked_writes(blob, self.info)
+
+    def test_native_byte_writes_self_overlap_and_branch_data_are_accepted(self):
+        cases = [ips32((0x121, b"\0" * 4)), ips32((0x120, b"\0" * 3)),
+                 ips32((0x120, b"\0" * 8), (0x124, b"\x01" * 4)),
+                 ips32((0x120, (0x140000FF).to_bytes(4, "little")))]
+        for blob in cases:
+            with self.subTest(blob=blob):
+                kind, writes = modpack.checked_writes(blob, self.info)
+                self.assertEqual(kind, "IPS32")
+                self.assertTrue(writes)
+
+    def full_main(self):
+        data = bytearray(self.main.read_bytes() + b"\0" * 0x440)
+        struct.pack_into("<I", data, 0x0C, 0x38)
+        struct.pack_into("<I", data, 0x60, 0x400)
+        for index, file_off, memory_off in ((1, 0x500, 0x1000), (2, 0x520, 0x2000)):
+            struct.pack_into("<III", data, 0x10 + index * 0x10, file_off, memory_off, 0x20)
+            struct.pack_into("<I", data, 0x60 + index * 4, 0x20)
+        for index in range(3):
+            off, _, size = struct.unpack_from("<III", data, 0x10 + index * 0x10)
+            data[0xA0 + index * 32:0xC0 + index * 32] = hashlib.sha256(data[off:off + size]).digest()
+        self.main.write_bytes(data)
+        self.info = modpack.main_info(self.main)
+        return bytes(data)
+
+    def test_byte_patches_cover_rodata_and_data_and_refresh_each_segment_hash(self):
+        original = self.full_main()
+        patch = self.raw_patch("数据修改.ips32", ips32((0x1101, b"\x11\x22"), (0x2103, b"\x33")))
+        result = modpack.import_mod(patch, self.mods, self.info)
+        modpack.set_enabled(self.mods, self.info, result["id"], True)
+        changed = modpack.patched_main(original, self.mods, modpack.installed(self.mods, self.info),
+                                      [result["id"]], BUILD_ID)
+        self.assertEqual(changed[0x501:0x503], b"\x11\x22")
+        self.assertEqual(changed[0x523], 0x33)
+        self.assertEqual(changed[0xC0:0xE0], hashlib.sha256(changed[0x500:0x520]).digest())
+        self.assertEqual(changed[0xE0:0x100], hashlib.sha256(changed[0x520:0x540]).digest())
+        self.assertEqual(changed[0x100:0x500], original[0x100:0x500])
+        self.assertEqual(self.main.read_bytes(), original)
+
+    def test_pchtxt_uses_native_blocks_offset_shift_and_build_id(self):
+        original = self.full_main()
+        patch = self.raw_patch("属性修改.pchtxt", (
+            f"@nsobid-{BUILD_ID}\n@flag offset_shift 0x100\n@enabled\n"
+            "00001001 AABB\n@disabled\n00002000 CCDD\n@stop\n").encode("utf-8"))
+        result = modpack.import_mod(patch, self.mods, self.info)
+        packages = modpack.installed(self.mods, self.info)
+        changed = modpack.patched_main(original, self.mods, packages, [result["id"]], BUILD_ID)
+        self.assertEqual(changed[0x501:0x503], b"\xAA\xBB")
+        self.assertEqual(changed[0x520:0x522], b"\0\0")
+        patch.write_text("@nsobid-" + "CD" * 32 + "\n@enabled\n00000120 AABB\n", encoding="utf-8")
+        with self.assertRaisesRegex(modpack.ModError, "Build ID"):
+            modpack.import_mod(patch, self.mods, self.info, "wrong-build")
+
+    def test_native_folder_import_reports_skipped_modules_and_honors_disable(self):
+        source = self.root / "社区补丁"
+        source.joinpath("exefs").mkdir(parents=True)
+        matching = source / "exefs" / (BUILD_ID + ".ips")
+        matching.write_bytes(ips32((0x120, b"\x01\x02\x03\x04")))
+        other = source / "exefs" / ("CD" * 32 + ".ips")
+        other.write_bytes(ips32((0x120, b"\x05\x06\x07\x08")))
+        result = modpack.import_mod(source, self.mods, self.info)
+        self.assertEqual(len(result["ignored_files"]), 1)
+        backend = modpack.native_builder()
+        self.assertEqual(backend.selected_patches(self.root, self.info), [])
+        modpack.set_enabled(self.mods, self.info, result["id"], True)
+        selected = backend.selected_patches(self.root, self.info)
+        self.assertEqual(len(selected), 1, "managed exefs must not also be scanned as loose patches")
+        self.assertEqual(selected[0][2], [(0x20, b"\x01\x02\x03\x04")])
+        modpack.set_enabled(self.mods, self.info, result["id"], False)
+        self.assertEqual(backend.selected_patches(self.root, self.info), [])
+        self.assertEqual(matching.read_bytes(), ips32((0x120, b"\x01\x02\x03\x04")))
+        self.assertEqual(other.read_bytes(), ips32((0x120, b"\x05\x06\x07\x08")))
+
+    def test_legacy_manifest_packages_still_import_and_apply(self):
+        patch = self.raw_patch("old.ips32", ips32((0x120, b"\x01\x02\x03\x04")))
+        package = self.root / "legacy"
+        package.mkdir()
+        (package / patch.name).write_bytes(patch.read_bytes())
+        (package / "manifest.json").write_text(json.dumps(
+            modpack.imported_manifest(patch, "legacy", "Old", "1.0", BUILD_ID)), encoding="utf-8")
+        modpack.import_mod(package, self.mods, self.info)
+        listed = modpack.set_enabled(self.mods, self.info, "legacy", True)
+        self.assertEqual(listed["mods"][0]["type"], "exefs-ips")
+        self.assertEqual(modpack.installed(self.mods, self.info)["legacy"][1],
+                         [(0x20, 0x24, b"\x01\x02\x03\x04")])
 
     def test_wrong_build_hash_duplicate_id_and_rollback(self):
         path = self.raw_patch("first.ips32", ips32((0x120, b"\0" * 4)))
@@ -195,7 +279,7 @@ class ModPackTests(unittest.TestCase):
         with self.assertRaisesRegex(modpack.ModError, "original main .text SHA"):
             modpack.patched_main(bytes(damaged), self.mods, packages, ["first"], BUILD_ID)
         (self.mods / "first" / "first.ips32").write_bytes(ips32((0x124, b"\0" * 4)))
-        with self.assertRaisesRegex(modpack.ModError, "IPS sha256 changed"):
+        with self.assertRaisesRegex(modpack.ModError, "sha256 mismatch"):
             modpack.patched_main(original, self.mods, packages, ["first"], BUILD_ID)
 
 

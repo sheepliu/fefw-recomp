@@ -7,7 +7,11 @@ on-disk segment offsets are *not* IPS offsets.
 """
 
 import argparse
+import contextlib
+from functools import lru_cache
 import hashlib
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +19,7 @@ import re
 import shutil
 import struct
 import sys
+import tempfile
 import uuid
 
 
@@ -22,6 +27,8 @@ FORMAT = 1
 IPS_LIMIT = 32 * 1024 * 1024
 ID = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+PATCH_TYPES = ("exefs-ips", "exefs-patches")
+PATCH_SUFFIXES = (".ips", ".ips32", ".pchtxt")
 
 # Keep the runtime backend's supported operations explicit. Importing a package
 # with an unknown capability never silently promises that it can execute.
@@ -84,76 +91,87 @@ def main_info(path):
     text_offset, text_size = struct.unpack_from("<II", header, 0x14)
     if not text_size or text_offset % 4 or text_size % 4:
         raise ModError(f"{path}: invalid NSO text segment")
-    return {"game_build_id": build_id, "text_offset": text_offset, "text_size": text_size}
+    segments = []
+    for index, name in enumerate(("text", "rodata", "data")):
+        file_offset, memory_offset, size = struct.unpack_from("<III", header, 0x10 + 0x10 * index)
+        if size:
+            segments.append({"name": name, "file_offset": file_offset, "memory_offset": memory_offset, "size": size})
+    return {"game_build_id": build_id, "text_offset": text_offset, "text_size": text_size, "segments": segments}
+
+
+@lru_cache(maxsize=1)
+def native_builder():
+    """Load the same pinned parser/writer used by upstream Setup, including in a release ZIP."""
+    sibling = Path(__file__).with_name("fefw_build.py")
+    source = sibling if sibling.is_file() else Path(__file__).resolve().parents[2] / "game-build/release/fefw_build.py"
+    spec = importlib.util.spec_from_file_location("fefw_native_patch_backend", source)
+    if not source.is_file() or spec is None or spec.loader is None:
+        raise ModError("Native ExeFS patch backend is missing")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not sibling.is_file():
+        module.RECOMP = str(source.parents[2] / "recomp")
+    return module
 
 
 def parse_ips(blob):
-    """Return (format, [(file_offset, bytes)]); reject truncated/ambiguous records."""
     if len(blob) > IPS_LIMIT:
         raise ModError("IPS file exceeds 32 MiB limit")
-    if blob.startswith(b"IPS32"):
-        kind, cursor, width, marker = "IPS32", 5, 4, b"EEOF"
-    elif blob.startswith(b"PATCH"):
-        kind, cursor, width, marker = "IPS", 5, 3, b"EOF"
-    else:
-        raise ModError("expected PATCH or IPS32 magic")
-    records = []
-    while True:
-        if blob[cursor:cursor + len(marker)] == marker:
-            cursor += len(marker)
-            if cursor != len(blob):
-                raise ModError("trailing data / truncate extension is not supported")
-            if not records:
-                raise ModError("empty IPS patch")
-            return kind, records
-        if cursor + width + 2 > len(blob):
-            raise ModError("truncated IPS record or missing EOF marker")
-        offset = int.from_bytes(blob[cursor:cursor + width], "big")
-        cursor += width
-        size = int.from_bytes(blob[cursor:cursor + 2], "big")
-        cursor += 2
-        if size:
-            if cursor + size > len(blob):
-                raise ModError(f"truncated IPS record at 0x{offset:X}")
-            payload = blob[cursor:cursor + size]
-            cursor += size
-        else:
-            if cursor + 3 > len(blob):
-                raise ModError(f"truncated IPS RLE record at 0x{offset:X}")
-            count = int.from_bytes(blob[cursor:cursor + 2], "big")
-            if count == 0:
-                raise ModError(f"empty IPS RLE record at 0x{offset:X}")
-            payload = blob[cursor + 2:cursor + 3] * count
-            cursor += 3
-        records.append((offset, payload))
+    backend = native_builder()
+    try:
+        records = backend.parse_ips(blob, "IPS")
+    except backend.Fail as exc:
+        raise ModError(str(exc)) from exc
+    return ("IPS32" if blob.startswith(b"IPS32") else "IPS"), records
+
+
+def checked_records(records, info):
+    """Use native module-segment bounds; data writes are not ARM64 instructions."""
+    segments = info.get("segments", [{"memory_offset": info["text_offset"], "size": info["text_size"]}])
+    writes = []
+    for offset, data in records:
+        if offset < 0x100:
+            raise ModError(f"patch offset 0x{offset:X} targets the NSO header")
+        if not data:
+            continue
+        start, end = offset - 0x100, offset - 0x100 + len(data)
+        if not any(seg["memory_offset"] <= start < end <= seg["memory_offset"] + seg["size"] for seg in segments):
+            raise ModError(f"patch offset 0x{offset:X} is outside main text, rodata and data")
+        writes.append((start, end, data))
+    return writes
 
 
 def checked_writes(blob, info):
     kind, records = parse_ips(blob)
-    text_start = info["text_offset"]
-    text_end = text_start + info["text_size"]
-    writes = []
-    for offset, data in records:
-        memory_offset = offset - 0x100
-        end = memory_offset + len(data)
-        if not (text_start <= memory_offset < end <= text_end):
-            raise ModError(f"IPS offset 0x{offset:X} is outside main .text (or targets the NSO header)")
-        if memory_offset % 4 or len(data) % 4:
-            raise ModError(f"IPS offset 0x{offset:X} is not aligned to AArch64 instructions")
-        for pos in range(0, len(data), 4):
-            word = int.from_bytes(data[pos:pos + 4], "little")
-            if word & 0x7C000000 == 0x14000000:  # AArch64 B / BL, signed imm26 words
-                imm = word & 0x03FFFFFF
-                displacement = (imm - (1 << 26) if imm & (1 << 25) else imm) * 4
-                target = memory_offset + pos + displacement
-                if not (text_start <= target < text_end):
-                    raise ModError(f"branch at main+0x{memory_offset + pos:X} leaves main .text")
-        writes.append((memory_offset, end, data))
-    writes.sort(key=lambda x: x[0])
-    for left, right in zip(writes, writes[1:]):
-        if left[1] > right[0]:
-            raise ModError(f"overlapping records in one IPS at main+0x{right[0]:X}")
-    return kind, writes
+    return kind, checked_records(records, info)
+
+
+def checked_patch(path, info):
+    if path.suffix.lower() != ".pchtxt" and re.fullmatch(r"[0-9a-fA-F]{16,64}", path.stem):
+        if not native_builder().bid_matches(path.stem, info["game_build_id"]):
+            raise ModError(f"{path.name}: patch Build ID does not match main (other modules are not supported)")
+    if path.suffix.lower() == ".pchtxt":
+        backend = native_builder()
+        try:
+            records = backend.parse_pchtxt(path.read_text(encoding="utf-8-sig"), path.name, info["game_build_id"])
+        except (backend.Fail, UnicodeError, ValueError) as exc:
+            raise ModError(str(exc)) from exc
+        if records is None:
+            raise ModError(f"{path.name}: patch Build ID does not match main (other modules are not supported)")
+        return "PCHTXT", checked_records(records, info)
+    return checked_writes(path.read_bytes(), info)
+
+
+def patch_entries(manifest):
+    if manifest["type"] == "exefs-ips":
+        return [{"path": manifest.get("patch"), "sha256": manifest.get("sha256"), "format": manifest.get("ips_format")}]
+    entries = manifest.get("patches")
+    if not isinstance(entries, list) or not entries or not all(isinstance(e, dict) for e in entries):
+        raise ModError("patches must be a nonempty list")
+    names = [entry.get("path") for entry in entries]
+    if not all(isinstance(n, str) for n in names) or len(names) != len(set(names)):
+        raise ModError("patch file paths must be unique")
+    return entries
 
 
 def package_file(root, relative):
@@ -179,17 +197,23 @@ def validate_manifest(manifest, root, info):
     if manifest.get("game_build_id") != info["game_build_id"]:
         raise ModError(f"{mod_id}: game Build ID does not match main")
     kind = manifest.get("type")
-    if kind == "exefs-ips":
+    if kind in PATCH_TYPES:
         if manifest.get("target_module") != "main":
             raise ModError(f"{mod_id}: only the main NSO is supported")
-        source = package_file(root, manifest.get("patch"))
-        data = source.read_bytes()
-        if not isinstance(manifest.get("sha256"), str) or not SHA256.fullmatch(manifest["sha256"]) or digest(data) != manifest["sha256"]:
-            raise ModError(f"{mod_id}: IPS sha256 mismatch")
-        actual_format, writes = checked_writes(data, info)
-        if manifest.get("ips_format") != actual_format:
-            raise ModError(f"{mod_id}: IPS format does not match the file")
-        return [(manifest["patch"], source)], writes
+        files, writes = [], []
+        for entry in patch_entries(manifest):
+            source = package_file(root, entry.get("path"))
+            if source.suffix.lower() not in PATCH_SUFFIXES:
+                raise ModError(f"{mod_id}: unsupported patch file {source.name}")
+            expected = entry.get("sha256")
+            if not isinstance(expected, str) or not SHA256.fullmatch(expected) or digest(source.read_bytes()) != expected:
+                raise ModError(f"{mod_id}: patch sha256 mismatch")
+            actual_format, changes = checked_patch(source, info)
+            if entry.get("format") != actual_format:
+                raise ModError(f"{mod_id}: patch format does not match the file")
+            files.append((entry["path"], source))
+            writes.extend(changes)
+        return files, writes
     if kind == "runtime":
         if manifest.get("capability_version") != 1:
             raise ModError(f"{mod_id}: unsupported runtime capability_version")
@@ -222,12 +246,65 @@ def imported_manifest(path, mod_id, name, version, build_id):
             "target_module": "main", "ips_format": kind, "patch": path.name, "sha256": digest(data)}
 
 
+def suggested_id(source):
+    label = source.parent.name if source.is_dir() and source.name.lower() == "exefs" else source.stem
+    slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:48]
+    if not slug or not slug[0].isalpha() or re.fullmatch(r"[a-f0-9]{16,64}", slug):
+        slug = "patch-" + digest(str(source.resolve()).encode("utf-8"))[:12]
+    return slug
+
+
+def native_manifest(source, info, mod_id=None, name=None, version="1.0.0"):
+    """Keep a managed selection over native patches; do not rewrite their contents."""
+    root = source if source.is_dir() else source.parent
+    patch_dir = root / "exefs" if (root / "exefs").is_dir() else root
+    if source.is_file():
+        paths = [source]
+    else:
+        paths = sorted((p for p in patch_dir.iterdir() if p.is_file() and p.suffix.lower() in PATCH_SUFFIXES),
+                       key=lambda p: p.name.lower())
+        if any(p.suffix.lower() in (".dll", ".sites") for p in patch_dir.iterdir() if p.is_file()):
+            raise ModError("This folder includes DLL/hook-site mods. Install it through the original mods-folder entry.")
+    if not paths:
+        raise ModError("No IPS, IPS32 or pchtxt patches in the selected folder")
+    entries, ignored = [], []
+    for path in paths:
+        if path.is_symlink():
+            raise ModError(f"symlink patch is not supported: {path}")
+        if path.suffix.lower() != ".pchtxt" and re.fullmatch(r"[0-9a-fA-F]{16,64}", path.stem):
+            if not native_builder().bid_matches(path.stem, info["game_build_id"]):
+                if source.is_dir():
+                    ignored.append(f"{path.name}: other module or game Build ID")
+                    continue
+                raise ModError(f"{path.name}: patch Build ID does not match main (other modules are not supported)")
+        if source.is_dir() and path.suffix.lower() == ".pchtxt":
+            backend = native_builder()
+            try:
+                matched = backend.parse_pchtxt(path.read_text(encoding="utf-8-sig"), path.name, info["game_build_id"])
+            except (backend.Fail, ValueError) as exc:
+                raise ModError(str(exc)) from exc
+            if matched is None:
+                ignored.append(f"{path.name}: other module or game Build ID")
+                continue
+        kind, _ = checked_patch(path, info)
+        entries.append({"path": path.relative_to(root).as_posix(), "sha256": digest(path.read_bytes()), "format": kind})
+    if not entries:
+        raise ModError("No patches match main's Build ID in the selected folder")
+    manifest = {"manifest_version": FORMAT, "id": mod_id or suggested_id(source), "name": name or (
+                source.parent.name if source.is_dir() and source.name.lower() == "exefs" else source.stem),
+                "version": version, "type": "exefs-patches", "game_build_id": info["game_build_id"],
+                "target_module": "main", "patches": entries}
+    if ignored:
+        manifest["ignored_files"] = ignored
+    return manifest, root
+
+
 def installed(mods_dir, info):
     packages = {}
     if not mods_dir.exists():
         return packages
     for folder in sorted(mods_dir.iterdir()):
-        if not folder.is_dir() or folder.is_symlink() or folder.name.startswith(".stage-"):
+        if not folder.is_dir() or folder.is_symlink() or folder.name.startswith(("-", "_", ".")):
             continue
         # Upstream's loose RomFS / ExeFS / DLL mods share this folder. They are
         # discovered by the native loader, not controlled by mods-state.json.
@@ -262,80 +339,71 @@ def read_state(mods_dir):
 
 
 def check_conflicts(packages, enabled):
-    writes = []
+    """Validate selection; native patch ordering permits overlap (later mod wins)."""
     for mod_id in sorted(enabled):
         if mod_id not in packages:
             raise ModError(f"enabled mod is missing: {mod_id}")
-        for start, end, _ in packages[mod_id][1]:
-            writes.append((start, end, mod_id))
-    writes.sort()
-    for left, right in zip(writes, writes[1:]):
-        if left[1] > right[0]:
-            raise ModError(f"IPS conflict: {left[2]} vs {right[2]} at main+0x{right[0]:X}")
 
 
 def fingerprint(packages, enabled, build_id):
     patches = []
     for mod_id in sorted(enabled):
         manifest = packages[mod_id][0]
-        if manifest["type"] == "exefs-ips":
-            patches.append([mod_id, manifest["target_module"], manifest["sha256"]])
+        if manifest["type"] in PATCH_TYPES:
+            patches.append([mod_id, manifest["target_module"], patch_entries(manifest)])
     data = {"game_build_id": build_id, "patches": patches}
     return digest(json.dumps(data, separators=(",", ":"), sort_keys=True).encode("utf-8"))
 
 
 def patched_main(plain, mods_dir, packages, enabled, build_id):
-    """Return a patched *uncompressed* NSO; never modify the input bytes.
-
-    The recorded IPS offset is 0x100 + the module's memory address, whereas
-    the NSO file's .text offset is read from its header. Other NSO segments are
-    preserved byte-for-byte. The checksum must reflect the new .text bytes.
-    """
+    """Compatibility helper; use the upstream writer on a scratch file."""
     check_conflicts(packages, enabled)
     if len(plain) < 0x100 or plain[:4] != b"NSO0" or plain[0x40:0x60].hex().upper() != build_id:
         raise ModError("plain main is not the matching NSO")
     flags = struct.unpack_from("<I", plain, 0x0C)[0]
     if flags & 0x87:
         raise ModError("main must be fully unpacked before applying an IPS")
-    file_off, mem_off, size = struct.unpack_from("<III", plain, 0x10)
-    stored_size = struct.unpack_from("<I", plain, 0x60)[0]
-    if file_off < 0x100 or size == 0 or stored_size != size or file_off + size > len(plain):
-        raise ModError("invalid uncompressed main .text layout")
-    original = plain[file_off:file_off + size]
-    if flags & 0x08 and hashlib.sha256(original).digest() != plain[0xA0:0xC0]:
-        raise ModError("original main .text SHA-256 mismatch")
+    for index, segment in enumerate(("text", "rodata", "data")):
+        off, _, size = struct.unpack_from("<III", plain, 0x10 + index * 0x10)
+        if not size:
+            continue
+        if off < 0x100 or off + size > len(plain):
+            raise ModError(f"invalid uncompressed main .{segment} layout")
+        if flags & (8 << index) and digest(plain[off:off + size]) != plain[0xA0 + 32 * index:0xC0 + 32 * index].hex():
+            raise ModError(f"original main .{segment} SHA-256 mismatch")
     if not enabled:
         return plain
-    out = bytearray(plain)
-    for mod_id in sorted(enabled):
-        manifest, expected = packages[mod_id]
-        if manifest["type"] != "exefs-ips":
-            continue
-        patch = package_file(mods_dir / mod_id, manifest["patch"])
-        blob = patch.read_bytes()
-        if digest(blob) != manifest["sha256"]:
-            raise ModError(f"{mod_id}: IPS sha256 changed during build")
-        actual_format, actual = checked_writes(blob, {"text_offset": mem_off, "text_size": size})
-        if actual_format != manifest["ips_format"] or actual != expected:
-            raise ModError(f"{mod_id}: IPS writes changed during build")
-        for start, end, data in expected:
-            if not (mem_off <= start < end <= mem_off + size):
-                raise ModError(f"{mod_id}: IPS write outside the unpacked .text segment")
-            off = file_off + start - mem_off
-            out[off:off + len(data)] = data
-    out[0xA0:0xC0] = hashlib.sha256(out[file_off:file_off + size]).digest()
-    return bytes(out)
+    backend = native_builder()
+    with tempfile.TemporaryDirectory(prefix="fefw-patch-check-") as scratch:
+        path = Path(scratch) / "main"
+        path.write_bytes(plain)
+        info = main_info(path)
+        patches = []
+        for mod_id in sorted(enabled):
+            manifest, expected = packages[mod_id]
+            if manifest["type"] not in PATCH_TYPES:
+                continue
+            _, actual = validate_manifest(manifest, mods_dir / mod_id, info)
+            if actual != expected:
+                raise ModError(f"{mod_id}: patch writes changed during build")
+            patches.append((mod_id, f"{mod_id}/manifest.json", [(a, data) for a, _, data in actual]))
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                backend.apply_exefs_patches(str(path), patches, compatible_entries=
+                                           backend.compatible_manifest_entries(mods_dir.parent, info))
+        except backend.Fail as exc:
+            raise ModError(str(exc)) from exc
+        return path.read_bytes()
 
 
 def import_mod(source, mods_dir, info, mod_id=None, name=None, version="1.0.0"):
-    if source.is_dir():
+    if source.is_dir() and (source / "manifest.json").is_file():
         manifest = read_json(source / "manifest.json")
         root = source
-    elif source.is_file() and source.suffix.lower() in (".ips", ".ips32"):
-        manifest = imported_manifest(source, mod_id, name, version, info["game_build_id"])
-        root = source.parent
+    elif source.is_dir() or (source.is_file() and source.suffix.lower() in PATCH_SUFFIXES):
+        manifest, root = native_manifest(source, info, mod_id, name, version)
     else:
-        raise ModError(f"expected a mod directory or .ips/.ips32 file: {source}")
+        raise ModError(f"expected a mod directory or .ips/.ips32/.pchtxt file: {source}")
     files, _ = validate_manifest(manifest, root, info)
     target = mods_dir / manifest["id"]
     if target.exists():
@@ -358,7 +426,7 @@ def import_mod(source, mods_dir, info, mod_id=None, name=None, version="1.0.0"):
     finally:
         if staging.exists():
             shutil.rmtree(staging)
-    return {"status": "imported", "id": manifest["id"]}
+    return {"status": "imported", "id": manifest["id"], "ignored_files": manifest.get("ignored_files", [])}
 
 
 def list_mods(mods_dir, info):
@@ -367,6 +435,7 @@ def list_mods(mods_dir, info):
     check_conflicts(packages, enabled)
     return {"game_build_id": info["game_build_id"], "patch_set_sha256": fingerprint(packages, enabled, info["game_build_id"]),
             "mods": [{"id": key, "name": value[0]["name"], "version": value[0]["version"], "type": value[0]["type"], "enabled": key in enabled,
+                      "ignored_files": value[0].get("ignored_files", []),
                       "status": ("runtime_supported" if supported_runtime(value[0]) else "metadata_only") if value[0]["type"] == "runtime" else "release_build_supported"}
                      for key, value in packages.items()]}
 

@@ -71,7 +71,7 @@ def selection(repo, game):
     info = mp.main_info(original)
     build_id = info["game_build_id"]
     try:
-        patches = builder.collect_exefs_patches(game, build_id) + builder.manifest_patches(game, info)
+        patches = builder.selected_patches(game, info)
         sites = builder.collect_mod_sites(game, build_id)
     except builder.Fail as exc:
         raise ValueError(str(exc)) from exc

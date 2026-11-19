@@ -52,3 +52,27 @@ build records or an old game executable and assume they validate the new runtime
 Verify game startup, previous saves, ordinary gameplay, IPS multiplier effects,
 F1 item search/addition, gift amount input, apply/cancel, and existing native
 RomFS mods. This checkout's game output is separate from the older checkout.
+
+## Native patch backend in the Mods UI
+
+- Retain the import and enable/disable UI, including automatic IDs when the
+  user leaves the optional ID blank. Do not require users to rename patch files.
+- Accept native IPS/IPS32, pchtxt and patch-only ExeFS folders. Both import
+  preflight and Setup now use the upstream parser and writer rather than
+  applying the earlier text-only/instruction-alignment restrictions.
+- New patch manifests use `exefs-patches`; old `exefs-ips` and existing
+  runtime manifests stay readable. Runtime implementations are unchanged.
+- Keep the original folder entry. Native and UI-managed patches use one
+  mod-name-ordered writer. Managed packages are not also scanned as loose
+  patches, so a disabled UI package really is excluded from the next build.
+- A folder may include patches for several NSO Build IDs. Import matching
+  main patches and visibly report other modules/builds as skipped.
+- Use the original folder entry for DLL mods or custom site lists.
+- This extends compatibility to upstream's supported segment writes; it
+  does not make arbitrary emulator patches compatible. For example, a local
+  community package tested here writes into the gap after main's text
+  (`main+0x1a452f0`): both the original upstream writer and the UI reject it.
+  Its five other module patches also cannot be applied to main.
+- Regression tests cover byte writes to rodata/data, refreshed hashes,
+  pchtxt blocks/offset shift, legacy packages, skipped module reporting,
+  upstream overlap order, and enable/disable without duplicate scanning.

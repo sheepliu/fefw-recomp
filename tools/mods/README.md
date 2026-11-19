@@ -3,21 +3,23 @@
 `modpack.py` is a standalone, standard-library-only **preflight and staging**
 tool. The tool itself does not modify the game dump, launch the game, or start
 a rebuild. Both the **release-package** builder and the checkout's developer
-CMake builder now read enabled IPS packages from the selected run directory.
+CMake builder read enabled patch packages from the selected run directory.
 `release_build_supported` means
 the build can consume that patch; it does not mean the patch is already built
 or verified in game. `metadata_only` means the runtime package has no
 matching execution backend. The launcher has a Mods page for importing, enabling,
-checking conflicts, and returning to Setup to rebuild; see
-`../../docs/MODDING_ROADMAP.md`.
+validating files, and returning to Setup to rebuild; see
+`../../docs/COMMUNITY_UPSTREAM_0.2.6.md`.
 While Setup runs, the page blocks imports and enablement changes. An import
 validation failure keeps the selected file and form values so they can be
-corrected without browsing again. A conflicting enablement reports the two
-mod IDs and offset, leaving the prior selection intact.
+corrected without browsing again. The original upstream mods-folder entry
+continues to work alongside the UI.
 
 An installation uses `mods/<id>/manifest.json` for each package and a separate
-`mods-state.json` file beside `mods/` for enabled IDs. Raw IPS imports need an
-explicit `--id` to prevent three Build-ID-named files replacing one another.
+`mods-state.json` file beside `mods/` for enabled IDs. Imports can be IPS,
+IPS32, pchtxt, a patch-only ExeFS folder, or an existing manifest package.
+An omitted `--id` is generated automatically; users need not rename patch
+files. Folder imports report any files skipped for other module/build IDs.
 The input `--main` is an **original, unmodified** game's ExeFS `main`. For a
 release installation, `--mods-dir` must be the same `<game directory>/mods`
 whose `fefw.exe` the launcher builds (normally the directory containing the
@@ -53,20 +55,32 @@ the referenced patch file (forward-slash relative paths only):
 }
 ```
 
-Only `main`'s 4-byte-aligned `.text` writes are accepted for now. IPS and
-IPS32 support ordinary and RLE records but reject truncate extensions,
-trailing bytes, overlapping writes, out-of-bounds writes, and writes to the
-NSO header. The IPS record address is the **module memory offset + 0x100**,
-not an offset into the original compressed NSO file. An IPS checksum and
-Build ID must match the manifest and selected `main`. Conflicts are checked
-before enabling; no conflicting state is written.
+The old `exefs-ips` manifest remains readable. New imports use
+`type: "exefs-patches"` with `target_module: "main"` and a `patches` array;
+each entry has a relative `path`, `sha256`, and `format` (`IPS`, `IPS32`,
+or `PCHTXT`). One folder can contain several matching patches.
+
+The tool loads the pinned upstream `fefw_build.py` for parsing and writing.
+It accepts byte writes in main's **text, rodata and data**, including
+unaligned data, instead of treating every word as an ARM64 instruction.
+IPSwitch enabled/disabled blocks and offset shifts follow the native parser.
+The IPS record address is the **module memory offset + 0x100**, not an offset
+into a compressed NSO file. Checksums, Build IDs, segment boundaries and
+protected hook sites are still checked. Overlaps follow upstream ordering:
+mod names sort first and later writes win. No arbitrary cross-module support
+or ability to write into NSO segment gaps has been added.
+
+Managed packages with an `exefs/` child are not additionally scanned as loose
+native patches; this keeps their UI enable/disable state effective. Original
+native folders without a managed patch manifest keep the upstream behavior.
+DLL/site-list mods should use the original mods-folder entry.
 
 When the release launcher runs Set up, `tools/build/fefw_build.py` verifies the
 original dump and builds against a temporary uncompressed NSO under the game
-directory's `build/input-exefs/`. It updates the patched text checksum and
+directory's `build/exefs/`. It updates checksums for all modified segments and
 uses that image for translation. Only after successful linking does it publish
-the paired `fefw.exe` and runtime `exefs/main`, keeping backups at
-`build/previous-fefw.exe` and `build/previous-main`. `--check` compares the
+the matching `fefw.exe`, hook-site list and runtime `exefs/main`, keeping backups
+in `build/`. `--check` compares the
 enabled ordered patch set, runtime NSO hash, executable hash, and build tools;
 switching IPS patches makes Setup require another full build. Currently there
 is **no incremental recompilation** or in-game patch-effect verification.
@@ -89,7 +103,7 @@ checkout Python environment. The developer build consumes a staged ExeFS in
 `<run directory>/mod-build/input-exefs`, keeps generated source and libraries
 in separate `work/lift/fefw-mod-*` and `work/build/fefw-mod-*` directories,
 and builds an EXE in `work/build/fefw-mod-exe-*`. Only after successful
-translation/linking does it publish the pair to `<run directory>/mod-build/active/`
+translation/linking does it publish the EXE/main/site-list set to `<run directory>/mod-build/active/`
 and write `mod-build/done.json`. The original dump and the checkout's old
 `game-build/fefw/build/release/fefw.exe` remain unchanged. Old active files
 are backed up by hash under `mod-build/previous/`; a publication error restores
@@ -97,10 +111,10 @@ the old pair. Launcher's `fefw.ini` points `[fs] main` to the active main and
 the game starts from the paired active EXE. Run `dev_build.py check --repo
 <repo> --game <run directory>` to verify the enabled patch set and artifacts;
 Play requires a rebuild after any mismatch. An installation with no
-`mods-state.json` keeps the original checkout build path. Disabling the last
-patch still uses the isolated path and rebuilds an unpatched pair. This has
-only been exercised with mocked compiler invocations and synthetic NSOs, not
-with a complete PC-game build or in-game behavior test.
+`mods-state.json` and no native code patches keeps the original checkout build path. Disabling the last
+patch still uses the isolated path and rebuilds an unpatched pair. The
+regression coverage includes synthetic NSOs and previous real multiplier
+packages. A new community patch still needs its own in-game verification.
 
 Run the validator tests without a game dump:
 
