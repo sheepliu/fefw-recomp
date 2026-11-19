@@ -86,6 +86,7 @@ jobs:
           "FEFW_BUILD_ID=$releaseTag" >> $env:GITHUB_ENV
           "PACKAGE_VERSION=$version-modhost.$short" >> $env:GITHUB_ENV
           Write-Host "Upstream $tag ($upstreamCommit), Mod Host $commit, release $releaseTag"
+          exit 0
 
       - uses: actions/setup-node@v4
         if: steps.version.outputs.exists == 'false'
