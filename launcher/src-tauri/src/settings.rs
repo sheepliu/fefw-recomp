@@ -98,7 +98,7 @@ pub fn apply(dir: &Path, edits: &[Edit]) -> Result<(), String> {
 fn owned(p: &Paths) -> Vec<(&'static str, &'static str, String)> {
     vec![
         ("fs", "exefs", crate::dump::game_path(&p.plain_exefs())),
-        ("fs", "main", String::new()),
+        ("fs", "main", p.runtime_main()),
         ("fs", "romfs", crate::dump::game_path(&p.romfs)),
         ("fs", "mods", crate::dump::game_path(&p.mods())),
         ("aoc", "dir", p.dlc.as_deref().map(crate::dump::game_path).unwrap_or_default()),

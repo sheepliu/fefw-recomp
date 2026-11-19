@@ -15,13 +15,16 @@ The package ships no game code. This script
   2. lifts the six NSOs with the bundled lifter (recomp/nxrecomp) into <game>/build/lift,
   3. compiles the generated C++ with the bundled Zig (zig c++, mingw target) into <game>/build/obj, in parallel,
   4. links fefw.exe = sdk/fefw_stub.cpp + the lifted objects + sdk/fefw_rt.lib (the runtime, fefw_rt.dll in the package),
+     then publishes both the EXE and the matching runtime main; the previous pair remains backed up until replaced,
   5. deletes the generated sources and objects (unless --keep) and records the result in <game>/build/done.json.
 
-The build stamp (state.json, done.json) is the dump (main build ID, module hashes) plus tool_stamp(): everything in this
-package that goes into fefw.exe (lifter sources, main.sites, compile flags and processor variant, the SDK files with fefw_rt.lib). A release that
+The build stamp (state.json, done.json) is the dump (main build ID, module hashes), enabled ordered IPS set, processor variant,
+plus tool_stamp(): everything in this package that goes into fefw.exe (lifter sources, main.sites, compile flags, SDK files,
+and runtime library). A release that
 changes any of them makes an older stamp stale: Set up then lifts, compiles and links again from scratch (the old fefw.exe
-stays until the new one is linked over it). --check compares <game>/build/done.json with this package's tools only (no
-dump check, well under a second) and prints one JSON line {"current": bool, "reason": text}; exit 0 current, 3 not.
+stays until the replacement and matching runtime main are ready). --check compares <game>/build/done.json with the tools,
+enabled patch set, executable and active runtime main (no source dump check) and prints one JSON line
+{"current": bool, "reason": text}; exit 0 current, 3 not.
 
 Resumable: a module's lift counts once its marker file is written, an object once it is renamed into place, so a stopped
 build continues where it stopped. A file named <game>/build/cancel stops it (the launcher's Pause).
@@ -30,8 +33,10 @@ Exit codes: 0 done, 1 error, 2 cancelled.
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
@@ -41,12 +46,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+MODPACK = os.path.join(HERE, 'modpack.py')
+if not os.path.isfile(MODPACK):  # source checkout; release bundles it beside fefw_build.py
+    MODPACK = os.path.abspath(os.path.join(HERE, '..', '..', 'tools', 'mods', 'modpack.py'))
 RECOMP = os.path.join(HERE, 'recomp')
 SDK = os.path.join(HERE, 'sdk')
 WINDOWS = os.name == 'nt'
 # the same Windows target from either host: on Linux the launcher starts fefw.exe through Wine/Proton
 ZIG = os.path.join(HERE, 'zig', 'zig.exe' if WINDOWS else 'zig')
-FORMAT = 2          # bump when the build layout or the stamp changes: older builds (partial or done) are then started over
+FORMAT = 4          # includes ExeFS patches, CPU variant and active runtime NSO in the build stamp
 # the lifter as game-build/scripts/make-release.ps1 ships it: paths under RECOMP, the same in the zip (tools/build/recomp/...)
 # and in the repo (recomp/...)
 LIFTER = ['nxrecomp', 'include/nxrecomp', 'games/fefw/CMakeLists.txt', 'games/fefw/config.py', 'games/fefw/hot.txt',
@@ -171,12 +179,57 @@ def tool_stamp(variant, patch_stamp=None, sites_stamp=None):
     them keeps its old stamp."""
     stamp = {'lifter': tree_hash(RECOMP, LIFTER), 'sites': tree_hash(RECOMP, [SITES]), 'sdk': tree_hash(SDK, SDK_FILES),
              'runtime': sha256(os.path.join(SDK, 'fefw_rt.lib')), 'cxxflags': cxxflags(variant), 'cpu': variant,
-             'modules': [list(m) for m in MODULES]}
+             'modules': [list(m) for m in MODULES], 'modpack': sha256(MODPACK)}
     if patch_stamp:
         stamp['exefs_patches'] = patch_stamp
     if sites_stamp:
         stamp['mod_sites'] = sites_stamp
     return stamp
+
+
+def modpack():
+    # Python -I omits the script folder from sys.path; this sibling ships in the release's tools/build.
+    spec = importlib.util.spec_from_file_location('fefw_modpack', MODPACK)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def manifest_patches(game, info):
+    """Translate enabled Mod Host packages to the upstream patch writer's records."""
+    mp = modpack()
+    mods_dir = Path(game) / 'mods'
+    try:
+        packages = mp.installed(mods_dir, info)
+        enabled = mp.read_state(mods_dir)['enabled']
+        mp.check_conflicts(packages, enabled)
+    except (OSError, ValueError) as exc:
+        raise Fail('invalid Mod Host packages: %s' % exc) from exc
+    return [(name, '%s/manifest.json' % name, [(start, data) for start, _, data in packages[name][1]])
+            for name in sorted(enabled) if packages[name][0]['type'] == 'exefs-ips']
+
+
+# These exact, previously tested Mod Host patches branch out at a function entry.
+# The lifted entry hook runs before the patched first instruction.
+MODHOST_ENTRY_PATCHES = {
+    ('itemgain/manifest.json', 0x8a25c0, bytes.fromhex('020dff17')),
+    ('friendshipgain5x/manifest.json', 0x8ec500, bytes.fromhex('3aabe117')),
+}
+
+
+def compatible_manifest_entries(game, info):
+    """Return exceptions only for the tested package hashes on the supported game build."""
+    if not bid_matches('DB93B0125F4850601D61C3EDDE012F8EB2ECFE77', info['game_build_id']):
+        return set()
+    mp = modpack()
+    mods_dir = Path(game) / 'mods'
+    known = {
+        'itemgain': '464a060a7b05e842fb91e4498341fee61291aadd33d18a433a0dd2936b3b7edb',
+        'friendshipgain5x': '03cda886eadc835df9eea4ad2fa117e53c15b7a7bf6fb23f89eeade3cb55ee08',
+    }
+    packages = mp.installed(mods_dir, info)
+    return {record for record in MODHOST_ENTRY_PATCHES
+            if packages.get(record[0].split('/')[0], ({},))[0].get('sha256') == known[record[0].split('/')[0]]}
 
 
 # FEFW_CPU_FORCE_MISSING names (as fefw_rt.dll and the launcher read them) -> Zig's feature names
@@ -224,8 +277,12 @@ def pick_variant(want):
                   "an AMD FX of 2011 or newer)." % ', '.join(f.replace('cx16', 'CMPXCHG16B').replace('sse4_2', 'SSE4.2').upper() for f in missing))
 
 
-def check(game, variant):
-    """Whether fefw.exe and <game>/build/done.json were built with this package's tools for this processor: (current, reason)."""
+def check(game, variant=None):
+    """Whether the EXE, runtime NSO, enabled patch set, CPU variant and build record match."""
+    if variant is None:
+        variant, why = pick_variant('auto')
+        if not variant:
+            return False, why
     if not os.path.isfile(os.path.join(game, 'fefw.exe')):
         return False, 'fefw.exe is not built yet'
     done = read_json(os.path.join(game, 'build', 'done.json'))
@@ -233,11 +290,15 @@ def check(game, variant):
         return False, 'fefw.exe has no finished build record'
     if done.get('format') != FORMAT or not isinstance(done.get('tools'), dict):
         return False, 'fefw.exe was built by an older release'
+    active = os.path.join(game, 'exefs', 'main')
+    if not os.path.isfile(active):
+        return False, 'runtime main NSO is missing'
     try:
-        bid = json.load(open(os.path.join(HERE, 'dump_hashes.json'), encoding='utf-8'))['main_build_id']
-        patch_stamp = exefs_patch_stamp(collect_exefs_patches(game, bid))
+        info = modpack().main_info(Path(active))
+        bid = info['game_build_id']
+        patch_stamp = exefs_patch_stamp(collect_exefs_patches(game, bid) + manifest_patches(game, info))
         sites_stamp = mod_sites_stamp(collect_mod_sites(game, bid))
-    except Fail as e:
+    except (Fail, OSError, ValueError) as e:
         return False, str(e)
     want = tool_stamp(variant, patch_stamp, sites_stamp)
     changed = [k for k in sorted(set(want) | set(done['tools'])) if done['tools'].get(k) != want.get(k)]
@@ -253,6 +314,10 @@ def check(game, variant):
     shaders = read_json(os.path.join(game, 'shader_cache', 'setup.json'))
     if isinstance(shaders, dict) and shaders.get('translator_version') != SHADER_TRANSLATOR_VERSION:
         return False, 'this release changes the shader translator (shaders are translated again)'
+    if done.get('active_main_sha256') != sha256(active):
+        return False, 'runtime main does not match the built executable'
+    if done.get('exe_sha256') != sha256(os.path.join(game, 'fefw.exe')):
+        return False, 'fefw.exe does not match the finished build record'
     return True, 'fefw.exe matches this release'
 
 
@@ -301,7 +366,7 @@ def verify(exefs):
 
 def write_exefs(exefs, out):
     """The dump's NSOs into `out`, main uncompressed (the lifter and the runtime read plain NSOs only). Set up writes them to
-    <game>/build/exefs; install_exefs moves them to <game>/exefs after the link."""
+    <game>/build/exefs; publish moves them to <game>/exefs after the link."""
     sys.path.insert(0, HERE)
     from nso_unpack import unpack
     os.makedirs(out, exist_ok=True)
@@ -324,19 +389,9 @@ def write_exefs(exefs, out):
             shutil.copyfile(src, dst)
 
 
-def install_exefs(stage, out):
-    """Move the NSOs fefw.exe was just linked from (<game>/build/exefs, exefs patches applied) into <game>/exefs, which the runtime
-    maps. Only after the link: a build that stops or fails earlier leaves <game>/exefs as the fefw.exe still there was built from."""
-    os.makedirs(out, exist_ok=True)
-    for n in EXEFS_FILES:
-        src = os.path.join(stage, n)
-        if os.path.isfile(src):
-            os.replace(src, os.path.join(out, n))
-
-
 # ---- exefs patches (mods/<name>/exefs/*.ips, *.pchtxt) ----------------------------------------------------------------------
 # The game code is lifted ahead of time, so a patch cannot be applied when the game starts as on an emulator. Set up applies the
-# patches of the installed mods to the plain main NSO before lifting (in <game>/build/exefs; install_exefs moves it to <game>/exefs,
+# patches of the installed mods to the plain main NSO before lifting (in <game>/build/exefs; publish moves it to <game>/exefs,
 # which the runtime reads, only once fefw.exe is linked): code patches are then compiled into fefw.exe, data patches are loaded by
 # the runtime. Only patches for main's build ID are used. The
 # patched bytes are part of the build stamp, so adding, changing or removing a patch makes Set up build again. A patch must not touch
@@ -494,12 +549,12 @@ def collect_exefs_patches(game, build_id):
             stem, ext = os.path.splitext(f)
             ext = ext.lower()
             where = '%s/exefs/%s' % (name, f)
-            if ext == '.ips':
+            if ext in ('.ips', '.ips32'):
                 if not bid_matches(stem, build_id):
                     continue             # another module or another version
-                recs = parse_ips(open(p, 'rb').read(), where)
+                recs = parse_ips(Path(p).read_bytes(), where)
             elif ext == '.pchtxt':
-                recs = parse_pchtxt(open(p, encoding='utf-8-sig', errors='replace').read(), where, build_id)
+                recs = parse_pchtxt(Path(p).read_text(encoding='utf-8-sig', errors='replace'), where, build_id)
                 if recs is None:
                     continue
             else:
@@ -531,7 +586,7 @@ def site_addresses():
     """main.sites: {module offset: kind} of every site but noinline (patch, inline, midhook, entryhook, dynimm, jtable)."""
     out = {}
     try:
-        lines = open(os.path.join(RECOMP, *SITES.split('/'))).read().splitlines()
+        lines = Path(RECOMP, *SITES.split('/')).read_text(encoding='utf-8').splitlines()
     except OSError:
         return out
     for line in lines:
@@ -541,12 +596,12 @@ def site_addresses():
     return out
 
 
-def apply_exefs_patches(main_path, patches, mod_sites=()):
+def apply_exefs_patches(main_path, patches, mod_sites=(), compatible_entries=()):
     """Write the patches into the plain main NSO (uncompressed segments) and fix the segment hashes in its header. A patch may not
     touch a site of main.sites or one a mod adds (collect_mod_sites)."""
     if not patches:
         return
-    data = bytearray(open(main_path, 'rb').read())
+    data = bytearray(Path(main_path).read_bytes())
     flags = int.from_bytes(data[12:16], 'little')
     if flags & 7:
         raise Fail('exefs/main has LZ4-compressed segments; exefs patches need the plain main Set up writes')
@@ -565,7 +620,9 @@ def apply_exefs_patches(main_path, patches, mod_sites=()):
             if seg is None:
                 raise Fail('%s: 0x%x..0x%x is outside main\'s text, rodata and data' % (where, off, off + len(b)))
             for a in range(off & ~3, off + len(b), 4):
-                if a in sites:
+                if a in sites and not (sites[a] == 'entryhook' and a == off
+                                       and (where, off, b) in compatible_entries
+                                       and not any(addr - MODULES[0][2] == a for _, _, addr in mod_sites)):
                     raise Fail('%s patches 0x%x, where this release has a main.sites %s site: the two cannot be combined. '
                                'Remove the patch or ask for the site to be moved.' % (where, a, sites[a]))
             clash = next((owner[a] for a in range(off, off + len(b)) if owner.get(a, where) != where), None)
@@ -756,14 +813,14 @@ def write_sites(main_path, mod_sites, build):
     return out
 
 
-def write_lifted_sites(game, sites, build_id):
-    """<game>/fefw.sites: the site list main was lifted with (main.sites plus the mods' sites) under an @nsobid line, read by
+def write_lifted_sites(directory, sites, build_id):
+    """Write fefw.sites, the list main was lifted with, under an @nsobid line, read by
     the runtime to check hooks and the sites of installed mods against this build (runtime/src/services/mods_dll.cpp)."""
-    dst = os.path.join(game, 'fefw.sites')
+    dst = os.path.join(directory, 'fefw.sites')
     tmp = dst + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         f.write('# The hook sites fefw.exe was built with (written by Set up)\n@nsobid %s\n' % build_id)
-        f.write(open(sites, encoding='utf-8').read())
+        f.write(Path(sites).read_text(encoding='utf-8'))
     os.replace(tmp, dst)
 
 
@@ -1036,10 +1093,45 @@ def link(runner, obj, game, env, variant):
     if rc != 0:
         raise Fail('Linking fefw.exe failed (exit %d):\n%s' % (rc, tail))
     clear_high_entropy_va(tmp)
-    dst = os.path.join(game, 'fefw.exe')
-    replace_retry(tmp, dst)
-    progress('link', 1, 1, 'fefw.exe built')
-    return dst
+    progress('link', 1, 1, 'fefw.exe linked; preparing the matching runtime image')
+    return tmp
+
+
+def publish(game, build, staged, exe, done, sites, build_id):
+    """Promote EXE and its main together, restoring old files on an I/O failure.
+
+    Existing runnable files are left in place until linking has completed.
+    A backup of the previous EXE/main remains in build/ for manual rollback.
+    """
+    active_dir = os.path.join(game, 'exefs')
+    os.makedirs(active_dir, exist_ok=True)
+    for name in EXEFS_FILES:
+        if name != 'main' and os.path.isfile(os.path.join(staged, name)):
+            shutil.copy2(os.path.join(staged, name), os.path.join(active_dir, name))
+    write_lifted_sites(staged, sites, build_id)
+    targets = [(os.path.join(staged, 'main'), os.path.join(active_dir, 'main'), os.path.join(build, 'previous-main')),
+               (os.path.join(staged, 'fefw.sites'), os.path.join(game, 'fefw.sites'), os.path.join(build, 'previous-fefw.sites')),
+               (exe, os.path.join(game, 'fefw.exe'), os.path.join(build, 'previous-fefw.exe'))]
+    original = []
+    for _, dst, backup in targets:
+        existed = os.path.isfile(dst)
+        if existed:
+            tmp = backup + '.tmp'
+            shutil.copy2(dst, tmp)
+            os.replace(tmp, backup)
+        original.append(existed)
+    try:
+        for src, dst, _ in targets:
+            os.replace(src, dst)
+        write_json(os.path.join(build, 'done.json'), done)
+    except Exception:
+        for (_, dst, backup), existed in zip(targets, original):
+            if existed:
+                shutil.copy2(backup, dst)
+            elif os.path.exists(dst):
+                os.remove(dst)
+        raise
+    return os.path.join(game, 'fefw.exe')
 
 
 def main():
@@ -1101,13 +1193,14 @@ def main():
         if variant == 'compat':
             progress('verify', 0, 1, 'Building the compatible version of the game (for processors without FMA3)')
         want = verify(a.exefs)
-        # the NSOs are written and patched in build/exefs and lifted from there; install_exefs moves them to <game>/exefs once
-        # fefw.exe is linked, so the old fefw.exe never maps a main patched for the build that replaces it
-        plain, stage = os.path.join(game, 'exefs'), os.path.join(build, 'exefs')
+        # Keep the old runtime image and executable in place until their replacements are ready.
+        stage = os.path.join(build, 'exefs')
         write_exefs(a.exefs, stage)
-        patches = collect_exefs_patches(game, want['main_build_id'])
+        main_path = os.path.join(stage, 'main')
+        info = modpack().main_info(Path(main_path))
+        patches = collect_exefs_patches(game, want['main_build_id']) + manifest_patches(game, info)
         mod_sites = collect_mod_sites(game, want['main_build_id'])
-        apply_exefs_patches(os.path.join(stage, 'main'), patches, mod_sites)
+        apply_exefs_patches(main_path, patches, mod_sites, compatible_manifest_entries(game, info))
         sites = write_sites(os.path.join(stage, 'main'), mod_sites, build)
         stamp = {'format': FORMAT, 'main_build_id': want['main_build_id'], 'sha256': want['sha256'],
                  'tools': tool_stamp(variant, exefs_patch_stamp(patches), mod_sites_stamp(mod_sites))}
@@ -1132,15 +1225,14 @@ def main():
         times['compile'] = round(time.time() - t, 1)
         t = time.time()
         exe = link(runner, obj, game, env, variant)
-        install_exefs(stage, plain)
-        write_lifted_sites(game, sites, want['main_build_id'])
         times['link'] = round(time.time() - t, 1)
+        done = dict(stamp, active_main_sha256=sha256(main_path), exe_sha256=sha256(exe),
+                    seconds=times, finished=time.strftime('%Y-%m-%d %H:%M:%S'))
+        publish(game, build, stage, exe, done, sites, want['main_build_id'])
         if not a.keep:
             progress('finish', 0, 1, 'Removing the build files')
             for d in ('lift', 'obj', 'zig-cache', 'exefs'):
                 shutil.rmtree(os.path.join(build, d), ignore_errors=True)
-        done = dict(stamp, exe_sha256=sha256(exe), seconds=times, finished=time.strftime('%Y-%m-%d %H:%M:%S'))
-        write_json(os.path.join(build, 'done.json'), done)
         progress('finish', 1, 1, 'fefw.exe is ready (%d s)' % (time.time() - t0))
         return 0
     except Cancelled:

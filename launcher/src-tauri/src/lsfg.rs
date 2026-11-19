@@ -276,7 +276,8 @@ mod tests {
     fn copied_manifests_point_at_the_library_by_full_path() {
         let m = r#"{"file_format_version":"1.1.0","layer":{"name":"VK_LAYER_LSFGVK_frame_generation","library_path":"../../../lib/liblsfg-vk-layer.so"}}"#;
         let out: serde_json::Value = serde_json::from_str(&with_library_dir(m, Path::new("/home/p/.local/lib")).unwrap()).unwrap();
-        assert_eq!(out["layer"]["library_path"], "/home/p/.local/lib/liblsfg-vk-layer.so");
+        let expected = Path::new("/home/p/.local/lib").join("liblsfg-vk-layer.so");
+        assert_eq!(out["layer"]["library_path"].as_str(), expected.to_str());
         assert_eq!(out["layer"]["name"], "VK_LAYER_LSFGVK_frame_generation");
         assert!(with_library_dir("{}", Path::new("/l")).is_err());
     }

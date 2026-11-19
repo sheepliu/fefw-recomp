@@ -104,6 +104,7 @@ foreach ($f in 'fefw_rt_api.h', 'fefw_stub.cpp', 'fefw_fma.c', 'fefw_hle.cpp') {
 foreach ($f in 'fefw.rc', 'fefw.manifest', 'fefw.ico') { Put "$root\game-build\fefw\res\$f" "tools\build\sdk\$f" }
 Mirror "$root\game-build\fefw\third_party\zstd" 'tools\build\sdk\zstd'
 foreach ($f in 'fefw_build.py', 'dump_hashes.json') { Put "$root\game-build\release\$f" "tools\build\$f" }
+Put "$root\tools\mods\modpack.py" 'tools\build\modpack.py'
 Put "$root\tools\nso\nso_unpack.py" 'tools\build\nso_unpack.py'
 Put "$root\recomp\LICENSE" 'tools\build\recomp\LICENSE'
 Mirror "$root\recomp\nxrecomp" 'tools\build\recomp\nxrecomp' @('*__pycache__*', '*.pyc')
@@ -115,6 +116,7 @@ Put "$root\LICENSE" 'LICENSE.txt'
 Put "$root\LEGAL.md" 'LEGAL.txt'
 Put "$root\game-build\release\BUNDLED_TOOLS.txt" 'licenses\BUNDLED_TOOLS.txt'
 Put "$root\runtime\THIRD_PARTY_NOTICES.md" 'licenses\THIRD_PARTY_NOTICES.md'
+Put "$root\runtime\third_party\nlohmann\LICENSE.MIT" 'licenses\LICENSE.nlohmann-json.MIT.txt'
 Put "$root\tools\shaders\licenses\LICENSE.Ryubing.MIT" 'licenses\LICENSE.Ryujinx.MIT.txt'
 
 # --- the language tables fefw_rt.dll reads (locales\<lang>.ini next to the DLL). The launcher copies them into the run folder

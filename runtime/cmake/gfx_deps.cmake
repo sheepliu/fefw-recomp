@@ -16,12 +16,14 @@ FetchContent_Declare(sdl3
 FetchContent_Declare(vulkan_headers
     URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.363.0.zip
     DOWNLOAD_DIR "${NXRT_DEPS_DIR}"
+    DOWNLOAD_NAME Vulkan-Headers-vulkan-sdk-1.4.363.0.zip
     URL_HASH SHA256=f4be95220ff0ee0b1c620301ff4fe9ae48592d71f4c30f2d5c571351a153ae81
     SOURCE_SUBDIR none)
 # volk vulkan-sdk-1.4.363.0 (MIT)
 FetchContent_Declare(volk
     URL https://github.com/zeux/volk/archive/refs/tags/vulkan-sdk-1.4.363.0.zip
     DOWNLOAD_DIR "${NXRT_DEPS_DIR}"
+    DOWNLOAD_NAME volk-vulkan-sdk-1.4.363.0.zip
     URL_HASH SHA256=889b90fdcbe9cee7b118339d640c6895b7be5c920d309c44b744692063275b3d
     SOURCE_SUBDIR none)
 # VulkanMemoryAllocator v3.4.0 (MIT)

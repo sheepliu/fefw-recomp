@@ -7,12 +7,14 @@ import { t, initLang, getLang } from './i18n.js';
 import * as play from './pages/play.js';
 import * as settings from './pages/settings.js';
 import * as setup from './pages/setup.js';
+import * as mods from './pages/mods.js';
 import * as about from './pages/about.js';
 import { upd, notify, checkNow, available } from './update.js';
 
 const PAGES = {
   play: { mod: play, key: 'nav.play', icon: 'play' },
   setup: { mod: setup, key: 'nav.setup', icon: 'hammer' },
+  mods: { mod: mods, key: 'nav.mods', icon: 'puzzle' },
   settings: { mod: settings, key: 'nav.settings', icon: 'settings' },
   about: { mod: about, key: 'nav.about', icon: 'info' },
 };

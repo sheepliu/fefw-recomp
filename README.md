@@ -55,6 +55,14 @@ the launcher (Desktop Mode on a Deck) before playing from Steam.
 The launcher's **Settings** page covers resolution, frame rate, upscaling, window mode, sound and controls. Press **F1** in game for
 the overlay. Every option is described in [runtime/docs/CONFIG.md](runtime/docs/CONFIG.md).
 
+### Mods
+
+The launcher's **Mods** page imports `.ips` / `.ips32` patches or folders containing a mod manifest. Patches must match the
+selected game's Build ID. Importing leaves a mod disabled; enable it, then return to **Setup** to rebuild the PC game. Disabling a
+patch also requires a rebuild. The original game dump is not modified. The current interface supports ExeFS `main` instruction
+patches only; supported runtime packages appear in the in-game F1 Mods tab after restarting the game. Runtime packages
+require a matching game runtime implementation; a manifest alone does not execute arbitrary code. See
+[tools/mods/README.md](tools/mods/README.md) for the manifest format, validation limits and checkout build layout.
 ### Game language
 
 **Settings > Language** (or **F1 > Game**) picks the language of the game's text and voices: Japanese, English (US or UK), French,
@@ -205,7 +213,7 @@ DLC is used when you dump it from your own copy, like the game. Put each add-on 
 to `exefs\` and `romfs\`, or next to `base\` and `updates\`). A `.nup` with add-ons is unpacked that way on its own. The **Play**
 page lists the DLC it found.
 
-### Mods
+### RomFS mods
 
 RomFS mods go in the `mods\` folder next to the launcher (**Play** > **Open mods folder**), in the layout emulators use:
 `mods\<mod name>\romfs\...`. Files in a mod replace the game's files at the same path. If two mods change the same file, the mod
@@ -224,6 +232,9 @@ data files as they are loaded. A mod that needs hook sites of its own lists them
 lifts the game with them, so press **Set up** again after adding or removing such a mod. A DLL runs with the same rights as the game:
 only install mods you trust. `[fs] dll_mods = false` in `fefw.ini` turns them off. Writing one:
 [runtime/include/nxrt/mod_api.h](runtime/include/nxrt/mod_api.h).
+
+Existing Mod Host packages are managed through the launcher's **Mods** page and the F1 **Mods** tab. Manifest-based runtime
+packages and native DLL mods use separate interfaces.
 
 ### Updating to a new release
 

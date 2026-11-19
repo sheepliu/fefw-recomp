@@ -914,7 +914,7 @@ int update_hook(::Ctx*, uint64_t, void*) {
     st.overlay_was_visible = overlay_visible;
 
     if (st.window) {
-        platform::set_text_input(st.overlay && st.overlay->keyboard_open());   // typed text for the on-screen keyboard only
+        platform::set_text_input(st.overlay && (st.overlay->visible() || st.overlay->keyboard_open()));
         const bool free_ok = platform::focused() && !platform::minimized() && !overlay_visible && st.capture_state.load() == 0;
         const bool want_cam = st.capture_mouse && free_ok && playing && !hid::jc2_mouse_wants_pointer();
         // The Joy-Con 2 mouse on its surface: the game draws its own cursor and turns its camera by the motion, so the mouse is captured

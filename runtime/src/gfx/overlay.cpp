@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
@@ -498,6 +499,17 @@ std::unique_ptr<Overlay> Overlay::create(const Context& ctx, std::string* error)
         else {
             if (wants_cjk) NXLOG_W(kTag, "no CJK font found ([gfx] ui_font '%s'): using the built-in default", font.c_str());
             io.Fonts->AddFontDefaultVector();   // the scalable default font: stays sharp at every UI scale (update_scale)
+            // Item catalog labels can be CJK even when the interface language is English.
+            if (!wants_cjk) {
+                ImFontConfig cjk;
+                cjk.MergeMode = true;
+                cjk.OversampleH = 1;
+                cjk.OversampleV = 1;
+                if (std::filesystem::exists(L"C:\\Windows\\Fonts\\msyh.ttc"))
+                    io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/msyh.ttc", 16.0f, &cjk, io.Fonts->GetGlyphRangesChineseFull());
+                else if (std::filesystem::exists(L"C:\\Windows\\Fonts\\meiryo.ttc"))
+                    io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/meiryo.ttc", 16.0f, &cjk, io.Fonts->GetGlyphRangesJapanese());
+            }
         }
     }
     ImGui::GetStyle().FontSizeBase = 16.0f;

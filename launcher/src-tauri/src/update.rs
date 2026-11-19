@@ -17,7 +17,7 @@ use std::time::Duration;
 /// The GitHub repository whose releases the launcher follows. FEFW_UPDATE_REPO at build time: a fork's launcher follows the fork.
 pub const REPO: &str = match option_env!("FEFW_UPDATE_REPO") {
     Some(r) => r,
-    None => "aidankinzett/fefw-recomp",
+    None => "sheepliu/fefw-recomp",
 };
 /// FEFW_BUILD_ID at build time: the release tag this launcher was built for (a fork tagging its releases by commit). Any other
 /// latest release then counts as newer, as tags like that have no order.
