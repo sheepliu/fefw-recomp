@@ -48,7 +48,6 @@ struct State {
     std::mutex mu;
     bool item_enabled = false;
     bool friendship_enabled = false;
-    bool friendship_x5 = false;
     std::vector<ModItem> items;
     std::vector<ModOperation> operations;
     Request item, friendship;
@@ -182,7 +181,7 @@ int on_score(Ctx* c, uint64_t, void*) {
     s.friendship.running = true;
     s.friendship.ctx = c;
     s.friendship.score_ptr = c->x[0];
-    c->x[1] = static_cast<uint64_t>(s.friendship_x5 ? s.friendship.number / 5 : s.friendship.number);
+    c->x[1] = static_cast<uint64_t>(s.friendship.number);
     s.friendship.text = "Gift writer reached; awaiting completion...";
     return 0;
 }
@@ -194,7 +193,7 @@ void on_gift_return(Ctx* c, uint64_t, void*) {
     s.friendship.running = false;
     s.friendship.ctx = nullptr;
     s.friendship.text = "Gift operation completed.";
-    NXLOG_I("mods", "friendship-adjust: gift writer returned (requested=%d)", s.friendship.number);
+    NXLOG_I("mods", "friendship-adjust: gift writer returned (base increase=%d)", s.friendship.number);
 }
 
 ModRequestStatus status(Request& r) {
@@ -220,7 +219,6 @@ void mods_install(uint64_t base) {
     }
     s.items.clear();
     s.operations.clear();
-    s.friendship_x5 = false;
     try {
         const fs::path mods = fs::current_path() / "mods";
         if (!fs::exists(mods.parent_path() / "mods-state.json")) return;
@@ -228,7 +226,6 @@ void mods_install(uint64_t base) {
         if (!enabled.is_array()) return;
         for (const auto& id : enabled) {
             if (!id.is_string()) continue;
-            if (id == "friendshipgain5x") s.friendship_x5 = true;
             if (id == "item-add") {
                 ModOperation op = load_operation(mods, "item-add", "inventory.add");
                 s.items = read_items(mods / "item-add" / "items.json");
@@ -249,8 +246,8 @@ void mods_install(uint64_t base) {
             s.friendship_hook = hook_add_entry(base + kScoreWriter, &on_score);
             s.gift_return_hook = hook_add_inline(base + kGiftReturn, &on_gift_return);
         }
-        NXLOG_I("mods", "runtime packages: item-add=%d (%zu items), friendship-adjust=%d, friendshipgain5x=%d",
-                s.item_enabled, s.items.size(), s.friendship_enabled, s.friendship_x5);
+        NXLOG_I("mods", "runtime packages: item-add=%d (%zu items), friendship-adjust=%d",
+                s.item_enabled, s.items.size(), s.friendship_enabled);
     } catch (const std::exception& e) {
         for (auto* h : {&s.item_hook, &s.friendship_hook, &s.gift_return_hook}) {
             if (*h) hook_remove(*h);
@@ -307,10 +304,6 @@ bool submit_friendship(int amount, std::string& error) {
     std::lock_guard lk(s.mu);
     if (!s.friendship_enabled || amount < 1 || amount > 50000 || s.friendship.waiting || s.friendship.running) {
         error = "Mod unavailable, invalid amount or request already active.";
-        return false;
-    }
-    if (s.friendship_x5 && amount % 5) {
-        error = "With Friendship 5x enabled, the requested amount must be divisible by 5.";
         return false;
     }
     s.friendship.number = amount;

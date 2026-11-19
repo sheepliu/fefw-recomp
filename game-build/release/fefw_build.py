@@ -215,30 +215,55 @@ def selected_patches(game, info):
     return sorted(patches, key=lambda p: p[0].lower())
 
 
-# These exact, previously tested Mod Host patches branch out at a function entry.
 # The lifted entry hook runs before the patched first instruction.
-MODHOST_ENTRY_PATCHES = {
-    ('itemgain/manifest.json', 0x8a25c0, bytes.fromhex('020dff17')),
-    ('friendshipgain5x/manifest.json', 0x8ec500, bytes.fromhex('3aabe117')),
-}
+MODHOST_BUILD_ID = 'DB93B0125F4850601D61C3EDDE012F8EB2ECFE77'
+FRIENDSHIP_ENTRY = 0x8ec500
+FRIENDSHIP_CAVE = 0x1571e8
+FRIENDSHIP_BRANCH = bytes.fromhex('3aabe117')
 
 
 def compatible_manifest_entries(game, info):
-    """Return exceptions only for the tested package hashes on the supported game build."""
-    if not bid_matches('DB93B0125F4850601D61C3EDDE012F8EB2ECFE77', info['game_build_id']):
+    """Retain the exact-file exception for the tested inventory package."""
+    if not bid_matches(MODHOST_BUILD_ID, info['game_build_id']):
         return set()
     mp = modpack()
-    mods_dir = Path(game) / 'mods'
-    known = {
-        'itemgain': '464a060a7b05e842fb91e4498341fee61291aadd33d18a433a0dd2936b3b7edb',
-        'friendshipgain5x': '03cda886eadc835df9eea4ad2fa117e53c15b7a7bf6fb23f89eeade3cb55ee08',
-    }
-    packages = mp.installed(mods_dir, info)
-    return {record for record in MODHOST_ENTRY_PATCHES
-            if record[0].split('/')[0] in packages
-            and packages[record[0].split('/')[0]][0]['type'] in mp.PATCH_TYPES
-            and any(entry.get('sha256') == known[record[0].split('/')[0]]
-                    for entry in mp.patch_entries(packages[record[0].split('/')[0]][0]))}
+    itemgain = mp.installed(Path(game) / 'mods', info).get('itemgain')
+    if itemgain and itemgain[0]['type'] in mp.PATCH_TYPES and any(
+            entry.get('sha256') == '464a060a7b05e842fb91e4498341fee61291aadd33d18a433a0dd2936b3b7edb'
+            for entry in mp.patch_entries(itemgain[0])):
+        return {('itemgain/manifest.json', 0x8a25c0, bytes.fromhex('020dff17'))}
+    return set()
+
+
+def friendship_entry_exception(build_id, patches):
+    """Allow the score writer detour only when both of its writes are verified."""
+    if not bid_matches(MODHOST_BUILD_ID, build_id):
+        return set()
+    for index, (_, where, writes) in enumerate(patches):
+        # Both known layouts consist of exactly the entry branch and its trampoline.
+        if len(writes) != 2:
+            continue
+        records = dict(writes)
+        if records.get(FRIENDSHIP_ENTRY) != FRIENDSHIP_BRANCH:
+            continue
+        cave = records.get(FRIENDSHIP_CAVE, b'')
+        # Replays PACIBSP, skips multiplication for negative deltas, then returns
+        # to the instruction after the entry hook. The old x5 uses ADD with shift.
+        if cave != bytes.fromhex('7f2303d53f0000714d0000542108010bc3541e14'):
+            # The other layout uses MOVZ W9,#factor and MUL W1,W1,W9.
+            if (len(cave) != 24 or cave[:12] != bytes.fromhex('7f2303d53f0000716d000054')
+                    or cave[16:] != bytes.fromhex('217c091bc2541e14')):
+                continue
+            mov = int.from_bytes(cave[12:16], 'little')
+            if mov & 0xffe0001f != 0x52800009 or not (mov >> 5) & 0xffff:
+                continue
+        spans = [(FRIENDSHIP_ENTRY, 4), (FRIENDSHIP_CAVE, len(cave))]
+        if any(off < start + size and start < off + len(blob)
+               for other, (_, _, records) in enumerate(patches) if other != index
+               for off, blob in records for start, size in spans):
+            continue
+        return {(where, FRIENDSHIP_ENTRY, FRIENDSHIP_BRANCH)}
+    return set()
 
 
 # FEFW_CPU_FORCE_MISSING names (as fefw_rt.dll and the launcher read them) -> Zig's feature names
@@ -615,6 +640,7 @@ def apply_exefs_patches(main_path, patches, mod_sites=(), compatible_entries=())
     if not patches:
         return
     data = bytearray(Path(main_path).read_bytes())
+    compatible_entries = set(compatible_entries) | friendship_entry_exception(data[0x40:0x60].hex(), patches)
     flags = int.from_bytes(data[12:16], 'little')
     if flags & 7:
         raise Fail('exefs/main has LZ4-compressed segments; exefs patches need the plain main Set up writes')

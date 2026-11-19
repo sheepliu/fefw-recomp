@@ -71,6 +71,7 @@ void friendship_page(const ModOperation& op) {
     ImGui::TextUnformatted(op.label.c_str());
     ImGui::SetNextItemWidth(140);
     if (ImGui::InputInt(op.integer_label.c_str(), &amount)) amount = std::clamp(amount, op.minimum, op.maximum);
+    ImGui::TextDisabled("Base increase, before any multiplier.");
     const auto status = friendship_status();
     ImGui::BeginDisabled(status.waiting || status.running);
     if (ImGui::Button("Apply##friendship")) {
