@@ -1,0 +1,288 @@
+# Uses the Windows toolchain and cache layout of upstream linux-release.yml.
+name: Build and publish Windows Mod Host
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 * * * *'
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: modhost-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: metrist38/fefw-recomp
+  FEFW_UPDATE_REPO: ${{ github.repository }}
+
+jobs:
+  release:
+    if: github.repository == 'sheepliu/fefw-recomp' && github.ref_name == 'modhost'
+    runs-on: windows-2022
+    timeout-minutes: 330
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LLVM_VERSION: 23.1.5
+      LLVM_SHA256: b2be33385ddc86e83511417a060de927ae8b09d1f3017cc3cdce5c73cd5029d7
+      NX_JOBS: 4
+      RYUBING_COMMIT: a82350bb774f70fcbd41c9987bf67a3775409963
+    steps:
+      - name: Require a successful manual run before scheduled builds
+        id: ready
+        shell: pwsh
+        run: |
+          $ready = $true
+          if ($env:GITHUB_EVENT_NAME -eq 'schedule') {
+            $path = "repos/$env:GITHUB_REPOSITORY/actions/workflows/modhost-release.yml/runs?event=workflow_dispatch&status=success&branch=modhost&per_page=1"
+            $count = gh api $path --jq '.total_count'
+            if ($LASTEXITCODE -ne 0) { throw 'Could not check the manual validation run' }
+            $ready = [int]$count -gt 0
+          }
+          "ready=$($ready.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/checkout@v4
+        if: steps.ready.outputs.ready == 'true'
+        with:
+          ref: modhost
+          fetch-depth: 0
+
+      - name: Select and merge the latest published upstream tag
+        id: version
+        if: steps.ready.outputs.ready == 'true'
+        shell: pwsh
+        run: |
+          $release = gh api "repos/$env:UPSTREAM_REPO/releases/latest" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Could not find the latest upstream release' }
+          $tag = $release.tag_name
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "Unexpected upstream release tag $tag" }
+          git fetch --no-tags "https://github.com/$env:UPSTREAM_REPO.git" "refs/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw "Could not fetch upstream tag $tag" }
+          $upstreamCommit = git rev-parse 'FETCH_HEAD^{commit}'
+          if ($LASTEXITCODE -ne 0) { throw "Could not resolve commit for $tag" }
+          $baseCommit = git rev-parse HEAD
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git merge --no-ff --no-edit $upstreamCommit
+          if ($LASTEXITCODE -ne 0) { throw "Merge of $tag failed. Resolve the conflict on modhost and rerun." }
+          $version = $tag.Substring(1)
+          $launcherVersion = (Get-Content -Raw launcher/src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          if ($launcherVersion -ne $version) { throw "Launcher version $launcherVersion does not match upstream $tag" }
+          $commit = (git rev-parse HEAD).Trim()
+          $short = $commit.Substring(0, 12)
+          $releaseTag = "modhost-$tag-$short"
+          $probe = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$releaseTag" 2>&1
+          $exists = $LASTEXITCODE -eq 0
+          if (-not $exists -and ($probe -join ' ') -notmatch '\bHTTP 404\b') {
+            throw "Could not check release $releaseTag. $probe"
+          }
+          "exists=$($exists.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "BUILD_BASE=$baseCommit" >> $env:GITHUB_ENV
+          "SOURCE_COMMIT=$commit" >> $env:GITHUB_ENV
+          "UPSTREAM_COMMIT=$upstreamCommit" >> $env:GITHUB_ENV
+          "UPSTREAM_TAG=$tag" >> $env:GITHUB_ENV
+          "FEFW_BUILD_ID=$releaseTag" >> $env:GITHUB_ENV
+          "PACKAGE_VERSION=$version-modhost.$short" >> $env:GITHUB_ENV
+          Write-Host "Upstream $tag ($upstreamCommit), Mod Host $commit, release $releaseTag"
+
+      - uses: actions/setup-node@v4
+        if: steps.version.outputs.exists == 'false'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: launcher/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.version.outputs.exists == 'false'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.version.outputs.exists == 'false'
+        with:
+          workspaces: launcher/src-tauri
+      - uses: actions/setup-dotnet@v4
+        if: steps.version.outputs.exists == 'false'
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-python@v5
+        if: steps.version.outputs.exists == 'false'
+        with:
+          python-version: '3.13'
+
+      - name: LLVM cache
+        if: steps.version.outputs.exists == 'false'
+        id: llvm
+        uses: actions/cache@v4
+        with:
+          path: work/toolchain/llvm
+          key: llvm-${{ env.LLVM_VERSION }}-x86_64-pc-windows-msvc
+
+      - name: LLVM ${{ env.LLVM_VERSION }} (clang-cl)
+        if: steps.version.outputs.exists == 'false' && steps.llvm.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p work/toolchain/llvm
+          cd work/toolchain
+          curl -fsSL -o llvm.tar.zst "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/clang%2Bllvm-$LLVM_VERSION-x86_64-pc-windows-msvc.tar.zst"
+          echo "$LLVM_SHA256  llvm.tar.zst" | sha256sum -c --quiet
+          # the programs and clang's own headers; the static libraries (most of the archive) are not needed
+          zstd -dc --long=31 llvm.tar.zst | tar -xf - -C llvm --strip-components=1 --wildcards '*/bin/*' '*/lib/clang/*'
+          rm llvm.tar.zst
+
+      - name: Toolchain paths
+        if: steps.version.outputs.exists == 'false'
+        run: |
+          $bin = (Resolve-Path work\toolchain\llvm\bin).Path
+          & "$bin\clang-cl.exe" --version
+          "NX_LLVM_BIN=$bin" >> $env:GITHUB_ENV
+
+      # Each part of the package is cached under a key made of the sources it is built from, so a change that touches only the
+      # launcher (or only the runtime) rebuilds only that part and reuses the rest.
+      #
+      # the runtime: the files make-release.ps1 takes from the build, built from runtime/, game-build/fefw, recomp/include and the
+      # texture transcoder (its third-party sources are fetched by a script that is part of tools/textures, so they are covered)
+      - name: Cache key inputs
+        if: steps.version.outputs.exists == 'false'
+        id: ver
+        run: |
+          # what a cached build also depends on besides the sources: the runner's compilers and SDKs, the .NET SDK, the pinned downloads
+          "image=$env:ImageVersion" >> $env:GITHUB_OUTPUT
+          "dotnet=$(dotnet --version)" >> $env:GITHUB_OUTPUT
+          $mk = Get-Content -Raw game-build\scripts\make-release.ps1
+          $zig = [regex]::Match($mk, '\$ZigVersion = "([^"]+)"').Groups[1].Value
+          $py = [regex]::Match($mk, '\$PythonVersion = "([^"]+)"').Groups[1].Value
+          if (-not $zig -or -not $py) { throw 'cannot read the Zig and Python versions from make-release.ps1' }
+          "downloads=zig$zig-py$py" >> $env:GITHUB_OUTPUT
+
+      - name: Runtime cache
+        if: steps.version.outputs.exists == 'false'
+        id: rt
+        uses: actions/cache@v4
+        with:
+          path: |
+            game-build/fefw/build/rtdll/fefw_rt.dll
+            game-build/fefw/build/rtdll/fefw_rt.pdb
+            game-build/fefw/build/rtdll/fefw_rt.lib
+            game-build/fefw/build/rtdll/fonts
+            game-build/fefw/build/rtdll/astcdec-*-shared.dll
+          key: rt-nasm-${{ steps.ver.outputs.image }}-${{ env.LLVM_VERSION }}-${{ hashFiles('runtime/**', 'game-build/fefw/**', 'recomp/include/**', 'tools/textures/**', 'game-build/scripts/build_fefw.ps1') }}
+
+      - name: Texture transcoder sources
+        if: steps.version.outputs.exists == 'false' && steps.rt.outputs.cache-hit != 'true'
+        run: pwsh -File tools\textures\scripts\fetch_third_party.ps1
+
+      # sccache keeps the compiled objects between runs, for the runtime changes that do miss the cache above
+      - name: sccache
+        if: steps.version.outputs.exists == 'false' && steps.rt.outputs.cache-hit != 'true'
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      # dav1d (the AV1 movie decoder) needs NASM for its x86-64 assembly; without it the movies decode several times slower
+      - name: NASM (dav1d assembly)
+        if: steps.version.outputs.exists == 'false' && steps.rt.outputs.cache-hit != 'true'
+        run: |
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'choco install nasm failed' }
+            $dir = 'C:\Program Files\NASM'
+            if (-not (Test-Path "$dir\nasm.exe")) { throw "nasm.exe not found in $dir" }
+            $dir >> $env:GITHUB_PATH
+            $env:PATH = "$dir;$env:PATH"
+          }
+          nasm -v
+
+      - name: Runtime (fefw_rt.dll)
+        if: steps.version.outputs.exists == 'false' && steps.rt.outputs.cache-hit != 'true'
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+        # NXRT_DAV1D_ASM=ON makes the configure fail when NASM is missing, instead of building the slow C-only decoder
+        run: pwsh -File game-build\scripts\build_fefw.ps1 -Target fefw_rt -BuildDir build\rtdll -CMakeArgs "-DFEFW_RT_DLL=ON -DNXRT_DAV1D_ASM=ON"
+
+      - name: Check the runtime files
+        if: steps.version.outputs.exists == 'false'
+        run: |
+          foreach ($f in 'fefw_rt.dll', 'fefw_rt.pdb', 'fefw_rt.lib', 'fonts\DejaVuSans.ttf') {
+            if (-not (Test-Path "game-build\fefw\build\rtdll\$f")) { throw "the runtime build is missing $f" }
+          }
+
+      # the shader translator (dotnet publish of tools/shaders/harness over the pinned Ryujinx sources)
+      - name: Shader translator cache
+        if: steps.version.outputs.exists == 'false'
+        id: harness
+        uses: actions/cache@v4
+        with:
+          path: work/release/harness
+          key: harness-${{ steps.ver.outputs.dotnet }}-${{ env.RYUBING_COMMIT }}-${{ hashFiles('tools/shaders/harness/**', 'tools/shaders/scripts/**') }}
+
+      - name: Shader translator sources (Ryujinx, pinned)
+        if: steps.version.outputs.exists == 'false' && steps.harness.outputs.cache-hit != 'true'
+        run: |
+          git clone -q --filter=blob:none --no-checkout https://git.ryujinx.app/ryubing/ryujinx.git work\refs\ryubing
+          git -C work\refs\ryubing checkout -q $env:RYUBING_COMMIT
+          if ($LASTEXITCODE) { throw 'cannot check out the Ryujinx revision' }
+          pwsh -File tools\shaders\scripts\setup_ryujinx.ps1 -Ryubing work\refs\ryubing
+
+      # Zig, the Python embeddable package and the wheels make-release.ps1 downloads (it only fetches what is missing)
+      - name: Downloads cache
+        if: steps.version.outputs.exists == 'false'
+        uses: actions/cache@v4
+        with:
+          path: work/release/cache
+          key: release-downloads-${{ steps.ver.outputs.downloads }}
+
+      - name: Validate Mod Host
+        if: steps.version.outputs.exists == 'false'
+        shell: pwsh
+        run: |
+          python -X utf8 -m unittest discover -s tools/mods -p 'test_*.py'
+          if ($LASTEXITCODE -ne 0) { throw 'Mod Host tests failed' }
+
+      - name: Build Windows package
+        if: steps.version.outputs.exists == 'false'
+        shell: pwsh
+        run: |
+          $argsForPackage = @('-Version', $env:PACKAGE_VERSION)
+          if ($env:REUSE_HARNESS -eq 'true') { $argsForPackage += '-ReuseHarness' }
+          pwsh -File game-build/scripts/make-release.ps1 @argsForPackage
+          if ($LASTEXITCODE -ne 0) { throw 'Packaging failed' }
+        env:
+          REUSE_HARNESS: ${{ steps.harness.outputs.cache-hit }}
+
+      - name: Check release contents and write checksum
+        if: steps.version.outputs.exists == 'false'
+        shell: pwsh
+        run: |
+          $zip = "work/release/fefw-recomp-$env:PACKAGE_VERSION-win64.zip"
+          Add-Type -AssemblyName System.IO.Compression
+          $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip).Path)
+          try {
+            $entries = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+            foreach ($file in 'fefw-launcher.exe', 'fefw_rt.dll', 'tools/build/fefw_build.py', 'tools/build/modpack.py') {
+              if (-not @($entries | Where-Object { $_.EndsWith("/$file") }).Count) { throw "Missing $file" }
+            }
+            $forbidden = @($entries | Where-Object { $_ -match '(?i)(^|/)(mods|mod-packages|romfs|exefs|saves?|shader_cache)(/|$)|\.(ips(32)?|pchtxt)$|/fefw\.exe$' })
+            if ($forbidden.Count) { throw "Unexpected game data or mod package: $($forbidden[0])" }
+          } finally { $archive.Dispose() }
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path -Leaf $zip)" | Set-Content "$zip.sha256" -Encoding ascii
+
+      - name: Push validated merge and publish release
+        if: steps.version.outputs.exists == 'false'
+        shell: pwsh
+        run: |
+          if ($env:SOURCE_COMMIT -ne $env:BUILD_BASE) {
+            git push origin HEAD:refs/heads/modhost
+            if ($LASTEXITCODE -ne 0) { throw 'Could not push the validated upstream merge' }
+          }
+          $short = $env:SOURCE_COMMIT.Substring(0, 12)
+          $zip = "work/release/fefw-recomp-$env:PACKAGE_VERSION-win64.zip"
+          $notes = @"
+          ## Windows Mod Host
+
+          - Upstream release [$env:UPSTREAM_TAG](https://github.com/$env:UPSTREAM_REPO/releases/tag/$env:UPSTREAM_TAG) ($env:UPSTREAM_COMMIT).
+          - Mod Host source commit $env:SOURCE_COMMIT.
+          - The Mods page imports IPS, IPS32, pchtxt and ExeFS folders. Setup uses the upstream patch writer, and the original mods-folder entry is available for loose mods.
+          - The F1 menu supports compatible item-addition and friendship mod packages. Install those packages separately.
+          - Extract the ZIP, run fefw-launcher.exe and select your own game dump before running Setup. The ZIP contains the launcher, runtime and build tools. The accompanying SHA-256 verifies the download.
+          "@
+          $notes | Set-Content work/release/notes.md -Encoding utf8
+          gh release create $env:FEFW_BUILD_ID $zip "$zip.sha256" --target $env:SOURCE_COMMIT --title "FEFW Mod Host $env:UPSTREAM_TAG ($short)" --notes-file work/release/notes.md --prerelease
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release publishing failed' }

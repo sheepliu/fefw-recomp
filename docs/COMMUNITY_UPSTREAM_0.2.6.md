@@ -38,8 +38,7 @@ fork's tested original-upstream 0.2.0 integration.
   staged main bytes as the previous patch system.
 - No game executable was recompiled or replaced. In-game testing remains
   required after the player runs Setup.
-- Remote push, release publication and workflow re-enablement are deferred
-  until the local test passes.
+- The local gameplay test passed before the release workflow was migrated.
 
 ## Local test
 
@@ -76,3 +75,18 @@ RomFS mods. This checkout's game output is separate from the older checkout.
 - Regression tests cover byte writes to rodata/data, refreshed hashes,
   pchtxt blocks/offset shift, legacy packages, skipped module reporting,
   upstream overlap order, and enable/disable without duplicate scanning.
+
+## Release workflow
+
+- `origin` is `sheepliu/fefw-recomp` and `upstream` is
+  `metrist38/fefw-recomp`. The GitHub fork relationship is independent of
+  these remotes.
+- `modhost` is the release and default branch. `master` retains the previous
+  history. The old `launcher-sync.yml` workflow remains disabled.
+- `modhost-release.yml` builds the Windows ZIP from the latest published
+  upstream version tag. It publishes a `modhost-v<version>-<commit>`
+  prerelease with release notes and a SHA-256 checksum. Existing releases
+  with the same tag skip the build.
+- The hourly schedule checks for a successful manual run before it starts
+  building. A merge conflict stops the run before it pushes a merge or
+  publishes anything.
