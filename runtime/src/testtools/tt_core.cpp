@@ -97,6 +97,7 @@ struct State {
     std::atomic<::Ctx*> svc_ctx{nullptr};
     std::atomic<uint64_t> svc_count{0};
     std::thread wall_thread;
+    bool own_watchdog = false;   // init started the freeze watchdog (freeze_exit): shutdown stops it
     std::atomic<bool> stop_wall{false};
 };
 
@@ -444,11 +445,18 @@ bool init() {
             WatchdogOptions wo;
             wo.on_fire = on_freeze;
             watchdog_start(wo);
+            s.own_watchdog = true;
         }
     }
     diag_set_frame_listener(tick_listener);
     if (s.src == Source::Svc) detail::svc_every.store(s.svc_n);
-    if (s.src == Source::Hook) install_game_hooks();
+    // A game without a frame hook of its own (Fortune's Weave) counts frames at the runtime's present tick instead: with the hook
+    // source and no hook, no frame boundary would ever come and a script would never start.
+    if (s.src == Source::Hook && !install_game_hooks()) {
+        s.src = Source::Tick;
+        NXLOG_I("tt", "frame source: the game (%s) has no frame hook, so each presented frame is a frame boundary ([test] frame_source = tick)",
+                game::info().id);
+    }
     if (s.wall_timeout_s > 0) s.wall_thread = std::thread(wall_loop, &s, s.wall_timeout_s);
     return true;
 }
@@ -459,6 +467,12 @@ void shutdown() {
     if (!s.on) return;
     s.stop_wall = true;
     if (s.wall_thread.joinable()) s.wall_thread.join();
+    // The freeze watchdog this run started: left running, its on_freeze would end a later run in the same process, and a later
+    // watchdog_start (another run, the watchdog tests) would be ignored.
+    if (s.own_watchdog) {
+        watchdog_stop();
+        s.own_watchdog = false;
+    }
     detail::svc_every.store(0);
     release_held_keys(s);
     if (!s.finished) {
@@ -496,6 +510,7 @@ void reset_for_tests() {
     if (s.wall_thread.joinable()) s.wall_thread.join();
     s.stop_wall = false;
     s.frame_tid.store(0, std::memory_order_relaxed);   // a recycled thread id must not move the next run's clock
+    if (s.own_watchdog) watchdog_stop();                // a run reset without shutdown: its freeze watchdog goes with it
     if (s.trace) { std::fclose(s.trace); s.trace = nullptr; }
     detail::svc_every.store(0);
     ExitFn keep = s.exit_fn;

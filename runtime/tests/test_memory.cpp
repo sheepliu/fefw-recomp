@@ -369,6 +369,15 @@ NXTEST(heap_private_memory_without_section) {
     mem::shutdown();
 }
 
+NXTEST(wine_section_supported_flag_round_trips) {
+    const bool orig = mem::wine_section_supported();
+    mem::set_wine_section_supported(true);
+    CHECK(mem::wine_section_supported());
+    mem::set_wine_section_supported(false);
+    CHECK(!mem::wine_section_supported());
+    mem::set_wine_section_supported(orig);
+}
+
 NXTEST(heap_alias_rejects_misaligned_arguments) {
     mem::shutdown();
     CHECK(mem::init());

@@ -33,9 +33,24 @@ macro_rules! amd_v24 {
 }
 
 const FSR: [File; 3] = [
-    File { name: "amd_fidelityfx_upscaler_vk.dll", sha256: "4a7e895af6e0b615d40a84d59eb8c2b1054ad91cdd0c739567940270d51bdab7", size: 36_135_696, url: amd_v24!("amd_fidelityfx_upscaler_vk.dll") },
-    File { name: "amd_fidelityfx_loader_vk.dll", sha256: "38a56a01fb3565c0757d9f5c1e4e69de4b65e5f2e5769b323b200dc1f142bab9", size: 39_184, url: amd_v24!("amd_fidelityfx_loader_vk.dll") },
-    File { name: "amd_fidelityfx_vk.dll", sha256: "a1624cc4238fef046f30c4d80ce3f47be63fc5f5373f49e3ee9edb9960f54c78", size: 9_332_432, url: "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v1.1.4/PrebuiltSignedDLL/amd_fidelityfx_vk.dll" },
+    File {
+        name: "amd_fidelityfx_upscaler_vk.dll",
+        sha256: "4a7e895af6e0b615d40a84d59eb8c2b1054ad91cdd0c739567940270d51bdab7",
+        size: 36_135_696,
+        url: amd_v24!("amd_fidelityfx_upscaler_vk.dll"),
+    },
+    File {
+        name: "amd_fidelityfx_loader_vk.dll",
+        sha256: "38a56a01fb3565c0757d9f5c1e4e69de4b65e5f2e5769b323b200dc1f142bab9",
+        size: 39_184,
+        url: amd_v24!("amd_fidelityfx_loader_vk.dll"),
+    },
+    File {
+        name: "amd_fidelityfx_vk.dll",
+        sha256: "a1624cc4238fef046f30c4d80ce3f47be63fc5f5373f49e3ee9edb9960f54c78",
+        size: 9_332_432,
+        url: "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v1.1.4/PrebuiltSignedDLL/amd_fidelityfx_vk.dll",
+    },
 ];
 
 const XESS: [File; 1] = [File {
@@ -125,7 +140,11 @@ pub fn run(shared: &Shared, base: &Path, kind: &str, custom: &str) -> Result<Str
         base.join("upscalers").join(sub)
     } else {
         let p = Path::new(custom);
-        if p.is_file() { p.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| p.to_path_buf()) } else { p.to_path_buf() }
+        if p.is_file() {
+            p.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| p.to_path_buf())
+        } else {
+            p.to_path_buf()
+        }
     };
     shared.set(|s| s.folder = dest.display().to_string());
     fs::create_dir_all(&dest).map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
@@ -167,7 +186,10 @@ pub fn run(shared: &Shared, base: &Path, kind: &str, custom: &str) -> Result<Str
         };
         if got != f.sha256 {
             let _ = fs::remove_file(&part);
-            return Err(format!("{} does not match the expected file (SHA-256 {got}). It was not installed. Try again, and report it if it keeps happening.", f.name));
+            return Err(format!(
+                "{} does not match the expected file (SHA-256 {got}). It was not installed. Try again, and report it if it keeps happening.",
+                f.name
+            ));
         }
         let target = dest.join(f.name);
         let _ = fs::remove_file(&target);
@@ -190,7 +212,15 @@ fn get(shared: &Shared, url: &str, range: Option<(u64, u64)>, out: &Path, label:
         c.arg("--range").arg(format!("{a}-{b}")).arg("--max-filesize").arg((b - a + 1).to_string());
     }
     c.args(["--write-out", "%{http_code}"]);
-    let mut child = c.arg("--output").arg(out).arg(url).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("cannot run curl: {e}"))?;
+    let mut child = c
+        .arg("--output")
+        .arg(out)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run curl: {e}"))?;
     let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
     let status = loop {
         if let Some(s) = child.try_wait().map_err(|e| e.to_string())? {
@@ -206,7 +236,8 @@ fn get(shared: &Shared, url: &str, range: Option<(u64, u64)>, out: &Path, label:
         shared.set(|s| {
             s.done = got;
             s.total = expect;
-            s.message = if expect == 0 { format!("Downloading {label}") } else { format!("Downloading {label}: {:.0} of {:.0} MiB", mb(got), mb(expect)) };
+            s.message =
+                if expect == 0 { format!("Downloading {label}") } else { format!("Downloading {label}: {:.0} of {:.0} MiB", mb(got), mb(expect)) };
         });
         std::thread::sleep(Duration::from_millis(250));
     };
@@ -282,7 +313,7 @@ impl Zip {
             }
             (size, off) = (le64(&z, 40)?, le64(&z, 48)?);
         }
-        if size == 0 || off.checked_add(size).map_or(true, |e| e > SL_ZIP_SIZE) {
+        if size == 0 || off.checked_add(size).is_none_or(|e| e > SL_ZIP_SIZE) {
             return Err(LAYOUT.into());
         }
         let cd = read(off, off + size - 1)?;
@@ -333,7 +364,7 @@ impl Zip {
     fn extract(&self, shared: &Shared, f: &File, out: &Path, label: &str) -> Result<(), String> {
         let want = format!("{SL_DIR}{}", f.name);
         let e = self.entries.iter().find(|e| e.name == want).ok_or_else(|| format!("{} is not in NVIDIA's release any more.", f.name))?;
-        if e.compressed == 0 || e.local.checked_add(e.compressed).map_or(true, |x| x > SL_ZIP_SIZE) {
+        if e.compressed == 0 || e.local.checked_add(e.compressed).is_none_or(|x| x > SL_ZIP_SIZE) {
             return Err(LAYOUT.into());
         }
         let scratch = out.with_extension("zpart");
@@ -351,7 +382,8 @@ impl Zip {
                     std::io::copy(&mut std::io::BufReader::new(src), &mut dst).map_err(|e| e.to_string())?;
                 }
                 8 => {
-                    std::io::copy(&mut flate2::read::DeflateDecoder::new(std::io::BufReader::new(src)), &mut dst).map_err(|e| format!("cannot unpack {}: {e}", f.name))?;
+                    std::io::copy(&mut flate2::read::DeflateDecoder::new(std::io::BufReader::new(src)), &mut dst)
+                        .map_err(|e| format!("cannot unpack {}: {e}", f.name))?;
                 }
                 m => return Err(format!("{} uses compression method {m}, which is not supported.", f.name)),
             }

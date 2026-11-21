@@ -24,6 +24,7 @@
 #include <nxrt/config.h>
 
 #include "astc2bc7.h"
+#include "astc_test_util.h"
 #include "nvn_astc_gpu.h"
 #include "nvn_core.h"
 #include "nvn_enums.h"
@@ -320,6 +321,7 @@ uint64_t gpu_transcodes() {
 
 // ---- 1: an RGBA8 image holds the CPU decoder's bytes --------------------------------------------------------------------------
 NXTEST(decode_to_rgba8_is_bit_exact) {
+    if (!astctest::transcoder_or_skip()) return;
     Rig r;
     if (!bring_up(r, false)) {
         CHECK(false);
@@ -361,6 +363,7 @@ NXTEST(decode_to_rgba8_is_bit_exact) {
 
 // ---- 2: a BC7 image is close to the CPU decode, layers and levels in place -----------------------------------------------------
 NXTEST(encode_to_bc7_layers_and_levels) {
+    if (!astctest::transcoder_or_skip()) return;
     Rig r;
     if (!bring_up(r, false)) {
         CHECK(false);
@@ -418,6 +421,7 @@ NXTEST(encode_to_bc7_layers_and_levels) {
 
 // ---- 3: over the budget: a stand-in first, then bands over the following presents ---------------------------------------------
 NXTEST(queued_texture_is_transcoded_in_bands) {
+    if (!astctest::transcoder_or_skip()) return;
     Rig r;
     // half a millisecond a present for a GPU the scheduler takes to be 400 times slower: a 512x512 texture is far over it
     if (!bring_up(r, false, "0.5", "400")) {
@@ -466,6 +470,7 @@ NXTEST(queued_texture_is_transcoded_in_bands) {
 
 // ---- 4: the cache: the blocks are stored, and a texture with the same storage is served from the entry -------------------------
 NXTEST(encoded_blocks_reach_the_cache) {
+    if (!astctest::transcoder_or_skip()) return;
     Rig r;
     if (!bring_up(r, true)) {
         CHECK(false);

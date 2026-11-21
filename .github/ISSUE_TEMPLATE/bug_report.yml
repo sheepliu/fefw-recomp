@@ -28,5 +28,7 @@ body:
   - type: textarea
     id: log
     attributes:
-      label: fefw.log or work/setup.log
+      label: fefw.log or work/setup.log or other relevant log
       description: Drag in the log from the run (or the setup) where it happened.
+    validations:
+      required: true

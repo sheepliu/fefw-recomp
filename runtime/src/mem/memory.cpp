@@ -83,6 +83,7 @@ uint64_t g_committed = 0;                 // bytes of pages whose bit is set
 // write tracker's arm (heap_rw_pages) answer heap ranges from this table.
 std::vector<uint8_t> g_heap_cls;
 std::atomic<uint64_t> g_heap_epoch{0};    // bumped by every change of the table, inside the change's OsWriteScope
+std::atomic<bool> g_wine_section_ok{false};  // set by the Vulkan back end after probing section-alias host imports under Wine
 struct Alias {
     uint64_t size;
     uint64_t offset;                      // section offset of the first byte of the view
@@ -437,6 +438,9 @@ bool is_mapped(uint64_t addr, uint64_t size) {
 // ---------------------------------------------------------------------------------------------------------------------
 // heap section
 
+void set_wine_section_supported(bool ok) { g_wine_section_ok.store(ok, std::memory_order_release); }
+bool wine_section_supported() { return g_wine_section_ok.load(std::memory_order_acquire); }
+
 bool heap_create(uint64_t reserve_bytes) {
     if (!initialised() && !init()) return false;
     std::lock_guard lk(g_heap_mu);
@@ -453,11 +457,13 @@ bool heap_create(uint64_t reserve_bytes) {
                 static_cast<unsigned long long>(size), static_cast<unsigned long long>(kHeapMax));
         return false;
     }
-    // [memory] heap_section: auto (default) = a section unless running under Wine (memory.h), 1 = always, 0 = never
+    // [memory] heap_section: auto (default) = a section on Windows, or under Wine when the GPU driver passed the section-import
+    // probe (memory.h); 1 = always, 0 = never
     const std::string mode = nxrt::config_get_str("memory", "heap_section", "auto");
     const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     const bool wine = ntdll && GetProcAddress(ntdll, "wine_get_version");
-    if (mode == "0" || (mode != "1" && wine)) {
+    const bool wine_ok = wine && g_wine_section_ok.load(std::memory_order_acquire);
+    if (mode == "0" || (mode != "1" && wine && !wine_ok)) {
         void* p = VirtualAlloc(reinterpret_cast<void*>(kHeapBase), static_cast<SIZE_T>(size), MEM_RESERVE, PAGE_NOACCESS);
         if (reinterpret_cast<uint64_t>(p) != kHeapBase) {
             NXLOG_E(kTag, "heap_create: VirtualAlloc(MEM_RESERVE %llu MiB) at %llx failed, error %lu", static_cast<unsigned long long>(size >> 20),
@@ -470,7 +476,8 @@ bool heap_create(uint64_t reserve_bytes) {
         g_heap_cls.assign(static_cast<size_t>(size / kPage), 0);
         g_committed = 0;
         NXLOG_I(kTag, "heap: private memory of %llu MiB at %llx, no section (%s): no alias views, pools import at their own address",
-                static_cast<unsigned long long>(size >> 20), static_cast<unsigned long long>(kHeapBase), wine ? "Wine" : "[memory] heap_section = 0");
+                static_cast<unsigned long long>(size >> 20), static_cast<unsigned long long>(kHeapBase),
+                mode == "0" ? "[memory] heap_section = 0" : "Wine, GPU cannot import section views");
         return true;
     }
     HANDLE sec = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
@@ -501,8 +508,8 @@ bool heap_create(uint64_t reserve_bytes) {
     g_commit_bits.assign((size / kPage + 63) / 64, 0);
     g_heap_cls.assign(static_cast<size_t>(size / kPage), 0);
     g_committed = 0;
-    NXLOG_I(kTag, "heap: section of %llu MiB, primary view at %llx", static_cast<unsigned long long>(size >> 20),
-            static_cast<unsigned long long>(kHeapBase));
+    NXLOG_I(kTag, "heap: section of %llu MiB, primary view at %llx%s", static_cast<unsigned long long>(size >> 20),
+            static_cast<unsigned long long>(kHeapBase), wine ? (mode == "1" ? " (Wine, forced)" : " (Wine, probed)") : "");
     return true;
 }
 

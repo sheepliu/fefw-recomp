@@ -825,7 +825,7 @@ def write_sites(main_path, mod_sites, build):
         data = f.read()
     text_file, text_off, text_size = (int.from_bytes(data[o:o + 4], 'little') for o in (0x10, 0x14, 0x18))
     word_at = lambda off: int.from_bytes(data[text_file + off - text_off:text_file + off - text_off + 4], 'little')
-    own = open(base).read()
+    own = open(base, encoding='utf-8').read()
     have = set()
     for line in own.splitlines():
         t = line.split('#', 1)[0].split()

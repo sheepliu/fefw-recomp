@@ -24,12 +24,7 @@ const AMD: u32 = 0x1002;
 const INTEL: u32 = 0x8086;
 
 fn from_vendors(ids: &[u32]) -> Gpus {
-    Gpus {
-        known: !ids.is_empty(),
-        nvidia: ids.contains(&NVIDIA),
-        amd: ids.contains(&AMD),
-        intel: ids.contains(&INTEL),
-    }
+    Gpus { known: !ids.is_empty(), nvidia: ids.contains(&NVIDIA), amd: ids.contains(&AMD), intel: ids.contains(&INTEL) }
 }
 
 fn from_env(v: &str) -> Gpus {
@@ -66,10 +61,7 @@ fn probe() -> Vec<u32> {
         let s = std::fs::read_to_string(p).ok()?;
         u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
     };
-    dir.flatten()
-        .filter(|d| hex(d.path().join("class")).is_some_and(|c| c >> 16 == 0x03))
-        .filter_map(|d| hex(d.path().join("vendor")))
-        .collect()
+    dir.flatten().filter(|d| hex(d.path().join("class")).is_some_and(|c| c >> 16 == 0x03)).filter_map(|d| hex(d.path().join("vendor"))).collect()
 }
 
 static GPUS: OnceLock<Gpus> = OnceLock::new();

@@ -9,6 +9,7 @@
 #include "extras/framegen.h"
 #include "nxrt/config.h"
 #include "nxrt/log.h"
+#include "nvn_framegen_select.h"
 
 namespace nxrt::nvn::be::gpu {
 namespace {
@@ -23,14 +24,20 @@ struct Img {
 struct State {
     bool after_eval = false;
     Texture* captured = nullptr;      // this frame's copy is of this texture (before its first blended draw after the evaluation)
+    int cap_tier = fgsel::kReject;    // what made it a candidate (fgsel::Tier)
+    int next_tier = fgsel::kReject;   // what made the candidate fg_hudless_capture is called for
     VkExtent2D cap_size = {};
     Texture* copied_to = nullptr;     // the window texture drawn after the capture (the game's copy of the captured picture into it)
     std::vector<Texture*> written;    // drawn without blending after the evaluation (the scene's passes)
     std::vector<Texture*> window;     // the textures of the window last presented
-    VkFormat window_format = VK_FORMAT_UNDEFINED;
+    fgsel::Fmt window_fmt;            // the formats of the window texture last presented
+    VkExtent2D eval_size = {};        // the picture the evaluator produced (out_img of the upscaler)
+    VkExtent2D shown = {};            // the part of the window texture the last present showed
+    uint32_t known_good = 0;          // texture id of a capture a present accepted (0: none yet)
     Img copy[2], bb[2];
     uint32_t cur = 0;
-    uint64_t frames = 0, evals = 0, used = 0, no_capture = 0, not_shown = 0;
+    uint64_t frames = 0, evals = 0, used = 0, no_capture = 0, not_shown = 0, rejected = 0;
+    uint32_t told_sel = 0, told_rej = 0;
     bool told_first = false, told_miss = false;
 };
 State& st() {
@@ -47,25 +54,35 @@ VkFormat unorm_of(VkFormat f) {
     }
 }
 
+fgsel::Fmt fmt_of(Texture* t) {
+    fgsel::Fmt f;
+    if (!t) return f;
+    f.nvn = t->b.format;
+    f.vk = static_cast<int>(tex_vk_format(t));
+    f.native_vk = t->fmt ? static_cast<int>(t->fmt->vk) : 0;
+    return f;
+}
+
 bool ensure(Img& i, VkExtent2D e, VkFormat fmt, VkImageUsageFlags usage, const char* name) {
     if (i.img.image && i.img.extent.width == e.width && i.img.extent.height == e.height && i.img.format == fmt) return true;
-    if (i.img.image) {
-        gfx::Image old = i.img;
-        defer_destroy([old]() mutable { device().destroy_image(old); });
-    }
-    i = Img();
     gfx::ImageDesc d;
     d.format = fmt;
     d.width = e.width;
     d.height = e.height;
     d.usage = usage;
     d.name = name;
+    gfx::Image next;
     std::string why;
-    if (device().create_image(d, &i.img, &why) != VK_SUCCESS) {
+    if (device().create_image(d, &next, &why) != VK_SUCCESS) {
         NXLOG_E(kTag, "%s %ux%u: not made (%s)", name, e.width, e.height, why.c_str());
-        i = Img();
         return false;
     }
+    if (i.img.image) {
+        gfx::Image old = i.img;
+        defer_destroy([old]() mutable { device().destroy_image(old); });
+    }
+    i = Img();
+    i.img = next;
     return true;
 }
 
@@ -105,35 +122,73 @@ bool fg_hudless_on() {
     return v;
 }
 
-void fg_note_eval() {
-    if (fg_hudless_on()) st().after_eval = true;
+void fg_note_eval(VkExtent2D eval_size) {
+    if (!fg_hudless_on()) return;
+    State& s = st();
+    s.after_eval = true;
+    s.eval_size = eval_size;
 }
 
 bool fg_hudless_candidate(Texture* t, bool blended) {
     State& s = st();
     if (!s.after_eval || !t) return false;
-    if (s.captured) {   // the game's copy of the captured picture into the window texture
-        if (!s.copied_to && t != s.captured && is_window_texture(s, t)) s.copied_to = t;
+    if (s.captured && t != s.captured && is_window_texture(s, t)) {
+        // the game's copy of the captured picture into the window texture, after it was captured: not another candidate, and no draw into
+        // the window after it either (its textels then hold the picture with its UI)
+        if (!s.copied_to) s.copied_to = t;
         return false;
     }
     if (!blended) {
         if (std::find(s.written.begin(), s.written.end(), t) == s.written.end()) s.written.push_back(t);
         return false;
     }
-    // the UI layer blended over the finished scene: a target of the picture's format that the scene's passes wrote (the UI layer itself
-    // is only cleared before its blended draws; the HDR targets of the post effects have another format)
-    if (is_window_texture(s, t)) return true;
-    return s.window_format != VK_FORMAT_UNDEFINED && tex_vk_format(t) == s.window_format &&
-           std::find(s.written.begin(), s.written.end(), t) != s.written.end();
+    const VkExtent3D e = tex_image_extent(t, 0);
+    const fgsel::Fmt fmt = fmt_of(t);
+    fgsel::Scene sc;
+    sc.have_window = s.window_fmt.vk != static_cast<int>(VK_FORMAT_UNDEFINED);
+    sc.window = s.window_fmt;
+    sc.eval_w = s.eval_size.width;
+    sc.eval_h = s.eval_size.height;
+    sc.shown_w = s.shown.width;
+    sc.shown_h = s.shown.height;
+    sc.known_good = s.known_good;
+    sc.copied = s.copied_to != nullptr;
+    fgsel::Look look;
+    look.id = t->id;
+    look.w = e.width;
+    look.h = e.height;
+    look.fmt = fmt;
+    look.window_texture = is_window_texture(s, t);
+    look.blended = blended;
+    look.written = std::find(s.written.begin(), s.written.end(), t) != s.written.end();
+    const fgsel::Choice ch = fgsel::judge(sc, look, s.captured ? s.cap_tier : fgsel::kReject, s.captured ? s.captured->id : 0u);
+    if (!ch.ok) {
+        ++s.rejected;
+        if (s.told_rej < 32) {
+            ++s.told_rej;
+            NXLOG_I(kTag, "HUD-less colour: t%u %ux%u (NVN %s, Vulkan %d) is not the capture: %s", t->id, e.width, e.height,
+                    t->fmt ? t->fmt->name : "?", fmt.vk, ch.why);
+        }
+        return false;
+    }
+    if (!ch.place) return false;
+    if (s.told_sel < 8) {
+        ++s.told_sel;
+        NXLOG_I(kTag, "HUD-less colour: t%u %ux%u (NVN %s, Vulkan %d) is the capture: %s, %s; the evaluated picture is %ux%u", t->id, e.width, e.height,
+                t->fmt ? t->fmt->name : "?", fmt.vk, ch.why, ch.pick, s.eval_size.width, s.eval_size.height);
+    }
+    s.next_tier = ch.tier;
+    return true;
 }
 
 void fg_hudless_capture(Frame& f, Texture* t) {
     State& s = st();
     if (copy_texture(s, f, t)) {
         s.captured = t;
+        s.cap_tier = s.next_tier;
         const VkExtent3D e = tex_image_extent(t, 0);
         s.cap_size = VkExtent2D{e.width, e.height};
-    } else {
+    } else if (!s.captured) {
         s.after_eval = false;
     }
 }
@@ -146,29 +201,39 @@ void fg_hudless_present(Window* w, Texture* presented, Frame& f, VkExtent2D bb, 
         s.window.clear();
         for (const auto& t : w->textures) s.window.push_back(t.get());
     }
-    if (presented && tex_gpu(presented)) s.window_format = tex_vk_format(presented);
+    if (presented && tex_gpu(presented)) s.window_fmt = fmt_of(presented);
     const bool eval = s.after_eval;
     Texture* cap = s.captured;
     Texture* copied = s.copied_to;
     const VkExtent2D cap_size = s.cap_size;
+    if (presented && tex_gpu(presented)) {   // what the next frame's selection compares a candidate's size against
+        const VkExtent3D pe = tex_image_extent(presented, 0);
+        // the region of the window texture this present showed: the window's crop (in image texels) or all of it
+        const bool cropped = crop[2] > 0 && crop[3] > 0;
+        s.shown = VkExtent2D{cropped ? static_cast<uint32_t>(crop[2]) : pe.width, cropped ? static_cast<uint32_t>(crop[3]) : pe.height};
+    }
     s.after_eval = false;
     s.captured = s.copied_to = nullptr;
+    s.cap_tier = fgsel::kReject;
+    s.cap_size = VkExtent2D{};
+    s.eval_size = VkExtent2D{};
     s.written.clear();
     if (again || !eval || !presented || !extras::framegen_running()) return;
     ++s.evals;
     const auto report = [&] {
         if (s.evals % 600 == 0)
-            NXLOG_I(kTag, "HUD-less colour: %llu of the last frames with a scene had it, %llu had no UI composite after the scene, %llu "
-                          "composited one that was not shown", static_cast<unsigned long long>(s.used), static_cast<unsigned long long>(s.no_capture),
-                    static_cast<unsigned long long>(s.not_shown));
-        if (s.evals % 600 == 0) s.used = s.no_capture = s.not_shown = 0;
+            NXLOG_I(kTag, "HUD-less colour: %llu of the frames with a scene had a capture passed to frame generation (the selection accepted it, which "
+                          "does not prove it holds no UI), %llu had no UI composite after the scene, %llu composited one that was not shown, %llu blended "
+                          "draws were rejected at selection",
+                    static_cast<unsigned long long>(s.used), static_cast<unsigned long long>(s.no_capture), static_cast<unsigned long long>(s.not_shown),
+                    static_cast<unsigned long long>(s.rejected));
+        if (s.evals % 600 == 0) s.used = s.no_capture = s.not_shown = s.rejected = 0;
     };
     // the captured picture is the presented one, or was drawn into it whole (the size of the window's crop)
-    const VkExtent3D pe = tex_image_extent(presented, 0);
-    const bool cropped = crop[2] > 0 && crop[3] > 0;
-    const uint32_t shown_w = cropped ? static_cast<uint32_t>(crop[2]) : pe.width, shown_h = cropped ? static_cast<uint32_t>(crop[3]) : pe.height;
+    const uint32_t shown_w = s.shown.width, shown_h = s.shown.height;
     const bool direct = cap && cap == presented;
     const bool via_copy = cap && copied == presented && cap_size.width == shown_w && cap_size.height == shown_h;
+    s.known_good = fgsel::next_known_good(s.known_good, cap ? cap->id : 0u, direct, via_copy);
     if (!direct && !via_copy) {
         ++(cap ? s.not_shown : s.no_capture);
         if (!s.told_miss) {

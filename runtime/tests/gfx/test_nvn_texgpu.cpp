@@ -31,6 +31,7 @@
 #include "nxrt/gfx_tuning.h"
 #include "tegra_tiling.h"
 #include "test_framework.h"
+#include "astc_test_util.h"
 NXTEST_GROUP(gfx_nvn_texgpu)
 
 namespace nxrt::nvn::be::gpu {
@@ -252,6 +253,7 @@ NXTEST(upload_readback_formats) {
 
 // ---- 3: ASTC 5x4 becomes BC7 when the GPU has no ASTC -----------------------------------------------------------------------
 NXTEST(astc_becomes_bc7) {
+    if (!astctest::transcoder_or_skip()) return;
     Rig r;
     if (!bring_up(r)) {
         CHECK(false);
@@ -1146,6 +1148,7 @@ void cache_entry_case(const char* what, VkFormat entry) {
 }  // namespace
 
 NXTEST(astc_with_rgba8_and_bc5_cache_entries) {
+    if (!astctest::transcoder_or_skip()) return;
     cache_entry_case("RGBA8 cache entry: the image is R8G8B8A8_UNORM and reads back as the entry", VK_FORMAT_R8G8B8A8_UNORM);
     cache_entry_case("BC5 cache entry: the image is BC5_UNORM and the upload completes", VK_FORMAT_BC5_UNORM_BLOCK);
 }
@@ -1294,6 +1297,7 @@ NXTEST(texprep_background_upload) {
 // block row from their distinct rows); the image must hold exactly the whole stand-in. Its job's result then replaces it; an upload asked for while
 // the job is not done keeps the stand-in (standin_keep) instead of preparing the texture on the render thread.
 NXTEST(compact_standin_upload_and_replacement) {
+    if (!astctest::transcoder_or_skip()) return;
     // the CPU texture path ([gfx] astc_gpu = off): with the GPU ASTC transcode (upstream 0.2.0, on by default on a discrete GPU) the
     // render thread transcodes on the GPU instead of uploading a stand-in, and its BC7 differs from bc7e's (test_nvn_astc_gpu covers it)
     config_set("gfx", "astc_gpu", "off");

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <string>
 
+#include "extras/ffx_device_proc.h"
 #include "extras/ffx_files.h"
 #include "extras/temporal.h"
 #include "nxrt/extras.h"
@@ -29,6 +30,9 @@ void on_message(uint32_t type, const wchar_t* msg) {
     if (type == FFX_API_MESSAGE_TYPE_ERROR) NXLOG_E(kTag, "%s", buf);
     else NXLOG_W(kTag, "%s", buf);
 }
+
+// The shared KHR-alias resolver (ffx_device_proc.h), with a miss logged under this module's tag.
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL device_proc(VkDevice d, const char* name) { return ffx_device_proc(d, name, kTag); }
 
 FfxApiResource resource(const TemporalImage& t, uint32_t state, uint32_t usage) {
     FfxApiResource r = {};
@@ -126,7 +130,7 @@ private:
         be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
         be.deviceContext.vkDevice = dev_->device();
         be.deviceContext.vkPhysicalDevice = dev_->physical();
-        be.deviceContext.vkDeviceProcAddr = vkGetDeviceProcAddr;
+        be.deviceContext.vkDeviceProcAddr = &device_proc;
         ffxCreateContextDescUpscale cd = {};
         cd.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
         cd.header.pNext = &be.header;
@@ -140,7 +144,7 @@ private:
             old.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK_DEPRECATED;
             old.vkDevice = dev_->device();
             old.vkPhysicalDevice = dev_->physical();
-            old.vkDeviceProcAddr = vkGetDeviceProcAddr;
+            old.vkDeviceProcAddr = &device_proc;
             cd.header.pNext = &old.header;
             ctx_ = nullptr;
             r = create_(&ctx_, &cd.header, nullptr);

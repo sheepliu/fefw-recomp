@@ -734,6 +734,173 @@ void pool_gpu_destroy(PoolGpu* p) {
     delete p;
 }
 
+void probe_wine_section() {
+    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll || !GetProcAddress(ntdll, "wine_get_version")) return;
+    if (mem::heap_exists()) return;
+    if (config_get_str("memory", "heap_section", "auto") != "auto") return;
+
+    mem::set_wine_section_supported(false);
+    gfx::Device& dev = device();
+    const char* gpu_name = dev.properties().deviceName;
+    if (!dev.features().external_memory_host) {
+        NXLOG_I(kTag, "wine section probe skipped on %s: VK_EXT_external_memory_host is not available", gpu_name);
+        return;
+    }
+
+    const uint64_t align = std::max<uint64_t>(dev.limits_ext().min_imported_host_alignment, 4096);
+    const uint64_t probe_size = ((std::max<uint64_t>(mem::kAllocGranularity, align) + mem::kAllocGranularity - 1) /
+                                 mem::kAllocGranularity) * mem::kAllocGranularity;
+
+    HANDLE sec = nullptr;
+    void* primary = nullptr;
+    void* alias1 = nullptr;
+    void* alias2 = nullptr;
+    VkBuffer buf1 = VK_NULL_HANDLE, buf2 = VK_NULL_HANDLE;
+    VkDeviceMemory mem1 = VK_NULL_HANDLE, mem2 = VK_NULL_HANDLE;
+    gfx::Buffer stg;
+    struct Cleanup {
+        gfx::Device& dev;
+        HANDLE& sec;
+        void*& primary;
+        void*& alias1;
+        void*& alias2;
+        VkBuffer& buf1;
+        VkBuffer& buf2;
+        VkDeviceMemory& mem1;
+        VkDeviceMemory& mem2;
+        gfx::Buffer& stg;
+        ~Cleanup() {
+            if (stg.buffer) dev.destroy_buffer(stg);
+            if (buf2) vkDestroyBuffer(dev.device(), buf2, nullptr);
+            if (mem2) vkFreeMemory(dev.device(), mem2, nullptr);
+            if (buf1) vkDestroyBuffer(dev.device(), buf1, nullptr);
+            if (mem1) vkFreeMemory(dev.device(), mem1, nullptr);
+            if (alias2) UnmapViewOfFile(alias2);
+            if (alias1) UnmapViewOfFile(alias1);
+            if (primary) UnmapViewOfFile(primary);
+            if (sec) CloseHandle(sec);
+        }
+    } cleanup{dev, sec, primary, alias1, alias2, buf1, buf2, mem1, mem2, stg};
+
+    auto fail = [&](const char* why) {
+        NXLOG_I(kTag, "wine section probe failed (%s) on %s: keeping private heap (no alias views / pool_mirror)", why, gpu_name);
+    };
+
+    sec = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
+                             static_cast<DWORD>(probe_size >> 32), static_cast<DWORD>(probe_size & 0xFFFFFFFFu), nullptr);
+    if (!sec) { fail("CreateFileMappingW"); return; }
+
+    primary = MapViewOfFile(sec, FILE_MAP_ALL_ACCESS, 0, 0, static_cast<SIZE_T>(probe_size));
+    if (!primary) { fail("MapViewOfFile primary"); return; }
+    if (!VirtualAlloc(primary, static_cast<SIZE_T>(probe_size), MEM_COMMIT, PAGE_READWRITE)) { fail("VirtualAlloc MEM_COMMIT"); return; }
+
+    alias1 = MapViewOfFile(sec, FILE_MAP_ALL_ACCESS, 0, 0, static_cast<SIZE_T>(probe_size));
+    alias2 = MapViewOfFile(sec, FILE_MAP_ALL_ACCESS, 0, 0, static_cast<SIZE_T>(probe_size));
+    if (!alias1 || !alias2) { fail("MapViewOfFile alias"); return; }
+    if ((reinterpret_cast<uint64_t>(alias1) % align) != 0 || (reinterpret_cast<uint64_t>(alias2) % align) != 0) {
+        fail("alias alignment");
+        return;
+    }
+
+    *static_cast<volatile uint32_t*>(primary) = 0x11223344u;
+    if (*static_cast<volatile uint32_t*>(alias1) != 0x11223344u || *static_cast<volatile uint32_t*>(alias2) != 0x11223344u) {
+        fail("CPU alias coherence");
+        return;
+    }
+
+    auto import_alias = [&](void* ptr, VkBuffer& out_buf, VkDeviceMemory& out_mem) -> bool {
+        VkMemoryHostPointerPropertiesEXT hp = {VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+        if (vkGetMemoryHostPointerPropertiesEXT(dev.device(), VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, ptr, &hp) != VK_SUCCESS ||
+            !hp.memoryTypeBits)
+            return false;
+        VkExternalMemoryBufferCreateInfo ebi = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        ebi.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &ebi};
+        bci.size = probe_size;
+        bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
+                    (dev.features().transform_feedback ? static_cast<VkBufferUsageFlags>(VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT) : 0u);
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateBuffer(dev.device(), &bci, nullptr, &out_buf) != VK_SUCCESS) { out_buf = VK_NULL_HANDLE; return false; }
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(dev.device(), out_buf, &req);
+        const uint32_t bits = hp.memoryTypeBits & req.memoryTypeBits;
+        if (!bits || req.size > probe_size) return false;
+        uint32_t ty = 0;
+        while (!(bits & (1u << ty))) ++ty;
+        VkImportMemoryHostPointerInfoEXT imp = {VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+        imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        imp.pHostPointer = ptr;
+        VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp};
+        mai.allocationSize = probe_size;
+        mai.memoryTypeIndex = ty;
+        if (vkAllocateMemory(dev.device(), &mai, nullptr, &out_mem) != VK_SUCCESS) { out_mem = VK_NULL_HANDLE; return false; }
+        return vkBindBufferMemory(dev.device(), out_buf, out_mem, 0) == VK_SUCCESS;
+    };
+
+    if (!import_alias(alias1, buf1, mem1)) { fail("alias host-memory import"); return; }
+    if (!import_alias(alias2, buf2, mem2)) { fail("overlapping alias host-memory import"); return; }
+
+    if (dev.create_buffer(4096, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gfx::MemoryUse::Readback, &stg, "wine section probe") != VK_SUCCESS ||
+        !stg.mapped) {
+        fail("readback staging buffer");
+        return;
+    }
+
+    auto copy_and_fill = [&](uint32_t fill_val, uint32_t* read_before_fill) -> bool {
+        const bool ok = dev.submit_once([&](VkCommandBuffer cb) {
+            const VkBufferCopy cp = {0, 0, 4096};
+            vkCmdCopyBuffer(cb, buf1, stg.buffer, 1, &cp);
+            VkMemoryBarrier2 mid = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            mid.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            mid.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+            mid.dstStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+            mid.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            VkDependencyInfo di1 = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            di1.memoryBarrierCount = 1;
+            di1.pMemoryBarriers = &mid;
+            vkCmdPipelineBarrier2(cb, &di1);
+            vkCmdFillBuffer(cb, buf1, 0, 4096, fill_val);
+            VkMemoryBarrier2 done = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            done.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT;
+            done.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            done.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+            done.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+            VkDependencyInfo di2 = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            di2.memoryBarrierCount = 1;
+            di2.pMemoryBarriers = &done;
+            vkCmdPipelineBarrier2(cb, &di2);
+        });
+        if (!ok) return false;
+        dev.invalidate_buffer(stg);
+        *read_before_fill = *static_cast<const uint32_t*>(stg.mapped);
+        return true;
+    };
+
+    // Simulate mem::ww::arm (PAGE_READONLY) and mem::ww::guard (PAGE_NOACCESS) on primary while the GPU reads and writes alias1.
+    *static_cast<volatile uint32_t*>(primary) = 0xCAFEBABEu;
+    DWORD oldp = 0;
+    uint32_t rb = 0;
+    if (!VirtualProtect(primary, 4096, PAGE_READONLY, &oldp)) { fail("VirtualProtect PAGE_READONLY"); return; }
+    if (!copy_and_fill(0xA5A55A5Au, &rb) || rb != 0xCAFEBABEu || *static_cast<volatile uint32_t*>(primary) != 0xA5A55A5Au) {
+        fail("GPU coherence under PAGE_READONLY");
+        return;
+    }
+
+    if (!VirtualProtect(primary, 4096, PAGE_NOACCESS, &oldp)) { fail("VirtualProtect PAGE_NOACCESS"); return; }
+    const bool noaccess_ok = copy_and_fill(0x55AA33CCu, &rb);
+    VirtualProtect(primary, 4096, PAGE_READWRITE, &oldp);
+    if (!noaccess_ok || rb != 0xA5A55A5Au || *static_cast<volatile uint32_t*>(primary) != 0x55AA33CCu) {
+        fail("GPU coherence under PAGE_NOACCESS");
+        return;
+    }
+
+    mem::set_wine_section_supported(true);
+    NXLOG_I(kTag, "wine section probe passed on %s (alias import + RO/NOACCESS coherence): heap section enabled for pool_mirror", gpu_name);
+}
+
 
 // ---- device-local copies of pool pages (S38) ---------------------------------------------------------------------
 // The game's vertex, index and uniform data live in its memory pools, which are host memory: every draw read them over PCIe (S34). A pool

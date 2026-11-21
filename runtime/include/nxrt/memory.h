@@ -56,9 +56,13 @@ bool is_mapped(uint64_t addr, uint64_t size);                // every byte of th
 
 // ---- heap section ---------------------------------------------------------------------------------------------------
 // One pagefile-backed section (SEC_RESERVE, nothing is charged until committed) with a primary view at kHeapBase. Under Wine
-// ([memory] heap_section = auto) it is plain private memory instead: Wine backs sections with shared files, and Linux GPU drivers
-// import only anonymous memory (VK_EXT_external_memory_host through amdgpu userptr is anonymous-only), so no pool could reach the GPU.
+// ([memory] heap_section = auto) this starts off (plain private memory) because Wine backs sections with shared files (memfd) and
+// some Linux GPU drivers import only anonymous memory (VK_EXT_external_memory_host through amdgpu userptr is anonymous-only). When the
+// NVN Vulkan back end probes the driver and confirms that section alias views import cleanly and tolerate primary-view protection
+// changes (e.g. NVIDIA Linux), it calls set_wine_section_supported(true) before heap_create() runs, enabling sections and pool_mirror.
 // Without a section there are no alias or private views (heap_alias / heap_private_view return 0 / nullptr).
+void set_wine_section_supported(bool ok);
+bool wine_section_supported();
 bool heap_create(uint64_t reserve_bytes);       // 0 = use the configured size; a second call is ignored
 bool heap_exists();
 bool heap_has_section();                        // false: private memory, no other views of the heap pages

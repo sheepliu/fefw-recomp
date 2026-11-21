@@ -58,7 +58,7 @@ handling, aim feedback, pitch limit, log status). Hooks keep their registration 
 before its own frame hook and the game's input hooks after it, as before.
 
 CMake: `NXRT_BUILD_GAMES` (on) adds every module listed in `NXRT_GAMES` (default `mpr`), so a second game needs no edit of the base. `NXRT_TEST_GAME` (mpr) picks the module the test programs register.
-Its tests run in the base test programs: `games/<id>/tests/core/*.cpp` in `nxrt_tests`, `games/<id>/tests/*.cpp` in `nxrt_gfx_tests`; without a test game they are left out. `NXRT_LAUNCHER_GAME` (mpr) picks the launcher's branding and its `games/<id>/launcher.rc`; when that module is not built, the launcher builds unbranded. The setup tool has `MPRS_GAME` (mpr) and
+Its tests run in the base test programs: `games/<id>/tests/core/*.cpp` in `nxrt_tests`, `games/<id>/tests/*.cpp` in `nxrt_gfx_tests`; without a test game they are left out. The setup tool has `MPRS_GAME` (mpr) and
 the release builder reads `tools/release/games/<id>.json` (`MPR_RELEASE_GAME`, default mpr).
 
 ## The audit
@@ -112,7 +112,6 @@ the release builder reads `tools/release/games/<id>.json` (`MPR_RELEASE_GAME`, d
 | --- | --- | --- |
 | "Metroid Prime Remastered PC" window title and dialog captions | (a) | `Info::product` |
 | `mpr.exe`, `mpr_setup.exe`, `mpr_launcher.ini`, `shader_cache.mprshc` | (a) | `Info` file names |
-| `apps/launcher/launcher.rc`, `launcher.manifest` (version info, icon, manifest) | (c) | `games/mpr/`, picked by `NXRT_LAUNCHER_GAME` |
 
 ### game exe
 
@@ -162,7 +161,6 @@ These are still Metroid-shaped in the base. None of them blocks a second game fr
 - Moved code keeps namespace `nxrt::play`. Done to keep the move mechanical; rename to `nxrt::games::mpr` later.
 - Test tooling vocabulary. `tt::GameState` fields (morph, beam, visor, missiles), the hash over them (`tt_core.cpp`) and the item
   names in `tt_script.cpp`.
-- Launcher names. Target `mpr_launcher`, library `mpr_launcher_core`, namespace `mprl`, window class `MprLauncherWindow`.
 - Base tests register the Metroid module. The service, tt and play tests of the base run with `NXRT_TEST_GAME=mpr`;
   the tests that use Metroid sites or hooks directly (timestep, play aim, lock-on, look rate, display hooks, play hook, camera look) are
   in `games/mpr/tests` and `games/mpr/tests/core`.
@@ -195,7 +193,7 @@ show different moments in two runs (docs/S5.md, known limits). Compare runs at a
 ## Adding a game
 
 1. `runtime/games/<id>/` with a CMakeLists that builds `nxrt_game_<id>_data` (and `_core`, and the full library if it has play
-   mode), an `Info` and `nxrt_register_game_<id>*()` functions; `launcher.rc` if it ships the launcher.
+   mode), an `Info` and `nxrt_register_game_<id>*()` functions.
 2. A game exe that calls the register function before `nxrt::init()`.
 3. `recomp/games/<id>/` with a `<id>_modules` target; build it with `scripts\build_game.cmd <id>`.
 4. `tools/setup/src/games/<id>.cpp` and `tools/release/games/<id>.json`.

@@ -1470,6 +1470,7 @@ bool bring_up(gfx::Device& dev, gfx::Renderer* rend, FrameLimiter* limiter, bool
     }
     NXLOG_I(kTag, "NVN back end up on %s (%u submission slots, timeline semaphore, host-memory import %s)", dev.properties().deviceName, kSlots,
             dev.features().external_memory_host ? "available" : "NOT available");
+    probe_wine_section();   // under Wine, check whether the GPU can import section alias views before heap_create() runs
     astc_gpu_start();   // [gfx] astc_gpu: its pipelines and self-test start now, on a thread of their own, so the first texture does not wait for them
     return true;
 }

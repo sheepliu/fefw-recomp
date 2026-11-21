@@ -34,8 +34,8 @@ fn key_eq(line: &str) -> Option<usize> {
 /// Splits the text after `=` (leading blanks already removed) into (value, tail), where the tail is
 /// the blanks and comment that follow the value.
 fn split_value(rest: &str) -> (&str, &str) {
-    if rest.starts_with('"') {
-        if let Some(close) = rest[1..].find('"') {
+    if let Some(quoted) = rest.strip_prefix('"') {
+        if let Some(close) = quoted.find('"') {
             let end = close + 2;
             return (&rest[..end], &rest[end..]);
         }
@@ -66,12 +66,7 @@ fn unquote(v: &str) -> String {
 /// A value is written quoted when the runtime would otherwise misread it.
 fn format_value(v: &str) -> String {
     let v: String = v.chars().filter(|c| *c != '\r' && *c != '\n').collect();
-    let needs = v != v.trim()
-        || v.contains(" ;")
-        || v.contains(" #")
-        || v.contains("\t;")
-        || v.contains("\t#")
-        || v.starts_with('"');
+    let needs = v != v.trim() || v.contains(" ;") || v.contains(" #") || v.contains("\t;") || v.contains("\t#") || v.starts_with('"');
     if needs && !v.contains('"') {
         format!("\"{}\"", v)
     } else {
@@ -179,7 +174,7 @@ impl Ini {
         if found_section {
             self.lines.insert(last_in_section.unwrap() + 1, new_line);
         } else {
-            if self.lines.last().map_or(false, |l| !l.trim().is_empty()) {
+            if self.lines.last().is_some_and(|l| !l.trim().is_empty()) {
                 self.lines.push(String::new());
             }
             self.lines.push(format!("[{}]", section));
@@ -200,7 +195,8 @@ impl Ini {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "# header comment\r\n\r\n[display]\r\nwindow_mode = windowed ; keep\r\nvsync=1\r\nUnknownKey = 5\r\n\r\n[mouse]\r\nyaw = 0.5\r\n";
+    const SAMPLE: &str =
+        "# header comment\r\n\r\n[display]\r\nwindow_mode = windowed ; keep\r\nvsync=1\r\nUnknownKey = 5\r\n\r\n[mouse]\r\nyaw = 0.5\r\n";
 
     #[test]
     fn edits_keep_everything_else() {

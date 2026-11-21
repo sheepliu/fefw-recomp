@@ -472,8 +472,8 @@ bool run_sdk(Frame& f, Upscaler u, NetGpu& n, const DlssEval& e, const extras::T
 }
 
 // [dlss] frame_gen: the frame's depth and motion (the SDK input images; made here when the built-in upscaler ran) go to frame generation.
-void feed_framegen(Frame& f, NetGpu& n, const extras::TaauPrepFrame& prep, VkExtent2D in, const float jitter[2], bool reset, bool depth_inverted,
-                   bool prepared) {
+void feed_framegen(Frame& f, NetGpu& n, const extras::TaauPrepFrame& prep, VkExtent2D in, VkExtent2D out, const float jitter[2], bool reset,
+                   bool depth_inverted, bool prepared) {
     if (!extras::framegen_requested()) return;
     if (!prepared) {
         extras::Taau* t = extras::Taau::get(device());
@@ -501,7 +501,7 @@ void feed_framegen(Frame& f, NetGpu& n, const extras::TaauPrepFrame& prep, VkExt
     fi.depth_inverted = depth_inverted;
     fi.flip_y = gpu::window_origin_mode() == NVN_WINDOW_ORIGIN_MODE_LOWER_LEFT;
     extras::framegen_inputs(&device(), f.cb, fi);
-    gpu::fg_note_eval();
+    gpu::fg_note_eval(out);   // the HUD-less capture has to be of this size (nvn_framegen_select.h)
 }
 
 }  // namespace
@@ -640,7 +640,7 @@ void dlss_replay(gpu::Frame& f, Obj* o) {
             render_status::set_upscaler(configured, status_backend(u), static_cast<int>(in_img.width), static_cast<int>(in_img.height),
                                         static_cast<int>(out_img.width), static_cast<int>(out_img.height));
             maybe_dump(f, n, *e, c, rm, n.sdk[3].img);
-            feed_framegen(f, n, prep, in_img, tf.jitter, sdk_reset, tf.depth_inverted, true);
+            feed_framegen(f, n, prep, in_img, out_img, tf.jitter, sdk_reset, tf.depth_inverted, true);   // FSR 3, DLSS, XeSS: out_img is the evaluated picture
             return;
         }
         static bool told = false;
@@ -697,7 +697,7 @@ void dlss_replay(gpu::Frame& f, Obj* o) {
                                 static_cast<int>(in_img.height), static_cast<int>(out_img.width), static_cast<int>(out_img.height));
     gpu::counters().dispatches.fetch_add(1, std::memory_order_relaxed);
     maybe_dump(f, n, *e, c, rm, dst.img);
-    feed_framegen(f, n, prep, in_img, tf.jitter, reset, tf.depth_inverted, false);
+    feed_framegen(f, n, prep, in_img, out_img, tf.jitter, reset, tf.depth_inverted, false);
     if (n.evals % 1800 == 0)
         NXLOG_I(kTag, "network %u: %llu evaluations, %llu history resets, %s %ux%u -> %ux%u", net.id, static_cast<unsigned long long>(n.evals),
                 static_cast<unsigned long long>(n.resets), upscaler_name(u), in_img.width, in_img.height, out_img.width, out_img.height);

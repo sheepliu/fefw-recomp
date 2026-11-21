@@ -8,6 +8,27 @@ cmake_minimum_required(VERSION 3.25)
 if(NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
+# The resource compiler: llvm-rc, next to the clang-cl this build already requires. The Windows SDK's rc.exe under a newer SDK folder has
+# been seen to hang on the preprocessed .rc this project feeds it, and llvm-rc compiles the same file at once. Set before project(),
+# because the resource language is not enabled yet there: setting the cache afterwards makes CMake announce "you have changed variables
+# that require your cache to be deleted", wipe the cache and configure again with its defaults, which turned a Release clang-cl build
+# into a Debug clang++ one (EmblemWeave issues 22, 25).
+if(NOT CMAKE_RC_COMPILER OR CMAKE_RC_COMPILER MATCHES "[Rr][Cc]\.exe$")
+    get_filename_component(_llvm_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    foreach(_llvm_rc "${_llvm_bin}/llvm-rc.exe" "${_llvm_bin}/llvm-rc")
+        if(EXISTS "${_llvm_rc}")
+            set(CMAKE_RC_COMPILER "${_llvm_rc}" CACHE FILEPATH "resource compiler" FORCE)
+            break()
+        endif()
+    endforeach()
+    # The compiler may be named without its folder; then take the first llvm-rc on PATH.
+    if(NOT CMAKE_RC_COMPILER OR CMAKE_RC_COMPILER MATCHES "[Rr][Cc]\.exe$")
+        find_program(_llvm_rc_prog NAMES llvm-rc llvm-rc.exe)
+        if(_llvm_rc_prog)
+            set(CMAKE_RC_COMPILER "${_llvm_rc_prog}" CACHE FILEPATH "resource compiler" FORCE)
+        endif()
+    endif()
+endif()
 project(fefw_game C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -21,7 +42,14 @@ set(FEFW_ROMFS_DEFAULT "game/dump/romfs" CACHE PATH "default [fs] romfs")
 set(FEFW_MAIN_DEFAULT "" CACHE FILEPATH "default [fs] main: main as an uncompressed NSO (empty: <exefs>/main)")
 configure_file(src/fefw_paths.h.in "${CMAKE_CURRENT_BINARY_DIR}/fefw_paths.h" @ONLY)
 
-add_compile_options("-clang:-fmacro-prefix-map=${FEFW_ROOT}=.")
+# clang-cl takes a clang argument through -clang:, the other drivers take it as it is. What tells the two apart is the frontend variant: on
+# a Windows host the clang++ driver also reports a simulated MSVC ABI (CMAKE_CXX_SIMULATE_ID is "MSVC" for it), so asking that handed
+# "-clang:" to clang++ and the build stopped on "unknown argument: '-clang:-fmacro-prefix-map=...'" (EmblemWeave issues 22 and 25).
+if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    add_compile_options("-clang:-fmacro-prefix-map=${FEFW_ROOT}=.")
+else()
+    add_compile_options("-fmacro-prefix-map=${FEFW_ROOT}=.")
+endif()
 set(FEFW_RUNTIME_DIR "${FEFW_ROOT}/runtime" CACHE PATH "runtime source tree compiled into fefw.exe")
 set(NXRT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(NXRT_GAMES "fefw" CACHE STRING "" FORCE)            # runtime/games/fefw only
@@ -90,11 +118,31 @@ target_link_libraries(fefw PRIVATE ${FEFW_LIBS} nxrt_game_fefw nxrt_gfx nxrt)
 target_link_options(fefw PRIVATE /MAP /STACK:134217728 /HIGHENTROPYVA:NO /DEBUG /MANIFEST:NO)
 
 # The shared-font fallback (runtime src/services/pl.cpp looks in fonts\ next to the exe) and the ASTC decoder DLLs when the transcoder is in.
-add_custom_command(TARGET fefw POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    "${FEFW_RUNTIME_DIR}/assets/fonts/DejaVuSans.ttf" "$<TARGET_FILE_DIR:fefw>/fonts/DejaVuSans.ttf")
-# The site list the libraries were lifted with (recomp/games/fefw/CMakeLists.txt), for the runtime's hook checks.
-add_custom_command(TARGET fefw POST_BUILD COMMAND ${CMAKE_COMMAND} -D "SRC=${FEFW_LIB_DIR}/main.sites"
-    -D "DST=$<TARGET_FILE_DIR:fefw>/fefw.sites" -P "${CMAKE_CURRENT_LIST_DIR}/cmake/copy_sites.cmake")
+# The processor features this build's lifted libraries need (recomp/games/fefw/CMakeLists.txt FEFW_CPU_VARIANT): fefw_main.cpp checks the
+# processor against them before the first game instruction (fefw_cpu.h). The launcher names the variant in FEFW_CPU_VARIANT
+# (launcher/src-tauri/src/cpu.rs): fma (FMA3 + AVX, the default) or compat (SSE4.2 + POPCNT).
+set(FEFW_CPU_VARIANT "fma" CACHE STRING "processor target of the lifted code: fma (FMA3 + AVX) or compat (SSE4.2 + POPCNT)")
+if(DEFINED ENV{FEFW_CPU_VARIANT} AND NOT "$ENV{FEFW_CPU_VARIANT}" STREQUAL "")
+    set(FEFW_CPU_VARIANT "$ENV{FEFW_CPU_VARIANT}" CACHE STRING "processor target of the lifted code" FORCE)
+endif()
+if(FEFW_CPU_VARIANT STREQUAL "compat")
+    target_compile_definitions(fefw PRIVATE FEFW_CPU_NEEDS=FEFW_CPU_NEEDS_COMPAT_BUILD)
+else()
+    target_compile_definitions(fefw PRIVATE FEFW_CPU_NEEDS=FEFW_CPU_NEEDS_FMA_BUILD)
+endif()
+# The font and the site list are copied when the build is configured, not in a POST_BUILD step: CMake wraps that step in cmd.exe's
+# `cd /D "<build dir>"`, and an & in the checkout path splits the command (EmblemWeave issue 38).
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fonts")
+configure_file("${FEFW_RUNTIME_DIR}/assets/fonts/DejaVuSans.ttf" "${CMAKE_CURRENT_BINARY_DIR}/fonts/DejaVuSans.ttf" COPYONLY)
+# The site list the libraries were lifted with (recomp/games/fefw/CMakeLists.txt), for the runtime's hook checks. Every configure
+# copies it (the launcher configures before every build); with no list, a stale fefw.sites is removed so the runtime skips its hook
+# checks instead of checking against the wrong build.
+if(EXISTS "${FEFW_LIB_DIR}/main.sites")
+    configure_file("${FEFW_LIB_DIR}/main.sites" "${CMAKE_CURRENT_BINARY_DIR}/fefw.sites" COPYONLY)
+else()
+    file(REMOVE "${CMAKE_CURRENT_BINARY_DIR}/fefw.sites")
+    message(WARNING "${FEFW_LIB_DIR}/main.sites is missing (rebuild the libraries with recomp/scripts/build_game.cmd fefw): no fefw.sites, so hooks and mods' sites are not checked")
+endif()
 foreach(dll ${NXRT_A2B_DLLS})
     add_custom_command(TARGET fefw POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "$<TARGET_FILE_DIR:fefw>")
 endforeach()

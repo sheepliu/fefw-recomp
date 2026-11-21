@@ -15,6 +15,7 @@
 #include "project_root.h"
 
 #include "extras/hdr_tonemap_patch.h"
+#include "post_patch_spirv.inc"
 
 NXTEST_GROUP(hdr_tonemap_patch)
 
@@ -232,4 +233,78 @@ NXTEST(other_cache_shaders_never_crash) {
         if (hdr::spirv_hdr_tonemap(w, out)) ++accepted;
     }
     printf("hdr_tonemap_patch: %d of %d other cache shaders accepted by the patch\n", accepted, tried);
+}
+
+// ---- spirv_hdr_tonemap_gt keep_wide ([hdr] wide_gamut) on authored stand-ins (post_patch_shaders.frag) --------------------------------------
+
+namespace {
+
+template <size_t N>
+std::vector<uint32_t> words_of(const uint32_t (&a)[N]) { return std::vector<uint32_t>(a, a + N); }
+
+// FMax counts: with a float 0 constant as one operand, and with both operands the same id.
+struct MaxCensus {
+    int zero = 0, self = 0;
+};
+
+MaxCensus max_census(const std::vector<uint32_t>& w) {
+    uint32_t t_float = 0, zero = 0;
+    for (size_t i = 5; i < w.size();) {
+        const uint32_t len = w[i] >> 16, op = w[i] & 0xffffu;
+        if (!len) break;
+        if (op == 22 && len == 3 && w[i + 2] == 32) t_float = w[i + 1];
+        if (op == 43 && len == 4 && w[i + 1] == t_float && w[i + 3] == 0) zero = w[i + 2];
+        i += len;
+    }
+    MaxCensus c;
+    for (size_t i = 5; i < w.size();) {
+        const uint32_t len = w[i] >> 16, op = w[i] & 0xffffu;
+        if (!len) break;
+        if (op == kOpExtInst && len == 7 && w[i + 4] == kGlslFMax) {
+            if (zero && (w[i + 5] == zero || w[i + 6] == zero)) ++c.zero;
+            if (w[i + 5] == w[i + 6]) ++c.self;
+        }
+        i += len;
+    }
+    return c;
+}
+
+}  // namespace
+
+NXTEST(gt_keep_wide_drops_the_three_output_clamps) {
+    const std::vector<uint32_t> in = words_of(kGt3Clamps);
+    std::vector<uint32_t> narrow, wide;
+    CHECK(hdr::spirv_hdr_tonemap_gt(in, 4.0f, narrow));
+    CHECK(hdr::spirv_hdr_tonemap_gt(in, 4.0f, wide, true));
+    CHECK_EQ(max_census(in).zero, 3);
+    CHECK_EQ(max_census(narrow).zero, 3);   // without keep_wide the clamps stay
+    CHECK_EQ(max_census(wide).zero, 0);
+    CHECK_EQ(max_census(wide).self, 3);     // max(x, x) = x
+    CHECK_EQ(wide.size(), narrow.size());   // operands rewritten in place
+    CHECK(census(wide).ok);
+}
+
+NXTEST(gt_keep_wide_refuses_an_unexpected_clamp_count) {
+    // two clamps: keep_wide must refuse (the caller then falls back to the plain HDR variant, hdr_tonemap_variant), the plain patch works
+    const std::vector<uint32_t> in = words_of(kGt2Clamps);
+    std::vector<uint32_t> out;
+    CHECK(!hdr::spirv_hdr_tonemap_gt(in, 4.0f, out, true));
+    CHECK(hdr::spirv_hdr_tonemap_gt(in, 4.0f, out));
+    CHECK_EQ(max_census(out).zero, 2);
+}
+
+NXTEST(gt_keep_wide_output_validates) {
+    std::error_code ec;
+    if (!fs::is_regular_file(kSpirvVal, ec)) {
+        nxtest::skip("spirv-val not present");
+        return;
+    }
+    std::vector<uint32_t> out;
+    CHECK(hdr::spirv_hdr_tonemap_gt(words_of(kGt3Clamps), 4.0f, out, true));
+    const char* temp = std::getenv("TEMP");
+    const fs::path tmp = std::string(temp ? temp : ".") + "\\nxrt_hdr_gt_wide.spv";
+    CHECK(write_words(tmp, out));
+    const std::string cmd = std::string("\"\"") + kSpirvVal + "\" --target-env vulkan1.3 \"" + tmp.string() + "\"\"";
+    CHECK_EQ(std::system(cmd.c_str()), 0);
+    fs::remove(tmp, ec);
 }

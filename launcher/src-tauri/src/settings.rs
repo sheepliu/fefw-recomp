@@ -155,7 +155,9 @@ pub fn ensure_play_paths(dir: &Path, p: &Paths) -> Result<(), String> {
     let path = dir.join(GAME_INI);
     let new = !path.exists();
     let mut ini = load(&path).unwrap_or_else(|| {
-        Ini::parse("; fefw.ini: settings of fefw.exe. Every key is described in runtime/docs/CONFIG.md. The launcher writes [fs], [aoc] and [nvn] paths.\n")
+        Ini::parse(
+            "; fefw.ini: settings of fefw.exe. Every key is described in runtime/docs/CONFIG.md. The launcher writes [fs], [aoc] and [nvn] paths.\n",
+        )
     });
     let mut changed = new;
     let _ = fs::create_dir_all(p.mods());

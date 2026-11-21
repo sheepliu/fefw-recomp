@@ -1,7 +1,7 @@
 import { listen } from '@tauri-apps/api/event';
 import { api, esc, icon, refreshIcons, toast, errText } from '../util.js';
 import { t } from '../i18n.js';
-import { checkText, dumpText, stepTitle, toolText, toolHint } from '../rusttext.js';
+import { checkText, dumpText, stepDetail, stepTitle, toolText, toolHint } from '../rusttext.js';
 
 // one listener for the session; the page being shown sets the handler
 let nupHandler = null;
@@ -70,7 +70,7 @@ function stepsHtml(s) {
     <div class="card" id="steps-card">
       <h2>${icon('hammer')}${esc(t('setup.setUp'))}</h2>
       <div class="stack">
-        <ul class="steps">${s.steps.map((x) => `<li class="${x.state}">${icon(stepIcon(x), x.state === 'running' ? 'spin' : '')}${esc(stepTitle(x))}</li>`).join('')}</ul>
+        <ul class="steps">${s.steps.map((x) => `<li class="${x.state}">${icon(stepIcon(x), x.state === 'running' ? 'spin' : '')}${esc(stepTitle(x))}${stepDetail(x) ? `<span class="step-detail">${esc(stepDetail(x))}</span>` : ''}</li>`).join('')}</ul>
         ${running ? `<p class="dim">${esc(progressMsg(p.message))}</p><progress max="100" ${p.total ? `value="${pct}"` : ''}></progress>
           <p class="faint">${esc((p.total ? t('setup.progressDone', { done: p.done, total: p.total }) : '') + t('setup.pauseHint'))}</p>` : ''}
         ${p.state === 'error' ? `<div class="banner danger">${icon('circle-x')}<div style="white-space: pre-wrap">${esc(progressMsg(p.message))}</div></div>` : ''}

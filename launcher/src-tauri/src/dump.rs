@@ -113,7 +113,7 @@ fn has_romfs(addon: &Path) -> bool {
         return true;
     }
     // one level down, a numbered folder: dlc/<id>/<n>/romfs
-    fs::read_dir(addon).map_or(false, |rd| {
+    fs::read_dir(addon).is_ok_and(|rd| {
         rd.filter_map(|e| e.ok()).any(|e| {
             let n = e.file_name().to_string_lossy().to_string();
             !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && e.path().join("romfs").is_dir()

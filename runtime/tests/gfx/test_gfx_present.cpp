@@ -50,7 +50,9 @@ NXTEST(no_handle_or_memory_growth_over_hundreds_of_swapchain_recreations) {
     // One device, one window, 700 frames with a present-mode change or a resize every 3 frames (about 300 swapchain rebuilds,
     // the overlay on). After a warm-up the process handle count, the private bytes and the allocator's live allocations must not
     // grow. (Creating and destroying whole devices is not what this checks: the NVIDIA driver on this machine keeps 5 handles per
-    // vkDestroyDevice, see docs/debug/006.md.)
+    // vkDestroyDevice, see docs/debug/006.md.) The driver's own handle count moves by a few while it runs (an RTX 5090 on 617.42: 735 to
+    // 747 over the run, with no trend), so the handles are compared as the lowest count of an early and of a late window: a leak per
+    // rebuild (about 200 here) raises the late floor, the driver's coming and going does not.
     SceneRunDesc d = base_desc();
     d.headless = false;
     d.width = 640;
@@ -58,7 +60,7 @@ NXTEST(no_handle_or_memory_growth_over_hundreds_of_swapchain_recreations) {
     d.frames = 700;
     d.overlay = true;
     d.overlay_visible_from_frame = 5;
-    DWORD h_start = 0, h_end = 0;
+    DWORD h_start = MAXDWORD, h_end = MAXDWORD;   // the lowest handle count in frames 100..199 and in 600..699
     double mb_start = 0, mb_end = 0;
     auto private_mb = [] {
         PROCESS_MEMORY_COUNTERS_EX pm = {sizeof pm};
@@ -66,8 +68,10 @@ NXTEST(no_handle_or_memory_growth_over_hundreds_of_swapchain_recreations) {
         return static_cast<double>(pm.PrivateUsage) / (1024.0 * 1024.0);
     };
     d.per_frame = [&](uint64_t frame, Renderer& r) {
-        if (frame == 100) { h_start = handle_count(); mb_start = private_mb(); }
-        if (frame == 699) { h_end = handle_count(); mb_end = private_mb(); }
+        if (frame >= 100 && frame < 200) h_start = (std::min)(h_start, handle_count());
+        if (frame >= 600 && frame < 700) h_end = (std::min)(h_end, handle_count());
+        if (frame == 100) mb_start = private_mb();
+        if (frame == 699) mb_end = private_mb();
         const PresentMode order[] = {PresentMode::Mailbox, PresentMode::Immediate, PresentMode::FifoRelaxed, PresentMode::Fifo};
         if (frame % 6 == 0) r.set_present_mode(order[(frame / 6) % 4]);
         if (frame % 6 == 3) {
@@ -79,7 +83,7 @@ NXTEST(no_handle_or_memory_growth_over_hundreds_of_swapchain_recreations) {
     const SceneRunResult r = run_scene(d);
     print_result("recreation soak", r);
     REQUIRE(r.ok);
-    std::printf("    %llu swapchains created; handles %lu -> %lu, private bytes %.2f -> %.2f MiB between frame 100 and 699\n",
+    std::printf("    %llu swapchains created; lowest handle count %lu (frames 100-199) -> %lu (600-699), private bytes %.2f -> %.2f MiB between frame 100 and 699\n",
                 static_cast<unsigned long long>(r.renderer.swapchain_creates), static_cast<unsigned long>(h_start), static_cast<unsigned long>(h_end), mb_start, mb_end);
     CHECK_EQ(r.validation.errors, 0ull);
     CHECK(r.renderer.swapchain_creates >= 200);

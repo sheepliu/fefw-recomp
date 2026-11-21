@@ -24,7 +24,8 @@ pub const REPO: &str = match option_env!("FEFW_UPDATE_REPO") {
 pub const BUILD_ID: Option<&str> = option_env!("FEFW_BUILD_ID");
 /// The release asset for this platform, and files a downloaded package must have.
 #[cfg(windows)]
-const PACKAGE: (&str, &str, [&str; 4]) = ("-win64.zip", "Windows", ["fefw-launcher.exe", "fefw_rt.dll", "tools/build/fefw_build.py", "tools/python/python.exe"]);
+const PACKAGE: (&str, &str, [&str; 4]) =
+    ("-win64.zip", "Windows", ["fefw-launcher.exe", "fefw_rt.dll", "tools/build/fefw_build.py", "tools/python/python.exe"]);
 #[cfg(not(windows))]
 const PACKAGE: (&str, &str, [&str; 4]) =
     ("-linux-x64.tar.gz", "Linux", ["fefw-launcher.AppImage", "fefw_rt.dll", "tools/build/fefw_build.py", "tools/python/bin/python3"]);
@@ -90,7 +91,11 @@ fn system_tool(name: &str) -> PathBuf {
     }
     let root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
     let p = root.join("System32").join(name);
-    if p.is_file() { p } else { PathBuf::from(name) }
+    if p.is_file() {
+        p
+    } else {
+        PathBuf::from(name)
+    }
 }
 
 pub(crate) fn curl() -> Command {
@@ -178,12 +183,18 @@ impl Run<'_> {
     }
 
     fn cancelled(&self) -> Result<(), String> {
-        if self.shared.cancel.load(Ordering::SeqCst) { Err("Update cancelled.".into()) } else { Ok(()) }
+        if self.shared.cancel.load(Ordering::SeqCst) {
+            Err("Update cancelled.".into())
+        } else {
+            Ok(())
+        }
     }
 
     pub fn run(&self, rel: &Release) -> Result<Status, String> {
         if rel.sha256.len() != 64 {
-            return Err("GitHub lists no checksum for this download, so it cannot be verified. Download the package from the release page instead.".into());
+            return Err(
+                "GitHub lists no checksum for this download, so it cannot be verified. Download the package from the release page instead.".into()
+            );
         }
         if rel.asset_name.contains(['/', '\\']) || rel.asset_name.contains("..") {
             return Err("The release's file name is not usable.".into());
@@ -222,7 +233,7 @@ impl Run<'_> {
         let _ = fs::remove_file(&zip);
         let _ = fs::remove_file(&part);
         let mut child = curl()
-            .args(["--retry", "3", "--speed-limit", "1024", "--speed-time", "60", "--output"])  // a stalled connection fails after a minute instead of hanging
+            .args(["--retry", "3", "--speed-limit", "1024", "--speed-time", "60", "--output"]) // a stalled connection fails after a minute instead of hanging
             .arg(&part)
             .arg(&rel.asset_url)
             .stdin(Stdio::null())
@@ -299,7 +310,8 @@ fn only_time_errors(stderr: &str) -> bool {
     let mut any = false;
     for l in stderr.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let l = l.to_ascii_lowercase();
-        if l.contains("error exit delayed") {   // bsdtar's closing line after any non-fatal error
+        if l.contains("error exit delayed") {
+            // bsdtar's closing line after any non-fatal error
             continue;
         }
         if !l.contains("can't restore time") && !l.contains("cannot utime") {
@@ -364,7 +376,8 @@ pub fn install(install: &Path, top: &Path, old: &Path) -> Result<(), String> {
             // a table the package does not ship is not stale, it is theirs.
             if name.to_string_lossy().eq_ignore_ascii_case("locales") {
                 continue;
-            }            stale.extend(walk(&install.join(&name)).into_iter().map(|r| name.join(r)).filter(|r| !new_set.contains(r)));
+            }
+            stale.extend(walk(&install.join(&name)).into_iter().map(|r| name.join(r)).filter(|r| !new_set.contains(r)));
         }
     }
     // (relative path, the old file was moved to old/, a new file was moved in)
@@ -376,7 +389,8 @@ pub fn install(install: &Path, top: &Path, old: &Path) -> Result<(), String> {
             if let Some(d) = dest.parent() {
                 fs::create_dir_all(d).map_err(|e| format!("cannot create {}: {e}", d.display()))?;
             }
-            rename_retry(&target, &dest).map_err(|e| format!("cannot move {} aside (is the game or another program using it?): {e}", target.display()))
+            rename_retry(&target, &dest)
+                .map_err(|e| format!("cannot move {} aside (is the game or another program using it?): {e}", target.display()))
         };
         for rel in &stale {
             aside(rel)?;
@@ -430,9 +444,12 @@ pub fn rebuild_needed(install: &Path, game_dir: &Path) -> (Option<bool>, String)
     match c.stdin(Stdio::null()).output() {
         Ok(o) => {
             let text = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
-            let last = text.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or_default();
+            let last = text.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or_default();
             // --check prints {"current": ..., "reason": "..."}
-            let reason = serde_json::from_str::<serde_json::Value>(last).ok().and_then(|v| v["reason"].as_str().map(String::from)).unwrap_or_else(|| last.to_string());
+            let reason = serde_json::from_str::<serde_json::Value>(last)
+                .ok()
+                .and_then(|v| v["reason"].as_str().map(String::from))
+                .unwrap_or_else(|| last.to_string());
             (Some(!o.status.success()), reason)
         }
         Err(e) => (None, format!("cannot run the build check: {e}")),
@@ -463,7 +480,9 @@ mod tests {
     #[test]
     fn unpacking_tolerates_only_time_errors() {
         // #129: tar could not set the file times (some Windows file systems); the files themselves were written
-        assert!(only_time_errors("fefw-recomp-0.1.7/fefw.exe: Can't restore time: Invalid argument\nfefw-recomp-0.1.7/LEGAL.txt: Can't restore time: Invalid argument\n"));
+        assert!(only_time_errors(
+            "fefw-recomp-0.1.7/fefw.exe: Can't restore time: Invalid argument\nfefw-recomp-0.1.7/LEGAL.txt: Can't restore time: Invalid argument\n"
+        ));
         assert!(only_time_errors("a: Can't restore time: Invalid argument\ntar.exe: Error exit delayed from previous errors.\n"));
         assert!(!only_time_errors("a: Can't restore time: Invalid argument\ntar: b: Cannot open: Permission denied\n"));
         assert!(!only_time_errors("tar.exe: Error exit delayed from previous errors.\n"));

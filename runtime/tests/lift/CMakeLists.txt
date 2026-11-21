@@ -4,7 +4,8 @@
 # the lifted module, runs test_main on a runtime guest thread and compares results[] with the expected output:
 #   EXPECT unicorn  Unicorn executing the original AArch64 code (S1's reference, recomp/oracle/e2e/unicorn_side.py)
 #   EXPECT native   the same program text compiled for the host (tests/lift/native/rt2.h) and run with the host's C++ exceptions
-# Needs ../recomp (lifter, ABI header, oracle helpers), ../tools/.venv (Python with unicorn) and LLVM clang for the AArch64 target.
+# Needs ../recomp (lifter, ABI header, oracle helpers), ../tools/.venv (Python with unicorn) and LLVM clang for the AArch64 target
+# (NXRT_LIFT_LLVM_BIN, set in ../../CMakeLists.txt).
 set(NXRT_RECOMP_ROOT "${CMAKE_SOURCE_DIR}/../recomp")
 include("${NXRT_RECOMP_ROOT}/cmake/NxRecomp.cmake")
 set(NXRT_LIFT_TOOLS "${CMAKE_SOURCE_DIR}/tests/tools")
@@ -18,7 +19,7 @@ function(nxrt_lift_case name)
   set(elf "${out}.elf")
   set(expected "${out}.expected")
   add_custom_command(OUTPUT "${elf}"
-    COMMAND "${NX_PYTHON}" "${NXRT_LIFT_TOOLS}/guest_build.py" "${L_SRC}" "${elf}" -O2
+    COMMAND "${CMAKE_COMMAND}" -E env "LLVM_BIN=${NXRT_LIFT_LLVM_BIN}" "${NX_PYTHON}" "${NXRT_LIFT_TOOLS}/guest_build.py" "${L_SRC}" "${elf}" -O2
     DEPENDS "${L_SRC}" "${NXRT_LIFT_TOOLS}/guest_build.py" ${NXRT_LIFT_HEADERS}
     COMMENT "guest ELF ${name}" VERBATIM)
   if(L_EXPECT STREQUAL "unicorn")
@@ -39,7 +40,7 @@ function(nxrt_lift_case name)
   set(lift_extra "")
   if(L_SITES)
     add_custom_command(OUTPUT "${out}.sites"
-      COMMAND "${NX_PYTHON}" "${NXRT_LIFT_TOOLS}/make_sites.py" "${elf}" "${out}.sites"
+      COMMAND "${CMAKE_COMMAND}" -E env "LLVM_BIN=${NXRT_LIFT_LLVM_BIN}" "${NX_PYTHON}" "${NXRT_LIFT_TOOLS}/make_sites.py" "${elf}" "${out}.sites"
       DEPENDS "${elf}" "${NXRT_LIFT_TOOLS}/make_sites.py" VERBATIM)
     set(lift_extra SITES "${out}.sites")
   endif()

@@ -19,6 +19,13 @@ export function stepTitle(x) {
   return text === key ? x.title : text;
 }
 
+/** A setup step's note (`detail` from setup_status), "" when it has none. */
+export function stepDetail(x) {
+  if (!x.detail) return '';
+  const m = /^new hook sites from (.+): Set up lifts the game with them$/.exec(x.detail);
+  return m ? t('setup.stepDetail.modSites', { mods: m[1] }) : x.detail;
+}
+
 /** One entry of a dump check list ("exefs/main is decrypted", "supported version (...)"). */
 export function checkText(label) {
   if (label === 'exefs/main is decrypted') return t('setup.check.decrypted');

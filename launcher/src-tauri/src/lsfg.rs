@@ -138,7 +138,9 @@ fn install_package(shelly: &Path) -> Result<String, String> {
         .args(["install", "standard", "--no-confirm", "--needed", "lsfg-vk"])
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("cannot run pkexec to install the lsfg-vk package: {e}. Install it with Shelly yourself (shelly install lsfg-vk)."))?;
+        .map_err(|e| {
+        format!("cannot run pkexec to install the lsfg-vk package: {e}. Install it with Shelly yourself (shelly install lsfg-vk).")
+    })?;
     match out.status.code() {
         Some(0) => Ok("Installed the lsfg-vk package with Shelly.".into()),
         Some(126 | 127) => Err("The lsfg-vk package was not installed: the administrator password was not given.".into()),
@@ -152,7 +154,10 @@ fn install_package(shelly: &Path) -> Result<String, String> {
 
 /// LSFG-VK's build, unpacked into ~/.local. Directories already there keep their own permissions (`--no-overwrite-dir`).
 fn install_local() -> Result<String, String> {
-    let home = std::env::var_os("HOME").map(PathBuf::from).filter(|h| h.is_absolute()).ok_or("HOME is not set, so there is no ~/.local to install LSFG-VK into.")?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute())
+        .ok_or("HOME is not set, so there is no ~/.local to install LSFG-VK into.")?;
     let prefix = home.join(".local");
     std::fs::create_dir_all(&prefix).map_err(|e| format!("cannot create {}: {e}", prefix.display()))?;
     let archive = std::env::temp_dir().join(format!("fefw-lsfg-vk-{}.tar.xz", std::process::id()));

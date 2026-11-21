@@ -279,6 +279,25 @@ void gpu_wrote(uint64_t addr, uint64_t size, int use) {
 const ProgLayout* g_pl = nullptr;
 const ProgLayout* g_last_draw_pl = nullptr;
 bool g_alpha_draw = false;       // this draw uses the alpha-test layout: build_key sets the key's alpha_func
+bool g_grade_draw = false;       // [hdr] grade_*: the GT tone-map draw runs the replacement (alpha-test layout, g_grade_push pushed)
+float g_grade_push[12] = {};       // extras::hdr_gt_grade_push for this frame
+bool g_sharp_draw = false;       // [hdr] sharpen: the sharpen pass runs kFefwSharpenFrag (alpha-test layout, g_sharp_push pushed)
+float g_sharp_push[4] = {1, 1, 0, 0};   // scene gain (per draw), strength multiplier, compare split (per draw)
+bool g_sharp_on = false;         // ... and whether the setting is not neutral (or compare is on)
+bool g_compare = false;          // [hdr] compare this frame
+// [hdr] compare: the split position for the grade and sharpen replacements, half the draw's colour target width in pixels (gl_FragCoord
+// counts target pixels; the sampled scene may be smaller when it is upscaled); 0 = no split.
+float compare_half_width(const GState& st) {
+    if (!g_compare || st.ncolor == 0 || !st.color_tex[0]) return 0.0f;
+    const uint32_t w = static_cast<uint32_t>(st.color_tex[0]->b.width) >> st.color_level[0];
+    return 0.5f * static_cast<float>(w ? w : 1);
+}
+bool g_bloom_draw = false;       // [hdr] bloom: the bloom composite draw runs its scaled variant (alpha-test layout, g_bloom_gain pushed)
+float g_bloom_gain = 1.0f;       // [hdr] bloom for this frame
+bool g_post_draw = false;        // [hdr] motion_blur, vignette: the draw runs its strength variant (alpha-test layout, g_post_val pushed)
+float g_post_val = 1.0f;
+float g_post_strength[4] = {1.0f, 1.0f, 1.0f, 1.0f};   // [1] motion_blur, [2] vignette, [3] depth_of_field for this frame
+bool g_grade_on = false;          // ... and whether any setting is not neutral
 bool g_gain_draw = false;        // [hdr] ui_nits: the scene's draw into the window texture: alpha-test layout, the scene gain pushed (hdr_gain_shader)
 // [hdr] ui_nits, per frame (render thread; replay_frame_presented starts the next frame). The settings are read once per frame, not per draw.
 bool g_ui_split = false;         // extras::hdr_ui_split for this frame
@@ -1430,6 +1449,8 @@ std::atomic<uint64_t> g_pool_uploads_deferred{0};
 std::atomic<uint64_t> g_pacing_on_present{0};   // the present at which pacing last came back on after a load (note_frame_for_pacing)
 const bool g_pool_deferred_hitch = (nxrt::hitch_add_counter("pool_uploads_deferred", []() -> uint64_t { return g_pool_uploads_deferred.load(std::memory_order_relaxed); }), true);
 
+VkFormat image_format_vk(uint32_t f);   // below
+
 // Makes the textures a draw samples current (uploaded, in their sampled layout) and the storage images it binds writable (GENERAL).
 // Ends the pass when it has to touch images. The depth attachment itself is left to the pass.
 void prepare_textures(const ProgLayout& pl) {
@@ -1445,7 +1466,14 @@ void prepare_textures(const ProgLayout& pl) {
             const TexResolved& r = resolve_image_ref(d, tmp);
             if (!r.tex || !tex_gpu(r.tex) || !tex_has_storage(r.tex)) continue;
             storage_bound.push_back(r.tex);
-            if (r.tex->cpu_dirty.load() || tex_layout(r.tex) != VK_IMAGE_LAYOUT_GENERAL || tex_scale(r.tex) != 1.0f) need_storage.push_back(r.tex);
+            // [gfx] float16_scene: an R11G11B10F image becomes RGBA16F at its first store, unless the shader declares its format (a view of
+            // another format than the declared one is not allowed)
+            bool f16 = tex_f16_on_store(r.tex);
+            if (f16 && image_format_vk(d.shader->refl.bindings[d.index].image.format) == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
+                tex_f16_keep(r.tex);
+                f16 = false;
+            }
+            if (f16 || r.tex->cpu_dirty.load() || tex_layout(r.tex) != VK_IMAGE_LAYOUT_GENERAL || tex_scale(r.tex) != 1.0f) need_storage.push_back(r.tex);
             continue;
         }
         if (d.type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) continue;
@@ -1515,10 +1543,13 @@ void prepare_textures(const ProgLayout& pl) {
     // on screen for its finished result ([nvn] pool_swap_budget, default on), bound or pool: the image already holds valid (approximate) data,
     // so a swap can wait a frame anywhere; at a load-in a thousand results land within a second or two and their copies piled into one frame.
     static const bool swap_budget = config_get_bool("nvn", "pool_swap_budget", true);
-    // [nvn] bound_upload_defer (default on): while a backlog streams in (burst), first uploads of asset textures a draw binds itself wait too;
+    // [nvn] bound_upload_defer (default off): while a backlog streams in (burst), first uploads of asset textures a draw binds itself wait too;
     // the draw samples the dummy texture until theirs is in (descriptor resolution below). A load-in's first frame still made 583 uploads, most
     // of them bound, in 582 ms (s2-default). Outside a burst bound textures always go at once.
-    static const bool bound_defer = config_get_bool("nvn", "bound_upload_defer", true);
+    // Off by default: the dummy is black, and models showed black for a split second after every load-in (reported against the
+    // ObeliskChamber fork). With it off, that load-in frame took 436 ms instead of 193 + 283 ms over two frames, under the game's fade, and
+    // nothing showed black.
+    static const bool bound_defer = config_get_bool("nvn", "bound_upload_defer", false);
     // more than pool_upload_burst_firsts first uploads needed by this frame's draws so far (the first frame after a loading screen, spread
     // over many draws) start the burst at once; s3-default's load-in frame still made 576 uploads with a per-draw count
     // [nvn] pool_upload_burst_firsts (default 256): the threshold of this count. 64 also fired while walking into a cold street (s4-default:
@@ -1596,6 +1627,7 @@ void prepare_textures(const ProgLayout& pl) {
     for (Texture* t : need_storage) {
         if (tex_scale(t) != 1.0f) tex_rescale(t, *F, 1.0f, "bound as a storage image");   // imageStore coordinates are not scaled (Ryujinx: ResScaleUnsupported)
         tex_ensure_current(t, *F);
+        tex_f16_promote(t, *F);   // after the upload: the content is copied over
         tex_transition(t, *F, VK_IMAGE_LAYOUT_GENERAL);
         tex_mark_gpu_written(t);
     }
@@ -2463,7 +2495,12 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
                     ii.imageView = v;
                     // GENERAL: the op also writes it as a storage image (prepare_textures left it there)
                     ii.imageLayout = tex_layout(r.tex) == VK_IMAGE_LAYOUT_GENERAL ? VK_IMAGE_LAYOUT_GENERAL : tex_sampled_layout(r.tex);
-                    if (r.has_sampler) ii.sampler = sampler_for(int_comp ? unfiltered(r.smp) : r.smp);
+                    // Integer views (the integer sampler variant, and images the shader reads only as integer bits, reflected as uint) take the
+                    // unfiltered sampler: Vulkan has no linear filtering of integer formats (VUID-vkCmdDrawIndexed-magFilter-04553), and Maxwell
+                    // takes the nearest texel of them anyway. [nvn] int_view_nearest = false: the game's sampler as before.
+                    static const bool int_nearest = nxrt::config_get_bool("nvn", "int_view_nearest", true);
+                    const bool int_view = int_comp || (int_nearest && component >= 2);
+                    if (r.has_sampler) ii.sampler = sampler_for(int_view ? unfiltered(r.smp) : r.smp);
                     // [nvn] reserved_sampler (default on): a texel-fetch handle (sampler id 0, the driver's reserved range) sampled with filtering
                     // gets the linear reserved sampler, as on the console; integer and depth textures keep the nearest dummy
                     else if (r.sid0 && component == 1 && !(tex_aspect(r.tex) & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) &&
@@ -2507,6 +2544,13 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
                 if (shader_fmt != VK_FORMAT_UNDEFINED) q.format = shader_fmt;
                 q.format = tex_storage_format(r.tex, q.format);   // an sRGB image is stored to through its UNORM view (raw bits, as on the console)
                 ii.imageView = tex_sampled_view(r.tex, q);
+                // A storage image declared r11f_g11f_b10f over an R11G11B10F image kept as RGBA16F (the format's fallback, or [gfx] float16_scene):
+                // the view is RGBA16F, which Vulkan does not allow for a declared format other than its own. Fortune's Weave declares none.
+                if (ii.imageView && shader_fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && tex_vk_format(r.tex) == VK_FORMAT_R16G16B16A16_SFLOAT &&
+                    first_time_id(4, d.shader, static_cast<uint64_t>(d.index), r.tex->id))
+                    NXLOG_W(kTag, "storage image: %s binding %s declares r11f_g11f_b10f, texture %u is RGBA16F (float16_scene or the format's fallback): "
+                                  "the store's results are undefined; set [gfx] float16_scene = off if this shader's output looks wrong",
+                            d.shader->hash.c_str(), b.name.c_str(), r.tex->id);
             }
             if (!ii.imageView) {
                 if (r.tex) NXLOG_W(kTag, "storage image: texture %u (%s %dx%dx%d) has no storage view (gpu %d, storage usage %d)", r.tex->id, r.tex->fmt ? r.tex->fmt->name : "?",
@@ -2874,9 +2918,13 @@ bool build_key(GraphicsKey& key, VkPrimitiveTopology topo) {
         for (uint32_t i = 0; i < 8; ++i) key.blend_enable[i] = 0;
     }
     // The game's alpha test (alpha_test_wanted, begin_draw chose the alpha-test layout): the fragment shader variant; the reference is a push constant.
-    key.alpha_layout = (g_alpha_draw || g_gain_draw) ? 1 : 0;   // the layout begin_draw chose, also when the variant is ruled out below
+    key.alpha_layout = (g_alpha_draw || g_gain_draw || g_grade_draw || g_bloom_draw || g_sharp_draw || g_post_draw) ? 1 : 0;   // the layout begin_draw chose, also when the variant is ruled out below
     if (g_alpha_draw && key.stage[1] && !key.no_out && !key.dual_src && !key.xfb && key.color_format[0] != 0) key.alpha_func = static_cast<uint8_t>(S.color.alpha_test);
     if (g_gain_draw && key.stage[1] && !key.no_out && !key.dual_src && !key.xfb && key.color_format[0] != 0) key.scene_gain = 1;   // [hdr] ui_nits
+    if (g_grade_draw && key.stage[1] && !key.no_out && !key.dual_src && !key.xfb && key.color_format[0] != 0) key.grade = 1;   // [hdr] grade_*
+    if (g_bloom_draw && key.stage[1] && !key.no_out && !key.dual_src && !key.xfb && key.color_format[0] != 0) key.bloom = 1;   // [hdr] bloom
+    if (g_sharp_draw && key.stage[1] && !key.no_out && !key.dual_src && !key.xfb && key.color_format[0] != 0) key.sharpen = 1;   // [hdr] sharpen
+    if (g_post_draw && key.stage[1] && !key.no_out && !key.dual_src && !key.xfb && key.color_format[0] != 0) key.post = 1;   // [hdr] motion_blur, vignette
     return true;
 }
 
@@ -3183,6 +3231,29 @@ const ProgLayout* layout_cached(const ShaderInfo* const stages[6]) {
     return pl;
 }
 
+// [nvn] alpha_cache (default on): the alpha-test, scene-gain and post-effect variants of recently drawn programs' layouts, direct mapped on
+// the base layout, in front of alpha_layout's lock and map (the same reason as layout_cache: a busy frame crosses one of them hundreds of
+// times). Layouts live until pipeline_shutdown, which frees them; replay_shutdown clears this table with layout_cache, so a variant built
+// before it cannot come back from a reused address.
+struct AlphaCacheSlot { const ProgLayout* base = nullptr; const ProgLayout* alpha = nullptr; };
+AlphaCacheSlot g_alpha_cache[64];
+const ProgLayout* alpha_layout_cached(const ProgLayout& base) {
+    if (base.push_bytes || base.alpha_push) return &base;   // no variant: alpha_layout's own answer, and it keeps the table for programs that have one
+    static const bool on = nxrt::config_get_bool("nvn", "alpha_cache", true);
+    if (!on) return alpha_layout(base);
+    AlphaCacheSlot& sl = g_alpha_cache[(reinterpret_cast<uintptr_t>(&base) >> 4) & 63];
+    if (sl.base == &base) {
+        if (rt_check()) chk(alpha_layout(base) == sl.alpha, "alpha cache");
+        return sl.alpha;
+    }
+    const ProgLayout* a = alpha_layout(base);
+    if (a != &base) {   // a creation that failed returns base and is tried again on the next draw, as it was without the table
+        sl.base = &base;
+        sl.alpha = a;
+    }
+    return a;
+}
+
 // The game's fixed-function alpha test for this draw: the fragment shader runs as a variant that kills the invocation when the alpha of
 // colour output 0 fails the test, and the reference value reaches it as a push constant (alpha_layout, spirv_alpha_test). [nvn] alpha_test =
 // false: off (A/B). Not for tessellation, stream-out, a pass without a colour target or a dual-source blend.
@@ -3243,6 +3314,10 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
     if (!pl) return false;
     g_alpha_draw = false;
     g_gain_draw = false;
+    g_grade_draw = false;
+    g_bloom_draw = false;
+    g_sharp_draw = false;
+    g_post_draw = false;
     // [hdr] ui_nits: the scene keeps paper white. The gain goes on the scene's last pass before the UI: the frame's first draw after the
     // tone-map draw into a target of the window's kind (an 8-bit sRGB target kept as float, or a window texture), or the tone-map draw itself
     // when it writes there (no pass in between). Not on a tone map followed by other passes: those (grading, anti-aliasing) are not linear,
@@ -3261,18 +3336,41 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
         }
     }
     if (alpha_test_wanted()) {
-        const ProgLayout* ap = alpha_layout(*pl);
+        const ProgLayout* ap = alpha_layout_cached(*pl);
         if (ap != pl) { pl = ap; g_alpha_draw = true; }
+    } else if (g_sharp_on && S.stage[kFragment] && !S.stage[kTessCtl] && !g_xfb_active && S.ncolor > 0 && sharpen_shader(S.stage[kFragment])) {
+        const ProgLayout* ap = alpha_layout_cached(*pl);   // the same push constant range: the replacement also carries the scene gain
+        if (ap != pl) {
+            pl = ap;
+            g_sharp_draw = true;
+            g_sharp_push[0] = gain_wanted ? g_ui_gain : 1.0f;
+            g_sharp_push[2] = compare_half_width(S);
+            if (gain_wanted) g_gain_frame = true;
+        }
     } else if (gain_wanted && hdr_gain_shader(S.stage[kFragment])) {
-        const ProgLayout* ap = alpha_layout(*pl);   // the same push constant range carries the scene gain
+        const ProgLayout* ap = alpha_layout_cached(*pl);   // the same push constant range carries the scene gain
         if (ap != pl) { pl = ap; g_gain_draw = g_gain_frame = true; }
+    } else if (g_grade_on && S.stage[kFragment] && !S.stage[kTessCtl] && !g_xfb_active && S.ncolor > 0 && extras::hdr_scene_active() &&
+               hdr_gt_shader(S.stage[kFragment])) {
+        const ProgLayout* ap = alpha_layout_cached(*pl);   // the same push constant range, 48 bytes
+        if (ap != pl) { pl = ap; g_grade_draw = true; g_grade_push[8] = compare_half_width(S); }
+    } else if (g_bloom_gain != 1.0f && S.stage[kFragment] && !S.stage[kTessCtl] && !g_xfb_active && S.ncolor > 0 && bloom_shader(S.stage[kFragment])) {
+        const ProgLayout* ap = alpha_layout_cached(*pl);   // the same push constant range carries the bloom factor
+        if (ap != pl) { pl = ap; g_bloom_draw = true; }
+    } else if ((g_post_strength[1] != 1.0f || g_post_strength[2] != 1.0f || g_post_strength[3] != 1.0f) && S.stage[kFragment] && !S.stage[kTessCtl] && !g_xfb_active &&
+               S.ncolor > 0) {
+        const int kind = post_scale_shader(S.stage[kFragment]);
+        if (kind && g_post_strength[kind] != 1.0f) {
+            const ProgLayout* ap = alpha_layout_cached(*pl);   // the same push constant range carries the strength
+            if (ap != pl) { pl = ap; g_post_draw = true; g_post_val = g_post_strength[kind]; }
+        }
     }
     if (gain_wanted) {
         static int told = 0;
         if (told < 3) {
             ++told;
             NXLOG_I("hdr", "UI brightness: the scene's last draw before the UI, into t%u (fs %s), %s, gain %.3f", S.color_tex[0]->id, S.stage[kFragment]->hash.c_str(),
-                    g_gain_draw ? "gets the scene gain" : "cannot take it (alpha test, patch or layout): the frame keeps paper white", static_cast<double>(g_ui_gain));
+                    (g_gain_draw || g_sharp_draw) ? "gets the scene gain" : "cannot take it (alpha test, patch or layout): the frame keeps paper white", static_cast<double>(g_ui_gain));
         }
     }
     if (pl != g_last_draw_pl) {   // another layout than the last draw's (the alpha test came or went): the sets and the pipeline are bound again
@@ -3294,10 +3392,7 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
     rs_mark(kRsHead);
     if (g_dirty & (kDesc | kPipe)) {
         ++g_rs.draws_desc;
-        g_prog_writes = false;
-        static const bool ssbo_ro_pass = nxrt::config_get_bool("nvn", "gfx_ssbo_readonly", true);
-        for (const BindingDesc& d : pl->bindings)
-            g_prog_writes |= (d.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && !(ssbo_ro_pass && !d.shader->refl.bindings[d.index].written)) || d.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        g_prog_writes = pl->writes_storage;   // worked out once per layout (prog_layout), not over every binding per draw
         attach_targets(false);
         g_want_depth_ro = samples_depth_target(*pl);
         prepare_textures(*pl);
@@ -3521,6 +3616,10 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
     if (g_alpha_draw) vkCmdPushConstants(F->cb, pl->layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof S.alpha_ref, &S.alpha_ref);
     if (g_gain_draw)   // [hdr] ui_nits: the scene keeps paper white while the output pass maps 1.0 to the UI's white
         vkCmdPushConstants(F->cb, pl->layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof g_ui_gain, &g_ui_gain);
+    if (g_grade_draw) vkCmdPushConstants(F->cb, pl->layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof g_grade_push, g_grade_push);
+    if (g_bloom_draw) vkCmdPushConstants(F->cb, pl->layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof g_bloom_gain, &g_bloom_gain);
+    if (g_post_draw) vkCmdPushConstants(F->cb, pl->layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof g_post_val, &g_post_val);
+    if (g_sharp_draw) vkCmdPushConstants(F->cb, pl->layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof g_sharp_push, g_sharp_push);
     if (pl->push_bytes && g_gen_tcs) {
         // the pass-through control shader's tessellation levels (NVN's fixed SetInner/OuterTessellationLevels), every draw: cheap, and
         // the layout may have changed since the last push
@@ -4608,11 +4707,11 @@ void do_copy_buffer_texture(const P_CopyBufTex& p, bool to_texture) {
         tev(t, "copy_buffer_to_texture", p.address, p.has_view ? 1 : 0);
         for (uint32_t i = 0; i < c.imageSubresource.layerCount; ++i) tex_sparse_before_copy(t, c.imageSubresource.baseArrayLayer + i, s.level);
         tex_mark_gpu_written(t);
-        vkCmdCopyBufferToImage(F->cb, br.buffer, tex_image(t), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+        if (!tex_copy_buffer_promoted(t, *F, br.buffer, c, true)) vkCmdCopyBufferToImage(F->cb, br.buffer, tex_image(t), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
     } else {
         tex_ensure_exact(t, *F);
         tex_transition(t, *F, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        vkCmdCopyImageToBuffer(F->cb, tex_image(t), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, br.buffer, 1, &c);
+        if (!tex_copy_buffer_promoted(t, *F, br.buffer, c, false)) vkCmdCopyImageToBuffer(F->cb, tex_image(t), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, br.buffer, 1, &c);
         gpu_wrote(p.address, stride * ((rh + bh - 1) / bh) * rd, kWriteImageCopy);
     }
     memory_barrier(F->cb);
@@ -5611,6 +5710,15 @@ void replay_frame_presented(bool again) {
     const extras::HdrState hs = extras::hdr_state();
     g_ui_split = extras::hdr_ui_split(hs);
     g_ui_gain = extras::hdr_scene_gain(hs);
+    g_grade_on = extras::hdr_gt_grade_push(g_grade_push);
+    const extras::HdrSettings hset = extras::settings().hdr;
+    g_bloom_gain = static_cast<float>(hset.bloom);
+    g_post_strength[1] = static_cast<float>(hset.motion_blur);
+    g_post_strength[2] = static_cast<float>(hset.vignette);
+    g_post_strength[3] = static_cast<float>(hset.depth_of_field);
+    g_sharp_push[1] = static_cast<float>(hset.sharpen);
+    g_compare = hset.compare;   // the split position is set per draw from its target (compare_half_width)
+    g_sharp_on = hset.sharpen != 1.0 || hset.compare;
 }
 
 void trace_dump_targets() {
@@ -5716,6 +5824,7 @@ void replay_shutdown() {
     pipeline_shutdown();
     g_pl = nullptr;                // the layouts are gone with the pipelines
     for (LayoutCacheSlot& sl : g_layout_cache) sl = LayoutCacheSlot();
+    for (AlphaCacheSlot& sl : g_alpha_cache) sl = AlphaCacheSlot();
     S = GState();
     g_out_all = true;
     raw_binds_reset();

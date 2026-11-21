@@ -1263,6 +1263,23 @@ extras::Settings merge_env(const extras::Settings& from_file) {
     if (config_has("hdr", "paper_white_nits")) r.hdr.paper_white_nits = env.hdr.paper_white_nits;
     if (config_has("hdr", "highlight_boost")) r.hdr.highlight_boost = env.hdr.highlight_boost;
     if (config_has("hdr", "ui_nits")) r.hdr.ui_nits = env.hdr.ui_nits;
+    if (config_has("hdr", "sdr_gamma")) r.hdr.sdr_gamma = env.hdr.sdr_gamma;
+    if (config_has("hdr", "dither")) r.hdr.dither = env.hdr.dither;
+    if (config_has("hdr", "wide_gamut")) r.hdr.wide_gamut = env.hdr.wide_gamut;
+    if (config_has("hdr", "grade_exposure")) r.hdr.grade_exposure = env.hdr.grade_exposure;
+    if (config_has("hdr", "grade_contrast")) r.hdr.grade_contrast = env.hdr.grade_contrast;
+    if (config_has("hdr", "grade_shadows")) r.hdr.grade_shadows = env.hdr.grade_shadows;
+    if (config_has("hdr", "grade_highlights")) r.hdr.grade_highlights = env.hdr.grade_highlights;
+    if (config_has("hdr", "grade_saturation")) r.hdr.grade_saturation = env.hdr.grade_saturation;
+    if (config_has("hdr", "highlight_saturation")) r.hdr.highlight_saturation = env.hdr.highlight_saturation;
+    if (config_has("hdr", "hue_preserve")) r.hdr.hue_preserve = env.hdr.hue_preserve;
+    if (config_has("hdr", "compare")) r.hdr.compare = env.hdr.compare;
+    if (config_has("hdr", "bloom")) r.hdr.bloom = env.hdr.bloom;
+    if (config_has("hdr", "sharpen")) r.hdr.sharpen = env.hdr.sharpen;
+    if (config_has("hdr", "motion_blur")) r.hdr.motion_blur = env.hdr.motion_blur;
+    if (config_has("hdr", "vignette")) r.hdr.vignette = env.hdr.vignette;
+    if (config_has("hdr", "depth_of_field")) r.hdr.depth_of_field = env.hdr.depth_of_field;
+    if (config_has("hdr", "gamut_expand")) r.hdr.gamut_expand = env.hdr.gamut_expand;
     if (config_has("upscale", "mode")) r.upscale.mode = env.upscale.mode;
     if (config_has("upscale", "sharpness")) r.upscale.sharpness = env.upscale.sharpness;
     if (config_has("upscale", "quality")) r.upscale.quality = env.upscale.quality;
@@ -1332,6 +1349,9 @@ bool load() {
     else audio::set_master_volume(static_cast<float>(st.settings.audio.volume));
     if (config_has("audio", "device")) st.settings.audio.device = config_get_str("audio", "device", "default");
     else config_set("audio", "device", st.settings.audio.device.c_str());
+    // Speakers: the file's choice becomes [audio] channels unless the ini or the environment set it (the audio services read it when the game opens its audio renderer, after this).
+    if (config_has("audio", "channels")) st.settings.audio.channels = config_get_int("audio", "channels", 2) == 6 ? 6 : 2;
+    else config_set("audio", "channels", st.settings.audio.channels == 6 ? "6" : "2");
     st.capture_mouse = config_get_bool("play", "capture_mouse", true);
     st.late_sample = config_get_bool("play", "late_sample", true);
     st.quit_on_close = config_get_bool("play", "quit_on_close", true);

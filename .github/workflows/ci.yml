@@ -1,0 +1,166 @@
+# Checks of every pull request (and of master, which also keeps the caches warm for pull requests).
+#
+#   oracle-lock  recomp/oracle/SHA256SUMS still matches the locked oracle files (recomp/oracle/LOCKED, scripts/oracle_sums.py)
+#   linux        launcher: cargo fmt, clippy, cargo test, the frontend build; Python: every .py under recomp/ and tools/ compiles
+#   runtime      Windows, only when runtime/, recomp/include, tools/tiling or tools/textures change: nxrt_tests under
+#                CTest. The graphics groups (nxrt_gfx_tests) need a Vulkan GPU and the lift tests the
+#                recomp toolchain and Unicorn venv, so neither runs here.
+#
+# Pull requests from forks run with a read-only token and no secrets; none of these jobs needs one.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  oracle-lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Oracle hash lock
+        run: python3 recomp/scripts/oracle_sums.py check
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System packages (Tauri)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev build-essential
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: launcher/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher/src-tauri
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Launcher frontend
+        working-directory: launcher
+        run: |
+          npm ci
+          npm run build
+
+      - name: Launcher format
+        working-directory: launcher/src-tauri
+        run: cargo fmt --check
+
+      - name: Launcher lints
+        working-directory: launcher/src-tauri
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Launcher tests
+        working-directory: launcher/src-tauri
+        run: cargo test --release
+
+      - name: Python compiles
+        run: python -m compileall -q recomp tools
+
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      runtime: ${{ steps.filter.outputs.runtime }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            runtime:
+              - 'runtime/**'
+              - 'recomp/include/**'
+              - 'tools/tiling/**'
+              - 'tools/textures/**'
+              - '.github/workflows/ci.yml'
+
+  runtime:
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
+    runs-on: windows-2022
+    env:
+      # keep with linux-release.yml
+      LLVM_VERSION: 23.1.5
+      LLVM_SHA256: b2be33385ddc86e83511417a060de927ae8b09d1f3017cc3cdce5c73cd5029d7
+      NXRT_DEPS_DIR: ${{ github.workspace }}/work/deps
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: LLVM cache
+        id: llvm
+        uses: actions/cache@v4
+        with:
+          path: work/toolchain/llvm
+          key: llvm-${{ env.LLVM_VERSION }}-x86_64-pc-windows-msvc
+
+      - name: LLVM ${{ env.LLVM_VERSION }} (clang-cl)
+        if: steps.llvm.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p work/toolchain/llvm
+          cd work/toolchain
+          curl -fsSL -o llvm.tar.zst "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/clang%2Bllvm-$LLVM_VERSION-x86_64-pc-windows-msvc.tar.zst"
+          echo "$LLVM_SHA256  llvm.tar.zst" | sha256sum -c --quiet
+          zstd -dc --long=31 llvm.tar.zst | tar -xf - -C llvm --strip-components=1 --wildcards '*/bin/*' '*/lib/clang/*'
+          rm llvm.tar.zst
+
+      - name: Toolchain paths
+        run: |
+          $bin = (Resolve-Path work\toolchain\llvm\bin).Path
+          & "$bin\clang-cl.exe" --version
+          "NX_LLVM_BIN=$bin" >> $env:GITHUB_ENV
+
+      # the pinned SDL, Vulkan headers, volk, VMA, ImGui and zstd archives of runtime/cmake/gfx_deps.cmake
+      - name: Third-party archives cache
+        uses: actions/cache@v4
+        with:
+          path: work/deps
+          key: nxrt-deps-${{ hashFiles('runtime/cmake/gfx_deps.cmake') }}
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      # NXRT_ASTC2BC7=OFF: no tools/textures third-party fetch (only the graphics tests use the transcoder)
+      - name: Build the test executables
+        run: |
+          $sccache = (Get-Command sccache).Source.Replace('\', '/')
+          $cfg = "cmake -S runtime -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl " +
+                 "-DCMAKE_C_COMPILER_LAUNCHER=$sccache -DCMAKE_CXX_COMPILER_LAUNCHER=$sccache " +
+                 "-DNXRT_BUILD_LIFT_TESTS=OFF -DNXRT_ASTC2BC7=OFF -DNXRT_DEPS_DIR=`"$env:NXRT_DEPS_DIR`""
+          cmd /c "call runtime\scripts\env.cmd && $cfg && cmake --build build --target nxrt_tests -j 4"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      # every CTest entry except the groups of nxrt_gfx_tests, read from their sources the way runtime/cmake/gfx.cmake does. The groups
+      # whose checks depend on timing (write_watch: writer threads racing 3000 region rebuilds; watchdog: frames counted while it
+      # ticks) run afterwards on their own: beside the parallel groups on a 4-core runner they time out or miss their frame counts.
+      - name: Tests
+        run: |
+          $gfx = Get-ChildItem runtime\tests\gfx\*.cpp, runtime\games\*\tests\*.cpp |
+                 Select-String '^NXTEST_GROUP\(([a-z0-9_]+)\)' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Sort-Object -Unique
+          if (-not $gfx) { throw 'no graphics test groups found' }
+          $serial = 'write_watch', 'watchdog'
+          ctest --test-dir build --output-on-failure -j 4 -E "^($(($gfx + $serial) -join '|'))$"
+          $parallel = $LASTEXITCODE
+          ctest --test-dir build --output-on-failure -R "^($($serial -join '|'))$"
+          if ($parallel -or $LASTEXITCODE) { exit 1 }

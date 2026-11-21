@@ -28,7 +28,7 @@ namespace nxrt::gfx::haptic {
 
 // What the settings ask for ([pad] haptic).
 enum class Mode : uint8_t { Auto = 0, Off, Rumble, DualSense };
-// Inline: play_config.cpp uses them in builds without this module (mpr_launcher).
+// Inline: play_config.cpp uses them in builds without this module.
 inline const char* mode_name(Mode m) {   // "auto" "off" "rumble" "dualsense"
     switch (m) {
         case Mode::Off: return "off";

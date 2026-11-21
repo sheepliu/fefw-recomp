@@ -91,6 +91,16 @@ FSR 3 in a source build: put AMD's DLLs in `upscalers\fsr` next to `fefw.exe` or
 `PrebuiltSignedDLL` of tag v1.1.4 for frame generation. `game-build\scripts\make-release.ps1` downloads the same files (sha256 and AMD
 signature checked) into the release package; they are never committed.
 
+The path handling of the build scripts (spaces, `&`, parentheses, non-ASCII text, long folder names) has a test that does not build the
+game:
+
+```
+pwsh -NoProfile -File recomp\tests\build_paths.ps1
+```
+
+It configures and runs a small CMake/Ninja project from such folders with the same `CMAKE_NINJA_FORCE_RESPONSE_FILE=ON` setting as
+`build_game.cmd` and `build_fefw.ps1`, and needs `cmake`, `ninja` and LLVM's `clang-cl` (`-ClangCl <path>` when LLVM is not on `PATH`).
+
 ## Linux package
 
 On Linux the game still runs as `fefw.exe` through Proton or Wine; the launcher, the first-run build and the shader translator run

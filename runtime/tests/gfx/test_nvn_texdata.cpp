@@ -32,6 +32,7 @@
 #endif
 #include "tegra_tiling.h"
 #include "test_framework.h"
+#include "astc_test_util.h"
 NXTEST_GROUP(gfx_nvn_texdata)
 
 using namespace nxrt;
@@ -392,6 +393,7 @@ NXTEST(pitch_linear_copies_tight_rows) {
 // ---- ASTC -------------------------------------------------------------------------------------------------------------------
 
 NXTEST(astc_transcode_bc7_keep_and_decode) {
+    if (!astctest::transcoder_or_skip()) return;
     no_cache();
     const int formats[] = {NVN_FORMAT_RGBA_ASTC_5x4,      NVN_FORMAT_RGBA_ASTC_5x4_SRGB, NVN_FORMAT_RGBA_ASTC_5x5,
                            NVN_FORMAT_RGBA_ASTC_5x5_SRGB, NVN_FORMAT_RGBA_ASTC_8x5,      NVN_FORMAT_RGBA_ASTC_8x5_SRGB};
@@ -460,6 +462,7 @@ NXTEST(astc_transcode_bc7_keep_and_decode) {
 }
 
 NXTEST(astc_odd_size_two_layers) {
+    if (!astctest::transcoder_or_skip()) return;
     no_cache();
     // 61x37 with 8x5 blocks (partial blocks at both edges), 2 layers, 2 levels
     const TextureBuilderInfo info = make_info(NVN_TEXTURE_TARGET_2D_ARRAY, 61, 37, 2, 2, NVN_FORMAT_RGBA_ASTC_8x5);
@@ -490,6 +493,7 @@ NXTEST(astc_odd_size_two_layers) {
 // ---- disk cache -------------------------------------------------------------------------------------------------------------
 
 NXTEST(bc7_disk_cache_hit_and_truncated_file) {
+    if (!astctest::transcoder_or_skip()) return;
     const fs::path dir = fs::temp_directory_path() /
                          ("nxrt_texdata_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::error_code ec;
@@ -557,6 +561,7 @@ NXTEST(bc7_disk_cache_hit_and_truncated_file) {
 // [nvn] tex_async = standin (TexCaps::standin_first): with a valid cache entry on disk the render thread still gets the quick stand-in, never the
 // entry, and the stand-in is the same data as the one made when there is no entry (it untiles only the levels it encodes).
 NXTEST(standin_first_skips_the_cache_entry) {
+    if (!astctest::transcoder_or_skip()) return;
     const fs::path dir = fs::temp_directory_path() /
                          ("nxrt_texdata_si_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::error_code ec;
@@ -616,6 +621,7 @@ NXTEST(standin_first_skips_the_cache_entry) {
 // source row copied whole). The result must be byte for byte the block-by-block one, for big, odd-sized and layered textures; the times of both
 // are printed (a 4096x4096 stand-in is the case that costs the render thread on a first visit).
 NXTEST(standin_copy_equals_block_by_block) {
+    if (!astctest::transcoder_or_skip()) return;
     no_cache();
     struct Case { int target, w, h, depth, levels, format; };
     const Case cases[] = {
@@ -807,6 +813,7 @@ void build_astc(Built& bt, const TextureBuilderInfo& info, uint32_t seed) {
 
 // ASTC 4x4 UNORM with a hand-made RGBA8 entry: the entry is used (format, from_cache, data); caps that want BC7 ignore it.
 NXTEST(cache_entry_rgba8_is_used) {
+    if (!astctest::transcoder_or_skip()) return;
     std::error_code ec;
     const fs::path dir = new_cache_dir("rgba8");
     const TextureBuilderInfo info = make_info(NVN_TEXTURE_TARGET_2D, 64, 64, 1, 3, NVN_FORMAT_RGBA_ASTC_4x4);
@@ -861,6 +868,7 @@ NXTEST(cache_entry_rgba8_is_used) {
 // ASTC 4x4 UNORM with a hand-made BC5 entry: used for default caps and for a BC5 image; not for an RGBA8 image (decoded instead).
 // An sRGB texture does not use a BC5 entry (BC5 is for non-sRGB data only): it stays BC7.
 NXTEST(cache_entry_bc5_is_used) {
+    if (!astctest::transcoder_or_skip()) return;
     std::error_code ec;
     const fs::path dir = new_cache_dir("bc5");
     const TextureBuilderInfo info = make_info(NVN_TEXTURE_TARGET_2D, 64, 64, 1, 3, NVN_FORMAT_RGBA_ASTC_4x4);
@@ -941,6 +949,7 @@ NXTEST(cache_entry_bc5_is_used) {
 
 // The RGBA8 entry of an sRGB texture is the _SRGB variant: an entry declared UNORM is not used, the _SRGB one is.
 NXTEST(cache_entry_srgb_rgba8) {
+    if (!astctest::transcoder_or_skip()) return;
     std::error_code ec;
     const fs::path dir = new_cache_dir("srgb");
     Built bt;
@@ -1057,6 +1066,7 @@ NXTEST(failures_return_false_without_crashing) {
 }
 
 NXTEST(caps_select_output_format) {
+    if (!astctest::transcoder_or_skip()) return;
     no_cache();
     const TextureBuilderInfo info = make_info(NVN_TEXTURE_TARGET_2D, 32, 32, 1, 1, NVN_FORMAT_RGBA_ASTC_5x5);
     Built bt;
@@ -1120,6 +1130,7 @@ NXTEST(astc_quality_setting_parses) {
 
 // The banded encoder (used by the background upgrade, so it can stop between bands) gives the same blocks as one whole-image encode.
 NXTEST(banded_bc7_encode_equals_whole_image_encode) {
+    if (!astctest::transcoder_or_skip()) return;
     const uint32_t w = 22, h = 70;
     const std::vector<uint8_t> px = sample_rgba(w, h);
     const size_t bytes = static_cast<size_t>(div_up(w, 4)) * div_up(h, 4) * 16;

@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "nxrt/config.h"
+#include "nxrt/cpu_info.h"
 #include "nxrt/diag.h"
 #include "nxrt/dispatch.h"
 #include "nxrt/game.h"
@@ -234,8 +235,12 @@ std::string fs_path(const char* key, const std::string& cli, const char* def) {
 
 int fefw_run(int argc, char** argv);
 
-// The processor features the build of the game code needs (FEFW_CPU_*), logged at start-up.
-uint32_t g_cpu_needs = FEFW_CPU_NEEDS_FMA_BUILD;
+// The processor features the build of the game code needs (FEFW_CPU_*), logged at start-up. The CMake build sets FEFW_CPU_NEEDS from
+// FEFW_CPU_VARIANT (game-build/fefw/CMakeLists.txt); a build that does not name one is the FMA3 build.
+#ifndef FEFW_CPU_NEEDS
+#define FEFW_CPU_NEEDS FEFW_CPU_NEEDS_FMA_BUILD
+#endif
+uint32_t g_cpu_needs = FEFW_CPU_NEEDS;
 
 // Before the first lifted instruction: a CPU without what this build of the game code needs (`needs`: FMA3 / AVX for the default build,
 // SSE4.2 / POPCNT for the compatible one, CX16 for both) would die on an illegal instruction in a blank window (issues 33, 5). Says which
@@ -279,7 +284,7 @@ extern "C" int fefw_rt_main(int argc, char** argv, const FefwRtModules* m) {
 }
 #else
 int main(int argc, char** argv) {
-    check_cpu_or_exit(FEFW_CPU_NEEDS_FMA_BUILD);     // the libraries of recomp/games/fefw are compiled with -mfma
+    check_cpu_or_exit(FEFW_CPU_NEEDS);               // what the libraries of recomp/games/fefw were compiled for (FEFW_CPU_VARIANT)
     const NxModule* nx[6] = {&nxmod_rtld, &nxmod_main, &nxmod_subsdk0, &nxmod_subsdk1, &nxmod_subsdk2, &nxmod_sdk};
     const uint32_t* abi[6] = {&nxmod_rtld_abi, &nxmod_main_abi, &nxmod_subsdk0_abi, &nxmod_subsdk1_abi, &nxmod_subsdk2_abi, &nxmod_sdk_abi};
     for (int i = 0; i < 6; i++) {
@@ -365,6 +370,8 @@ int fefw_run(int argc, char** argv) {
     // base game's RomFS, 221,339 a partial copy); services/fs.cpp names the cause in the crash report. 0 turns the check off.
     if (!nxrt::config_has("fs", "romfs_files")) nxrt::config_set("fs", "romfs_files", "252686");
     NXLOG_I("boot", "fefw.exe build: %s", fefw_cpu::build_name(g_cpu_needs));
+    nxrt::cpu::set_game_build(fefw_cpu::build_name(g_cpu_needs));   // the F1 menu's Debug page shows it
+    NXLOG_I("boot", "CPU: %s", nxrt::cpu::summary_line().c_str());
     NXLOG_I("boot", "%s (update %s): exefs '%s', main '%s', romfs '%s'", nxrt::game::info().title, nxrt::game::info().version, exefs.c_str(),
             main_nso.c_str(), romfs.c_str());
     // a folder, or a .nup package served as the RomFS image; without either the game aborts in its first fs call (issue 142)

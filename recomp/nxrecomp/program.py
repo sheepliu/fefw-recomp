@@ -39,7 +39,7 @@ def load_patches(path, img):
     """Instruction patches: one `<address> <original word> <new word>  # note` per line (hex). The original word is
     checked against the image. Returns {address: new word}."""
     out = {}
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             t = line.split('#', 1)[0].split()
             if not t:
@@ -73,7 +73,7 @@ def load_sites(path, env):
     Fills env.sites[kind] (sets of addresses) and env.patches."""
     env.sites = {k: set() for k in SITE_KINDS}
     chain = {}
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for ln, line in enumerate(f, 1):
             t = line.split('#', 1)[0].split()
             if not t:
@@ -156,13 +156,13 @@ class Env:
         # cross-shard inlining (GameConfig.inline_edges): caller -> [callees] that get a static copy in the caller's shard
         self.inline_edges = {}
         if self.cfg.inline_edges and getattr(self.cfg, 'dir', None):
-            with open(os.path.join(self.cfg.dir, self.cfg.inline_edges)) as f:
+            with open(os.path.join(self.cfg.dir, self.cfg.inline_edges), encoding="utf-8") as f:
                 for line in f:
                     t = line.split('#', 1)[0].split()
                     if len(t) == 2:
                         self.inline_edges.setdefault(int(t[0], 16), []).append(int(t[1], 16))
         if self.cfg.hot_order and getattr(self.cfg, 'dir', None):
-            with open(os.path.join(self.cfg.dir, self.cfg.hot_order)) as f:
+            with open(os.path.join(self.cfg.dir, self.cfg.hot_order), encoding="utf-8") as f:
                 for line in f:
                     t = line.split('#', 1)[0].split()
                     if t:

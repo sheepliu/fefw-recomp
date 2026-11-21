@@ -18,6 +18,7 @@
 #include "nvn_texture_layout.h"
 #include "tegra_tiling.h"
 #include "test_framework.h"
+#include "astc_test_util.h"
 NXTEST_GROUP(gfx_nvn_tex_edit)
 
 using namespace nxrt;
@@ -108,6 +109,7 @@ size_t files_in(const fs::path& d) {
 }  // namespace
 
 NXTEST(edit_reaches_rgba8_output_and_is_reused) {
+    if (!astctest::transcoder_or_skip()) return;
     set_env("NXRT_NVN_BC7_CACHE", "");
     config_set("nvn", "bc7_cache", "");
     Built bt;
@@ -167,6 +169,7 @@ NXTEST(edit_reaches_rgba8_output_and_is_reused) {
 
 // BC7 output: the edit changes the blocks, the sizes stay, and the shared disk cache gets nothing from the edit.
 NXTEST(edited_bc7_stays_out_of_the_disk_cache) {
+    if (!astctest::transcoder_or_skip()) return;
     const fs::path dir = fs::temp_directory_path() / ("nxrt_texedit_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::error_code ec;
     fs::create_directories(dir, ec);

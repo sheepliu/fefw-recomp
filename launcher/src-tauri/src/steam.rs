@@ -277,15 +277,18 @@ fn accounts(root: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// pid, command line, environment
+type RunningSteam = (u32, Vec<String>, Vec<(String, String)>);
+
 #[cfg(not(unix))]
-fn running() -> Option<(u32, Vec<String>, Vec<(String, String)>)> {
+fn running() -> Option<RunningSteam> {
     None
 }
 
 /// This user's running Steam client (another user's is not ours to close): its pid, command line and environment (to start it
 /// again exactly as it was).
 #[cfg(unix)]
-fn running() -> Option<(u32, Vec<String>, Vec<(String, String)>)> {
+fn running() -> Option<RunningSteam> {
     use std::os::unix::fs::MetadataExt;
     let me = fs::metadata("/proc/self").ok()?.uid();
     for e in fs::read_dir("/proc").ok()?.flatten() {
@@ -528,7 +531,11 @@ mod tests {
     #[test]
     fn lsfg_variables_are_added_replaced_and_removed() {
         let lsfg = |m: &str| -> Vec<(String, String)> {
-            vec![("LSFGVK_ENV".into(), "1".into()), ("LSFGVK_DLL_PATH".into(), "/s/Lossless Scaling/lsfg-vk.dll".into()), ("LSFGVK_MULTIPLIER".into(), m.into())]
+            vec![
+                ("LSFGVK_ENV".into(), "1".into()),
+                ("LSFGVK_DLL_PATH".into(), "/s/Lossless Scaling/lsfg-vk.dll".into()),
+                ("LSFGVK_MULTIPLIER".into(), m.into()),
+            ]
         };
         let on = launch_options("PROTON_LOG=1 %command% -x", &lsfg("2"));
         assert_eq!(on, "LSFGVK_ENV=\"1\" LSFGVK_DLL_PATH=\"/s/Lossless Scaling/lsfg-vk.dll\" LSFGVK_MULTIPLIER=\"2\" PROTON_LOG=1 %command% -x");
@@ -568,7 +575,11 @@ mod tests {
     #[test]
     fn a_hand_added_entry_is_reused() {
         let exe = Path::new("/g/fefw.exe");
-        let mine = vec![(b"appid".to_vec(), Node::Int(123)), (b"appname".to_vec(), Node::Str(b"FE".to_vec())), (b"Exe".to_vec(), Node::Str(b"\"/g/fefw.exe\"".to_vec()))];
+        let mine = vec![
+            (b"appid".to_vec(), Node::Int(123)),
+            (b"appname".to_vec(), Node::Str(b"FE".to_vec())),
+            (b"Exe".to_vec(), Node::Str(b"\"/g/fefw.exe\"".to_vec())),
+        ];
         let mut top = vec![(b"shortcuts".to_vec(), Node::Map(vec![(b"0".to_vec(), Node::Map(mine))]))];
         assert!(upsert(&mut top, exe, Path::new("/g"), &none()).unwrap());
         let Some(Node::Map(l)) = get(&top, "shortcuts") else { panic!() };

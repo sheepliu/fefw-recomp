@@ -65,7 +65,7 @@ fn parse(f: &mut File) -> Result<Nup, String> {
     if u32_at(&sb, 0x4C)? != 0 {
         return Err("This .nup uses features this launcher does not know.".into());
     }
-    if file_size != real_size || toc_offset.checked_add(toc_size).map_or(true, |e| e > real_size) || toc_size > (1 << 30) {
+    if file_size != real_size || toc_offset.checked_add(toc_size).is_none_or(|e| e > real_size) || toc_size > (1 << 30) {
         return Err("The .nup file is damaged or incomplete (size mismatch).".into());
     }
     let mut uuid = [0u8; 16];
@@ -105,7 +105,11 @@ fn parse(f: &mut File) -> Result<Nup, String> {
     }
     let mut dirs = Vec::with_capacity(dir_count);
     for _ in 0..dir_count {
-        dirs.push(Dir { name: name_at(u32_at(&toc, pos)?, u32_at(&toc, pos + 4)?)?, first_child: u32_at(&toc, pos + 8)?, child_count: u32_at(&toc, pos + 0xC)? });
+        dirs.push(Dir {
+            name: name_at(u32_at(&toc, pos)?, u32_at(&toc, pos + 4)?)?,
+            first_child: u32_at(&toc, pos + 8)?,
+            child_count: u32_at(&toc, pos + 0xC)?,
+        });
         pos += 0x18;
     }
     let mut files = Vec::with_capacity(file_count);
@@ -119,7 +123,7 @@ fn parse(f: &mut File) -> Result<Nup, String> {
         });
         pos += 0x50;
     }
-    if pool_off < pos || (pool_off - pos) % 4 != 0 {
+    if pool_off < pos || !(pool_off - pos).is_multiple_of(4) {
         return Err("The .nup table of contents is invalid.".into());
     }
     let children = (0..(pool_off - pos) / 4).map(|i| u32_at(&toc, pos + i * 4)).collect::<Result<Vec<_>, _>>()?;
@@ -184,7 +188,7 @@ impl Extractor<'_> {
         (self.progress)(self.done, self.total, &f.name);
         let mut out = BufWriter::with_capacity(1 << 20, File::create(dest).map_err(|e| format!("cannot write {}: {}", dest.display(), e))?);
         if f.size > 0 {
-            if f.extent_offset.checked_add(f.extent_size).map_or(true, |e| e > self.nup.file_size) {
+            if f.extent_offset.checked_add(f.extent_size).is_none_or(|e| e > self.nup.file_size) {
                 return Err(format!("{} points outside the .nup file.", f.name));
             }
             self.src.seek(SeekFrom::Start(f.extent_offset)).map_err(|e| e.to_string())?;

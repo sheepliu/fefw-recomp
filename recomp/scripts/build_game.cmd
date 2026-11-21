@@ -24,6 +24,7 @@ if not defined NX_JOBS set "NX_JOBS=20"
 if not defined SCCACHE_DIR set "SCCACHE_DIR=%ROOT%\work\build\sccache"
 if not defined SCCACHE_SERVER_PORT set "SCCACHE_SERVER_PORT=24339"
 if not defined SCCACHE_CACHE_SIZE set "SCCACHE_CACHE_SIZE=20G"
+rem Configure on every build; prevent timestamp regeneration loops and quote Ninja object paths through response files.
 if defined NX_EXEFS if not defined NX_GEN (
     echo NX_GEN must be set when NX_EXEFS stages a separate input
     exit /b 2
@@ -34,9 +35,10 @@ if defined NX_EXEFS (
         echo NX_SITES must be set when NX_EXEFS stages a separate input
         exit /b 2
     )
-    call "%HERE%nx_env.cmd" cmake -S "%HERE%..\games\%GAME%" -B "%NX_BUILD%" -G Ninja -DCMAKE_TOOLCHAIN_FILE="%HERE%..\cmake\clang-cl.cmake" -DCMAKE_BUILD_TYPE=Release -DNX_ROOT="%ROOT%" -DFEFW_EXEFS="%NX_EXEFS%" -DFEFW_GEN="%NX_GEN%" -DFEFW_SITES="%NX_SITES%"
+    set "FEFW_SITES=%NX_SITES%"
+    call "%HERE%nx_env.cmd" cmake -S "%HERE%..\games\%GAME%" -B "%NX_BUILD%" -G Ninja -DCMAKE_TOOLCHAIN_FILE="%HERE%..\cmake\clang-cl.cmake" -DCMAKE_BUILD_TYPE=Release -DNX_ROOT="%ROOT%" -DCMAKE_SUPPRESS_REGENERATION=ON -DCMAKE_NINJA_FORCE_RESPONSE_FILE=ON -DFEFW_EXEFS="%NX_EXEFS%" -DFEFW_GEN="%NX_GEN%" -DFEFW_SITES="%NX_SITES%"
 ) else (
-    call "%HERE%nx_env.cmd" cmake -S "%HERE%..\games\%GAME%" -B "%NX_BUILD%" -G Ninja -DCMAKE_TOOLCHAIN_FILE="%HERE%..\cmake\clang-cl.cmake" -DCMAKE_BUILD_TYPE=Release -DNX_ROOT="%ROOT%"
+    call "%HERE%nx_env.cmd" cmake -S "%HERE%..\games\%GAME%" -B "%NX_BUILD%" -G Ninja -DCMAKE_TOOLCHAIN_FILE="%HERE%..\cmake\clang-cl.cmake" -DCMAKE_BUILD_TYPE=Release -DNX_ROOT="%ROOT%" -DCMAKE_SUPPRESS_REGENERATION=ON -DCMAKE_NINJA_FORCE_RESPONSE_FILE=ON
 )
 if errorlevel 1 exit /b 1
 call "%HERE%nx_env.cmd" cmake --build "%NX_BUILD%" --target %GAME%_modules -- -j %NX_JOBS%%ARGS%

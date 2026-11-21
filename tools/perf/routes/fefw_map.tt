@@ -1,0 +1,49 @@
+# Perf route for Fortune's Weave: boot -> Continue -> save slot 000 -> the saved battle map, then two measured scenes.
+# Runs unattended with [test] script = <this file> (tools/perf/ab_run.ps1 sets it); the run ends itself at @pass.
+# docs/PERF_ROUTES.md: what each step is for and how to adapt the menu presses to your save.
+#
+# Waits are host time (@sleep), not frames: the same route then covers the same game time at any frame rate, and a slower load
+# only eats into the margin. A @shot after each menu step shows in <[test] shot_dir> whether the press landed where it should.
+
+@timeout 0
+
+# --- the front end ---------------------------------------------------------------------------------------------------------
+@sleep 15000
+@shot 01_title
+press A
+@sleep 4000
+@shot 02_menu
+# Continue (the first entry of the title menu)
+press A
+@sleep 3000
+@shot 03_slots
+# save slot 000, then confirm the load
+press A
+@sleep 3000
+press A
+
+# --- into the map: let the load, the texture streaming and the background shader work settle ----------------------------
+@sleep 30000
+@shot 04_map
+
+# --- scene 1: the map standing still (render thread and GPU cost of the scene itself) -----------------------------------
+@log SCENE start map_still
+@sleep 20000
+@log SCENE end map_still
+
+# --- scene 2: the cursor panning the camera around (camera turns, streaming, culling) -----------------------------------
+@log SCENE start map_pan
+stick left 1 0
+@sleep 2500
+stick left 0 1
+@sleep 2500
+stick left -1 0
+@sleep 2500
+stick left 0 -1
+@sleep 2500
+stick left 0 0
+@sleep 1000
+@log SCENE end map_pan
+
+@shot 05_end
+@pass

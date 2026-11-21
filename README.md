@@ -17,10 +17,16 @@ software and draws with Vulkan. It is not an emulator.
 - Runs natively on Windows, with no emulator in between
 - 60 or 120 FPS modes, any output resolution, render scale and a temporal upscaler
 - Ultrawide (21:9, 32:9 or any wider shape): a wider view with the menus and HUD kept at 16:9 in the centre
+- DLSS, FSR 3 and XeSS upscaling, and DLSS or FSR 3 frame generation (the vendors' files are downloaded on request)
+- HDR output, with the menus and HUD brightness set apart from the 3D scene
 - Windowed, borderless or fullscreen
-- Keyboard or any controller, with matching button prompts
+- Keyboard, mouse or any controller, with matching button prompts
+- HD Rumble on DualSense and Pro Controller (cable or Bluetooth), and all four motors on Xbox controllers
+- The game in all its languages, and your own dumped DLC
+- RomFS mods, exefs code patches and DLL code mods
 - An in-game settings overlay (**F1**)
 - A launcher that sets everything up from your dump, with nothing else to install
+- Linux and Steam Deck through Proton, with LSFG-VK frame generation
 
 ## Requirements
 
@@ -49,6 +55,10 @@ Download `fefw-recomp-<version>-linux-x64.tar.gz` instead, extract it and run `f
 game runs through Proton: Play needs Steam with a Proton installed, [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher) (`umu-run`) or Wine, or
 press **Add to Steam** on the Play page and start it from Steam (also in the Steam Deck's Game Mode). After an update, run Set up in
 the launcher (Desktop Mode on a Deck) before playing from Steam.
+
+FSR 3 frame generation does not work through Proton, so the Linux launcher offers [LSFG-VK](https://lsfg-vk.dev) instead (it needs
+Lossless Scaling on Steam). **Settings > Frame rate** can install the layer, and shows its multiplier, flow scale and performance
+mode once it is found.
 
 ### Settings
 
@@ -261,6 +271,13 @@ See [docs/BUILDING.md](docs/BUILDING.md). Contributions are welcome.
 
 This project stands on the work of others. Thank you.
 
+- [Goldoire](https://github.com/Goldoire), who created fefw-recomp and made every release up to 0.2.0.
+- The forks whose work has been ported here: [xinthefreefallxai/ObeliskChamber](https://github.com/xinthefreefallxai/ObeliskChamber)
+  (fixes, performance and frame pacing changes), [stephenjayakar/fefw-recomp](https://github.com/stephenjayakar/fefw-recomp) (Stephen
+  Jayakar: the recompiler, stutter and PGO performance work) and [Kompas9/fefw-recomp](https://github.com/Kompas9/fefw-recomp) (Paulius:
+  the alpha test shader variant, shader preparation at Set up, the tutorial pager's D-pad prompts and quieter logs).
+- Everyone who has sent changes to this repository, among them moistman7, Paulius, Stellarznith, Abubakar-ux, ranbinrang-rgb, itaskaev2
+  and Ruben Ripalda.
 - [nxrecomp](https://github.com/drakolordx7/nxrecomp) by drakolordx7: the recompiler this is built on.
 - [pokopia-recomp](https://github.com/drakolordx7/pokopia-recomp) (drakolordx7) and [featureJosh/pokopia-recomp](https://github.com/featureJosh/pokopia-recomp)
   (featureJosh): the runtime, tools and launcher this project started from (GPL-3.0).
@@ -269,6 +286,8 @@ This project stands on the work of others. Thank you.
   several hardware facts (notices in `runtime/THIRD_PARTY_NOTICES.md`).
 - [Kompas9's Switch-Game-Patches](https://github.com/Kompas9/Switch-Game-Patches) (MIT): the Fortune's Weave ultrawide patch, whose sites and
   findings `[fefw] ultrawide` re-implements as runtime hooks.
+- [Fortune's Eden](https://github.com/TheSneakyBadger/FEFW-Stable-with-60-FPS-Patch) by TheSneakyBadger (GPL-3.0-or-later), whose map
+  started from Jbuck7's 60 FPS cheat: the per-frame sites and scaling rule `[fefw] frame_fixes` re-implements as runtime hooks.
 - [Ryujinx / Ryubing](https://git.ryujinx.app/ryubing/ryujinx) (MIT): the shader translator and tiling code; [Mesa](https://gitlab.freedesktop.org/mesa/mesa) NAK (MIT).
 - SuperMarioWonderRecomp (MIT); smo-recomp, ScarletNX and ssbu-recomp (GPL-3.0); [yuzu and Eden](https://git.eden-emu.dev/eden-emu/eden)
   (GPL); libnx (ISC); LLVM libc++abi (Apache-2.0 with LLVM exceptions).

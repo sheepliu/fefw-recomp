@@ -109,7 +109,7 @@ input[type="checkbox"] { accent-color: var(--color-accent); width: 16px; height:
 /* "Next start": the game reads the setting only when it starts */
 .chip.restart { padding: 0 var(--space-2); font-size: var(--font-size-xs); gap: var(--space-1); color: var(--color-text-faint); }
 .chip.restart svg, .chip.restart [data-lucide] { width: 11px; height: 11px; }
-.field .hint .status-warn { color: var(--color-danger); font-weight: 700; }
+.field .hint .status-note { font-style: italic; }
 .unit { color: var(--color-text-dim); }
 
 .chip {
@@ -178,6 +178,7 @@ progress::-webkit-progress-value { background: var(--color-accent); }
 .steps li.done { color: var(--color-ok); }
 .steps li.running { color: var(--color-warn); font-weight: var(--font-weight-medium); }
 .steps li svg { width: 16px; height: 16px; flex: none; }
+.steps li .step-detail { color: var(--color-warn); font-size: 0.9em; }
 .logbox { background: var(--color-surface-sunken); border: 1px solid var(--color-border); border-radius: var(--radius-sm);
   font-family: var(--font-mono); font-size: var(--font-size-xs); line-height: 1.45; height: 220px; overflow: auto;
   padding: var(--space-2) var(--space-3); white-space: pre-wrap; word-break: break-all; color: var(--color-text-dim); }

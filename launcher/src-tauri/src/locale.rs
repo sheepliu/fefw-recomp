@@ -84,12 +84,7 @@ fn read_pack(path: &std::path::Path) -> Result<LocalePack, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let text = text.trim_start_matches('\u{feff}');
     let root: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
-    let code = root
-        .get("code")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| stem.clone())
-        .ok_or("no code")?;
+    let code = root.get("code").and_then(|v| v.as_str()).map(|s| s.to_string()).or_else(|| stem.clone()).ok_or("no code")?;
     // The file name is the code `read_locale` looks the pack up by, so the two have to agree.
     if let Some(stem) = stem.as_deref() {
         if !code.eq_ignore_ascii_case(stem) {

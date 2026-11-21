@@ -1,0 +1,38 @@
+# Marks issues labelled `waiting-for-response` as stale after 7 days of inactivity,
+# then closes them as not planned 3 days later. Pull requests are never touched.
+name: Stale
+
+on:
+  schedule:
+    - cron: "30 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: stale
+  cancel-in-progress: false
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v11
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          only-issue-labels: waiting-for-response
+          days-before-issue-stale: 7
+          days-before-issue-close: 3
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+          stale-issue-label: stale
+          stale-issue-message: >-
+            This issue has been marked as stale because it has been waiting for a response for 7 days.
+            Please reply if it is still relevant, or it will be closed in 3 days.
+          close-issue-message: >-
+            This issue was closed because it remained inactive for 3 days after being marked as stale.
+            Feel free to comment or open a new issue if you have more details to share.
+          remove-issue-stale-when-updated: true
+          close-issue-reason: not_planned

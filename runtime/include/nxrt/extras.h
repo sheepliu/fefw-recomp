@@ -13,6 +13,7 @@
 //             camera matrices and the game's own projection jitter (src/gfx/extras/temporal.h, docs/S14.md). XeSS through libxess.dll (temporal_xess.cpp).
 //   Latency   NVIDIA Reflex (VK_NV_low_latency2) and AMD Anti-Lag 2 (VK_AMD_anti_lag) markers and sleeps around input sampling.
 #pragma once
+#include <cctype>
 #include <cstdint>
 #include <string>
 
@@ -31,6 +32,24 @@ struct HdrSettings {
     double paper_white_nits = 0;     // 0 = Windows' SDR content brightness when HDR is on there (203 otherwise), else 80..500
     double highlight_boost = 1.0;    // 0 = the game's SDR look up to its own white, 1 = highlights reach the peak (0 .. 2)
     double ui_nits = 0;              // 0 = the UI's white is paper white (as before), else 40..500: the UI's own white; the 3D scene keeps paper white
+    double sdr_gamma = 2.2;          // HDR output: the power the game's SDR range is shown with, like a TV (0 = the sRGB curve, else 1.8..2.6)
+    // scene grading before the tone map (GT tone map only: Fire Emblem Fortune's Weave); neutral = 0, 1, 1, 1, 1 and 0
+    double grade_exposure = 0;       // stops (-2 .. 2)
+    double grade_contrast = 1;       // power of luminance around mid grey (0.5 .. 1.5)
+    double grade_shadows = 1;        // below mid grey: > 1 lifts, < 1 deepens (0.5 .. 1.5)
+    double grade_highlights = 1;     // above mid grey: > 1 brighter, < 1 dimmer (0.5 .. 1.5)
+    double grade_saturation = 1;     // scene saturation (0 .. 2)
+    double hue_preserve = 0;         // 0 = the game's per-channel tone curve, 1 = the curve on luminance, scene hues kept (0 .. 1; GT tone map, HDR)
+    double highlight_saturation = 0; // 0 = the game's highlights (they whiten), 1 = highlights keep the scene's colour (0 .. 1)
+    bool compare = false;            // split screen for testing: the left half as the game draws it, the right half with grading, highlight saturation and sharpen
+    double sharpen = 1.0;            // the game's sharpening strength, SDR and HDR (0 = none, 1 = the game's, up to 3); Fire Emblem Fortune's Weave
+    double motion_blur = 1.0;        // the game's motion blur strength (0 = none, 1 = the game's, up to 2); Fire Emblem Fortune's Weave
+    double depth_of_field = 1.0;     // the game's depth-of-field blur strength (0 = none, 1 = the game's, up to 2); Fire Emblem Fortune's Weave
+    double vignette = 1.0;           // the game's vignette strength where a scene has one (0 = none, 1 = the game's, up to 2); Fire Emblem Fortune's Weave
+    double bloom = 1.0;              // the game's bloom strength, SDR and HDR (0 = none, 1 = the game's, up to 4); Fire Emblem Fortune's Weave
+    bool wide_gamut = false;         // keep the game's BT.2020 scene colours outside BT.709 (the tone map clips them); restart to apply
+    bool dither = false;             // add +-1 code value of fine noise to the output to hide steps in smooth gradients (off by default)
+    double gamut_expand = 0;         // HDR output: 0 = the game's own BT.709 colours (as on the console), up to 1 = saturated colours toward DCI-P3
 };
 
 // Nis: NVIDIA Image Scaling v1.0.3 (spatial, any GPU). Fsr3, Dlss, Dlaa, Xess: temporal (Dlaa = DLSS at the input size).
@@ -98,6 +117,27 @@ void set_settings(const Settings& s);
 // Lock-free reads of the live upscale fields (the render thread asks every frame).
 UpscaleMode upscale_mode();
 float upscale_sharpness();
+// The DLSS model ([dlss] preset): 0 = default, else Streamline's DLSSPreset number (J 10, K 11, L 12, M 13). Read from the config at the first call;
+// the F1 menu changes it live (set_dlss_preset) and the DLSS backend sets its options again when it differs from the one in use.
+int dlss_preset();
+void set_dlss_preset(int preset);
+inline int dlss_preset_from_word(std::string w) {   // "default", "j" .. "m" ("preset_m" too); -1 when unknown
+    for (char& c : w) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (w.rfind("preset", 0) == 0) w.erase(0, 6);
+    while (!w.empty() && (w[0] == ' ' || w[0] == '_')) w.erase(0, 1);
+    if (w.empty() || w == "default") return 0;
+    if (w.size() == 1 && w[0] >= 'j' && w[0] <= 'm') return w[0] - 'a' + 1;
+    return -1;
+}
+inline const char* dlss_preset_word(int preset) {
+    switch (preset) {
+        case 10: return "j";
+        case 11: return "k";
+        case 12: return "l";
+        case 13: return "m";
+        default: return "default";
+    }
+}
 int upscale_scene_scale();          // percent, 100 = off (a temporal mode with a quality preset other than Custom: the preset's percent)
 UpscaleQuality upscale_quality();
 bool upscale_temporal();            // the mode is FSR 3, DLSS, DLAA or XeSS

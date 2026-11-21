@@ -1156,16 +1156,32 @@ std::string hex16(uint64_t h) {
 }
 }  // namespace
 
-// The state file next to the program list: which GPU and driver the preparation ran on and whether it finished. The key changes with the
-// GPU, the driver version, the pipeline cache UUID (a driver update changes it) and the version of the part scheme in this file.
-constexpr int kPrepareScheme = 1;
-std::string prepare_key(uint64_t programs) {
+// The state file next to the program list: which GPU and driver the preparation ran on, which program list it covered, and whether it
+// finished. The key changes with the GPU, the driver version, the pipeline cache UUID (a driver update changes it), the version of the part
+// scheme in this file, and the content of the program list. The count alone is not enough: an update can replace shaders while keeping the
+// same number of programs.
+constexpr int kPrepareScheme = 2;
+uint64_t programs_digest(const std::vector<ProgHashes>& progs) {
+    uint64_t h = 1469598103934665603ull;
+    for (const ProgHashes& p : progs) {
+        for (uint64_t v : {p.vs, p.fs, p.gs}) {
+            for (int i = 0; i < 8; ++i) {
+                h ^= (v >> (8 * i)) & 0xffu;
+                h *= 1099511628211ull;
+            }
+        }
+    }
+    return h;
+}
+
+std::string prepare_key(uint64_t programs, uint64_t digest) {
     const VkPhysicalDeviceProperties& p = device().properties();
     char uuid[40];
     for (int i = 0; i < 16; ++i) std::snprintf(uuid + 2 * i, 3, "%02x", p.pipelineCacheUUID[i]);
     char b[512];
-    std::snprintf(b, sizeof b, "scheme=%d programs=%llu gpu=%s driver=%u api=%u cache=%s salt=%s", kPrepareScheme, static_cast<unsigned long long>(programs),
-                  p.deviceName, p.driverVersion, p.apiVersion, uuid, config_get_str("nvn", "spirv_salt", "").c_str());
+    std::snprintf(b, sizeof b, "scheme=%d programs=%llu digest=%016llx gpu=%s driver=%u api=%u cache=%s salt=%s", kPrepareScheme,
+                  static_cast<unsigned long long>(programs), static_cast<unsigned long long>(digest), p.deviceName, p.driverVersion, p.apiVersion, uuid,
+                  config_get_str("nvn", "spirv_salt", "").c_str());
     return b;
 }
 
@@ -1186,8 +1202,9 @@ void write_prepare_state(const std::string& path, const std::string& key, const 
     std::ofstream f(path, std::ios::trunc);
     if (!f) return;
     const char nl = 10;
+    const bool complete = !r.cancelled && r.failed == 0;   // missing shaders are not a failed preparation; the list cannot supply them
     f << "key: " << key << nl << "programs: " << r.programs << nl << "prepared: " << r.prepared << nl << "missing: " << r.missing_shaders << nl
-      << "failed: " << r.failed << nl << "seconds: " << r.seconds << nl << "complete: " << (r.cancelled ? 0 : 1) << nl;
+      << "failed: " << r.failed << nl << "seconds: " << r.seconds << nl << "complete: " << (complete ? 1 : 0) << nl;
 }
 
 bool gpl_prepare(const PrepareOptions& o, PrepareResult* res) {
@@ -1202,7 +1219,7 @@ bool gpl_prepare(const PrepareOptions& o, PrepareResult* res) {
     if (!read_programs_file(file, &progs, &r.error)) return false;
     r.programs = progs.size();
     const std::string state_path = (std::filesystem::path(file).parent_path() / "prepare.state").string();
-    const std::string key = prepare_key(r.programs);
+    const std::string key = prepare_key(r.programs, programs_digest(progs));
     if (o.only_if_needed && !o.force && prepare_state_ready(state_path, key)) {
         r.already_ready = true;
         return true;
@@ -1299,8 +1316,9 @@ bool gpl_prepare(const PrepareOptions& o, PrepareResult* res) {
     r.prepared = prepared.load(); r.missing_shaders = missing.load(); r.failed = failed.load(); r.parts = parts.load();
     r.cancelled = cancel.load();
     r.seconds = ms_since(t0) / 1000.0;
-    if (!r.cancelled && r.failed == 0) write_prepare_state(state_path, key, r);
-    else if (r.cancelled) write_prepare_state(state_path, key, r);
+    // Always replace the stamp, including after a failed or incomplete run: leaving an older complete stamp would make the next
+    // --if-needed run skip work that this run did not finish.
+    write_prepare_state(state_path, key, r);
     return true;
 }
 

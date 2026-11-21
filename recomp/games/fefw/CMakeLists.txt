@@ -21,7 +21,20 @@ if(DEFINED NX_ROOT)
     set(FEFW_ROOT "${FEFW_ROOT}" CACHE PATH "repository root (game/, work/)" FORCE)
 endif()
 set(FEFW_EXEFS "${FEFW_ROOT}/game/dump/exefs" CACHE PATH "folder with the NSOs main (uncompressed), sdk, subsdk0-2, rtld")
-set(FEFW_GEN "${FEFW_ROOT}/work/lift/fefw" CACHE PATH "where the generated sources go")
+# A '&' in the checkout path broke the static-library command CMake generates for lifted code whose sources live outside the build
+# folder: the object path is absolute, and cmd.exe split it at the '&' (EmblemWeave issue 38). Keep the generated sources under the
+# build folder in that case, where CMake writes the object paths relative to it; a normal checkout keeps work/lift so a build can be reused.
+set(FEFW_GEN_DEFAULT "${FEFW_ROOT}/work/lift/fefw")
+if(FEFW_ROOT MATCHES "[&]")
+    set(FEFW_GEN_DEFAULT "${CMAKE_BINARY_DIR}/gen")
+    message(STATUS "checkout path contains '&': generated sources go to ${FEFW_GEN_DEFAULT}")
+endif()
+set(FEFW_GEN "${FEFW_GEN_DEFAULT}" CACHE PATH "where the generated sources go")
+# A build folder made before the rule above still points at work/lift. Move only that default: an explicit -DFEFW_GEN stays.
+if(FEFW_ROOT MATCHES "[&]" AND FEFW_GEN STREQUAL "${FEFW_ROOT}/work/lift/fefw")
+    set(FEFW_GEN "${CMAKE_BINARY_DIR}/gen" CACHE PATH "where the generated sources go" FORCE)
+    message(STATUS "checkout path contains '&': moved generated sources to ${FEFW_GEN}")
+endif()
 # translation units per module: about 45k instruction words each (docs/S1b.md)
 set(FEFW_SHARDS_MAIN 153 CACHE STRING "translation units of main (6.89 M instruction words)")
 set(FEFW_SHARDS_SDK 50 CACHE STRING "translation units of sdk (2.23 M)")
@@ -29,6 +42,10 @@ set(FEFW_SHARDS_SUBSDK0 5 CACHE STRING "translation units of subsdk0, dlss (233 
 set(FEFW_SHARDS_SUBSDK1 14 CACHE STRING "translation units of subsdk1, cuda (620 k)")
 set(FEFW_SHARDS_SUBSDK2 3 CACHE STRING "translation units of subsdk2, movie (136 k)")
 set(FEFW_SITES "${CMAKE_CURRENT_LIST_DIR}/main.sites" CACHE FILEPATH "hook sites of main for this build")
+# the launcher's Set up passes main.sites plus the installed mods' exefs/*.sites (launcher/src-tauri/src/setup.rs lift_sites_file)
+if(NOT "$ENV{FEFW_SITES}" STREQUAL "")
+  set(FEFW_SITES "$ENV{FEFW_SITES}")  # this run only: a later build without it lifts with main.sites again
+endif()
 # a copy beside the libraries: the game build puts it next to fefw.exe as fefw.sites, the list the runtime checks
 # hooks and mods' sites against (runtime/src/services/mods_dll.cpp)
 configure_file("${FEFW_SITES}" "${CMAKE_BINARY_DIR}/main.sites" COPYONLY)
@@ -61,9 +78,22 @@ add_custom_target(fefw_modules DEPENDS ${FEFW_MODULES})
 # FMA3 code generation: the lifted FMADD / FMLA family is std::fma, which without it is a call into the CRT's fmaf (16 % of the game's
 # job workers in Dagsion, notes/pacing.md). A fused result is exactly rounded either way; -ffp-contract=off still keeps separate
 # multiplies and adds apart. Needs an x64 CPU with FMA3 (2013 on).
-foreach(t ${FEFW_MODULES})
-    target_compile_options(${t} PRIVATE -mfma)
-endforeach()
+#
+# The compat variant (game-build/release/fefw_build.py CPU_VARIANTS): the launcher names the one this processor runs in FEFW_CPU_VARIANT
+# (launcher/src-tauri/src/cpu.rs), so a Sandy Bridge, Ivy Bridge or Xeon E5 v1/v2 gets lifted code without FMA3 and does not die on an
+# illegal instruction. Without -mfma, std::fma stays a correctly rounded library call. Switching variant recompiles every module.
+set(FEFW_CPU_VARIANT "fma" CACHE STRING "processor target of the lifted code: fma (FMA3 + AVX) or compat (SSE4.2 + POPCNT)")
+if(DEFINED ENV{FEFW_CPU_VARIANT} AND NOT "$ENV{FEFW_CPU_VARIANT}" STREQUAL "")
+    set(FEFW_CPU_VARIANT "$ENV{FEFW_CPU_VARIANT}" CACHE STRING "processor target of the lifted code" FORCE)
+endif()
+if(FEFW_CPU_VARIANT STREQUAL "compat")
+    message(STATUS "lifted code: compat build (SSE4.2 + POPCNT, no FMA3)")
+else()
+    message(STATUS "lifted code: fma build (FMA3 + AVX)")
+    foreach(t ${FEFW_MODULES})
+        target_compile_options(${t} PRIVATE -mfma)
+    endforeach()
+endif()
 # Indirect calls look the target up at the call site in the runtime's flat table (nxrecomp/cxx.h, runtime core/dispatch.cpp).
 foreach(t ${FEFW_MODULES})
     target_compile_definitions(${t} PRIVATE NX_INLINE_INDIRECT)
