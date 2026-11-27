@@ -16,6 +16,7 @@
 
 #include "nxrt/config.h"
 #include "nxrt/frame_limiter.h"
+#include "nxrt/gauge.h"
 #include "nxrt/gfx.h"
 #include "nxrt/log.h"
 #include "nxrt/platform.h"
@@ -168,7 +169,11 @@ void open_frame(State& s) {
     sl::FrameToken* t = nullptr;
     if (s.f.token(t, &s.index) != sl::Result::eOk || !t) return;
     const uint64_t t0 = FrameLimiter::now_ns();
-    s.f.reflex_sleep(*t);
+    {
+        // Reflex sleep paces the frame when DLSS-G is active; count it as limiter time so it is not billed to render thread work.
+        nxrt::HitchTimer ht(nxrt::kHpRenderLimiter);
+        s.f.reflex_sleep(*t);
+    }
     g_sleep_ns.store(FrameLimiter::now_ns() - t0, std::memory_order_relaxed);
     s.f.marker(sl::PCLMarker::eSimulationStart, *t);
     s.f.marker(sl::PCLMarker::eSimulationEnd, *t);
@@ -645,14 +650,16 @@ void framegen_present_end() {
         } else if (now - s.t0 >= 2000000000ull) {
             const double sec = static_cast<double>(now - s.t0) * 1e-9;
             const uint64_t c = ffx_fg_present_count();
+            // Swapchain recreation resets FFX's present counter; avoid unsigned underflow.
+            const uint64_t shown = c >= s.ffx_count0 ? c - s.ffx_count0 : c;
             NXLOG_I(kTag, "FSR 3: %.1f game fps, %.1f shown fps (swapchain presents), generation on %u of %u frames%s", s.n_game / sec,
-                    static_cast<double>(c - s.ffx_count0) / sec, s.n_on, s.n_game,
+                    static_cast<double>(shown) / sec, s.n_on, s.n_game,
                     s.n_extra_inputs ? ", some frames had more than one DLSS evaluation" : "");
-            set_shown_ratio(s.n_game, static_cast<double>(c - s.ffx_count0), s.n_on);
-            s.win_shown = static_cast<uint32_t>(c - s.ffx_count0);
+            set_shown_ratio(s.n_game, static_cast<double>(shown), s.n_on);
+            s.win_shown = static_cast<uint32_t>(shown);
             s.win_game = s.n_game;
             s.win_game_fps = s.n_game / sec;
-            s.win_shown_fps = static_cast<double>(c - s.ffx_count0) / sec;
+            s.win_shown_fps = static_cast<double>(shown) / sec;
             s.win_measured = s.n_game > 0;
             publish_status(s);
             s.t0 = now;

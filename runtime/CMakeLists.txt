@@ -31,6 +31,74 @@ endif()
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     add_compile_options(/W3 -Wno-unused-parameter -Wno-missing-field-initializers -Wno-cast-function-type-mismatch
                         -Wno-cast-function-type-strict -Wno-language-extension-token)
+    # CMPXCHG16B. MSVC's <atomic> gives all its functions target("cx16") under clang on x64: without the flag clang may not inline
+    # them into code that lacks it, and every std::atomic load, store or add becomes a call ("conflicting target features"). Both
+    # builds of the game code need the instruction anyway.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
+        add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-mcx16>)
+    endif()
+endif()
+# ThinLTO: the C and C++ objects are LLVM bitcode, and lld-link optimises across source files at the link. On by default for Release
+# builds with clang and lld-link; the configure says which it is.
+set(_nxrt_lto_default OFF)
+if(CMAKE_BUILD_TYPE STREQUAL "Release" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_LINKER MATCHES "lld-link")
+    set(_nxrt_lto_default ON)
+endif()
+option(NXRT_LTO "Build the runtime with ThinLTO (needs clang-cl and lld-link)" ${_nxrt_lto_default})
+if(NXRT_LTO)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR NOT CMAKE_LINKER MATCHES "lld-link")
+        message(FATAL_ERROR "NXRT_LTO needs clang-cl and lld-link (compiler ${CMAKE_CXX_COMPILER_ID}, linker ${CMAKE_LINKER})")
+    endif()
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-flto=thin>)
+endif()
+message(STATUS "nxrt: ThinLTO ${NXRT_LTO} (linker ${CMAKE_LINKER})")
+# Profile-guided builds of the runtime (docs/PGO.md). Release builds with clang 23 or newer use the committed profile,
+# pgo/fefw_rt.profdata; a function whose source changed since it was recorded is built without it. NXRT_PGO_PROFILE names
+# another profile, or "off" none. NXRT_PGO_GENERATE builds the instrumented runtime that records a new one (a scripted test run
+# writes the counters when it ends: games/fefw/fefw_play.cpp).
+option(NXRT_PGO_GENERATE "Instrumented runtime that records an LLVM profile (never for a release)" OFF)
+set(NXRT_PGO_PROFILE "auto" CACHE STRING "LLVM profile of the runtime: auto (pgo/fefw_rt.profdata), off, or a .profdata file")
+set(NXRT_PGO_RUNTIME_DIR "" CACHE PATH "Folder of clang_rt.profile.lib for NXRT_PGO_GENERATE, where the linker does not find it itself")
+set(_nxrt_pgo "${NXRT_PGO_PROFILE}")
+if(_nxrt_pgo STREQUAL "auto")
+    set(_nxrt_pgo "")
+    if(NOT NXRT_PGO_GENERATE AND CMAKE_BUILD_TYPE STREQUAL "Release" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang"
+       AND NOT CMAKE_CXX_COMPILER_VERSION VERSION_LESS 23 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/pgo/fefw_rt.profdata")
+        set(_nxrt_pgo "${CMAKE_CURRENT_SOURCE_DIR}/pgo/fefw_rt.profdata")
+    endif()
+elseif(_nxrt_pgo STREQUAL "off")
+    set(_nxrt_pgo "")
+elseif(_nxrt_pgo)
+    # the compiler runs in the build folder: a relative path is taken from the top-level source folder
+    get_filename_component(_nxrt_pgo "${_nxrt_pgo}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
+endif()
+if((NXRT_PGO_GENERATE OR _nxrt_pgo) AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "NXRT_PGO_GENERATE and NXRT_PGO_PROFILE need clang-cl")
+endif()
+if(NXRT_PGO_GENERATE AND _nxrt_pgo)
+    message(FATAL_ERROR "NXRT_PGO_GENERATE records a profile and NXRT_PGO_PROFILE uses one: set only one of them")
+endif()
+if(NXRT_PGO_GENERATE)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fprofile-instr-generate>)
+    if(NXRT_PGO_RUNTIME_DIR)
+        link_directories("${NXRT_PGO_RUNTIME_DIR}")     # every target made from here on; nxrt hands it to its users too
+    endif()
+    message(WARNING "nxrt: instrumented runtime (NXRT_PGO_GENERATE): for recording a profile only, not for a release")
+elseif(_nxrt_pgo)
+    if(NOT EXISTS "${_nxrt_pgo}")
+        message(FATAL_ERROR "NXRT_PGO_PROFILE: no such file: ${_nxrt_pgo}")
+    endif()
+    # the file's hash in the command line: a new profile under the same name recompiles everything (stale objects would not link
+    # together under ThinLTO), and a change of the file configures again
+    file(MD5 "${_nxrt_pgo}" _nxrt_pgo_id)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_nxrt_pgo}")
+    add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-fprofile-instr-use=${_nxrt_pgo}>"
+                        $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-profile-instr-out-of-date>
+                        $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-profile-instr-unprofiled>)
+    add_compile_definitions($<$<COMPILE_LANGUAGE:C,CXX>:NXRT_PGO_PROFILE_ID_${_nxrt_pgo_id}>)
+    message(STATUS "nxrt: profile ${_nxrt_pgo} (id ${_nxrt_pgo_id})")
+else()
+    message(STATUS "nxrt: no profile")
 endif()
 add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS _WIN32_WINNT=0x0A00)
 
@@ -47,11 +115,39 @@ endif()
 file(GLOB_RECURSE NXRT_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 list(FILTER NXRT_SOURCES EXCLUDE REGEX "/src/gfx/")   # the graphics shell is its own library (cmake/gfx.cmake)
 add_library(nxrt STATIC ${NXRT_SOURCES})
+if(NXRT_PGO_GENERATE AND NXRT_PGO_RUNTIME_DIR)
+    target_link_directories(nxrt PUBLIC "${NXRT_PGO_RUNTIME_DIR}")     # fefw_rt and other targets of an enclosing project
+endif()
 target_include_directories(nxrt PUBLIC include)
 if(EXISTS "${NXRT_RECOMP_INCLUDE}")
     target_include_directories(nxrt PUBLIC "${NXRT_RECOMP_INCLUDE}")
 endif()
-target_link_libraries(nxrt PUBLIC psapi)
+target_link_libraries(nxrt PUBLIC psapi winhttp)
+# Media Foundation (src/media/movie_mf.cpp, Switch 1 movies) is loaded only when a movie asks for it: Windows N editions ship without
+# it, and a load-time import would keep the game from starting there at all (0xC0000135).
+target_link_libraries(nxrt PUBLIC delayimp)
+target_link_options(nxrt PUBLIC /DELAYLOAD:mfplat.dll /DELAYLOAD:mfreadwrite.dll)
+# The release check (include/nxrt/update_check.h): only a build that names its release asks GitHub (game-build/fefw sets these for the
+# release package).
+if(NXRT_RELEASE_VERSION)
+    set(_nxrt_update_defs "NXRT_RELEASE_VERSION=\"${NXRT_RELEASE_VERSION}\"" "NXRT_UPDATE_REPO=\"${NXRT_UPDATE_REPO}\"")
+    if(NXRT_RELEASE_BY_TAG)
+        list(APPEND _nxrt_update_defs NXRT_RELEASE_BY_TAG=1)
+    endif()
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/diag/update_check.cpp" PROPERTIES COMPILE_DEFINITIONS "${_nxrt_update_defs}")
+endif()
+# The known ini keys for config_log_unread (src/diag/config.cpp): regenerated when a source file or CONFIG.md changes.
+set(NXRT_CONFIG_KEYS "${CMAKE_CURRENT_BINARY_DIR}/generated/config_keys.inc")
+file(GLOB_RECURSE NXRT_CONFIG_KEY_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
+     "${CMAKE_CURRENT_SOURCE_DIR}/games/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/../game-build/fefw/src/*.cpp")
+add_custom_command(OUTPUT "${NXRT_CONFIG_KEYS}"
+    COMMAND "${CMAKE_COMMAND}" "-DROOTS=${CMAKE_CURRENT_SOURCE_DIR}/src\;${CMAKE_CURRENT_SOURCE_DIR}/games\;${CMAKE_CURRENT_SOURCE_DIR}/../game-build/fefw/src"
+            "-DDOC=${CMAKE_CURRENT_SOURCE_DIR}/docs/CONFIG.md" "-DOUT=${NXRT_CONFIG_KEYS}" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/config_keys.cmake"
+    DEPENDS ${NXRT_CONFIG_KEY_SOURCES} "${CMAKE_CURRENT_SOURCE_DIR}/docs/CONFIG.md" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/config_keys.cmake"
+    COMMENT "Listing the known ini keys" VERBATIM)
+set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/diag/config.cpp" PROPERTIES OBJECT_DEPENDS "${NXRT_CONFIG_KEYS}")
+target_sources(nxrt PRIVATE "${NXRT_CONFIG_KEYS}")
+target_include_directories(nxrt PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 include(cmake/media_deps.cmake)   # libvpx for the Switch 2 video decoders (optional)
 
 if(NXRT_BUILD_TESTS)
@@ -66,6 +162,14 @@ if(NXRT_BUILD_TESTS)
     target_include_directories(nxrt_tests PRIVATE tests)
     # nxrt calls into the graphics shell (switch2.cpp: HDR metadata, tt_core.cpp: screenshot writes), so the tests link it when it is built
     target_link_libraries(nxrt_tests PRIVATE nxrt $<TARGET_NAME_IF_EXISTS:nxrt_gfx>)
+    # A code mod built against the public header, loaded by tests/test_mod_api.cpp: the mod side of the ABI.
+    add_library(nxrt_test_mod SHARED tests/mods/test_mod.cpp)
+    target_include_directories(nxrt_test_mod PRIVATE include)
+    if(EXISTS "${NXRT_RECOMP_INCLUDE}")
+        target_include_directories(nxrt_test_mod PRIVATE "${NXRT_RECOMP_INCLUDE}")
+    endif()
+    add_dependencies(nxrt_tests nxrt_test_mod)
+    target_compile_definitions(nxrt_tests PRIVATE NXRT_TEST_MOD_PATH="$<TARGET_FILE:nxrt_test_mod>")
     target_compile_definitions(nxrt_tests PRIVATE NXRT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
     # A linker map next to the exe: the crash handler and the watchdog name host code from it. Keep host allocations low
     # (HIGHENTROPYVA:NO) so the guest ranges at 0x71_0000_0000 and up are free; a 64 MiB main stack.

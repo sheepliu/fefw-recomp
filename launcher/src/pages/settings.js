@@ -1,11 +1,11 @@
 import { api, esc, icon, refreshIcons, toast, errText } from '../util.js';
-import { t, getLang, listLangs, setLang } from '../i18n.js';
+import { t } from '../i18n.js';
 import { fileDetail } from '../rusttext.js';
 
 /*
  * Settings schema. Every key is described in runtime/docs/CONFIG.md.
  *   file: "game" (fefw.ini), "controls" (controls.ini, written by the game on its first start) or "config" (the launcher's own options)
- * Types: select, toggle, size, autonum, range (0 to `max`, default 1, shown as a percentage), path, text, number, language. A toggle with `on` / `off` writes those words
+ * Types: select, toggle, size, autonum, range (0 to `max`, default 1, shown as a percentage), path, text, number. A toggle with `on` / `off` writes those words
  * instead of 1 / 0 (`off`, 0, false or no read as off, anything else as on).
  * Text is a key into src/locales: `label` and `hint` are always translated, and an option name that contains a dot is a key
  * too (a plain name such as "720p" or "DLAA" is shown as it is).
@@ -43,7 +43,14 @@ const TABS = [
           { id: 'window_mode', type: 'select', label: 'settings.windowMode.label', sec: 'display', key: 'window_mode', def: 'windowed',
             options: [['windowed', 'settings.windowMode.windowed'], ['borderless', 'settings.windowMode.borderless'], ['exclusive', 'settings.windowMode.exclusive']],
             hint: 'settings.windowMode.hint' },
-          { id: 'size', type: 'size', label: 'settings.windowSize.label', sec: 'display', keys: ['width', 'height'], def: ['1280', '720'] },
+          { id: 'size', type: 'size', label: 'settings.windowSize.label', sec: 'display', keys: ['width', 'height'], def: ['1280', '720'],
+            options: [
+              ['1280x720', '1280 x 720'], ['1600x900', '1600 x 900'], ['1920x1080', '1920 x 1080'],
+              ['2560x1440', '2560 x 1440'], ['3840x2160', '3840 x 2160'],
+              ['2560x1080', 'settings.output.uw2560'], ['3440x1440', 'settings.output.uw3440'], ['5120x1440', 'settings.output.uw5120'],
+            ],
+            hint: 'settings.windowSize.hint',
+            lockedIf: (m) => m.window_mode !== 'windowed' },
         ],
       },
       {
@@ -126,6 +133,9 @@ const TABS = [
           { id: 'astc_bc', type: 'select', label: 'settings.astcBc.label', sec: 'gfx', key: 'astc_bc', def: 'auto',
             options: [['auto', 'settings.astcBc.auto'], ['off', 'settings.astcBc.off'], ['bc1', 'settings.astcBc.bc1']],
             hint: 'settings.astcBc.hint', restart: true },
+          { id: 'gpu', type: 'select', file: 'controls', label: 'settings.gpu.label', sec: 'display', key: 'gpu', def: 'auto',
+            options: [['auto', 'settings.gpu.auto'], ['discrete', 'settings.gpu.discrete'], ['integrated', 'settings.gpu.integrated']],
+            hint: 'settings.gpu.hint', restart: true },
         ],
       },
       {
@@ -196,12 +206,19 @@ const TABS = [
           // [pad] haptic: how the game's HD Rumble value reaches the pad (runtime/gfx/haptic.cpp). The launcher only writes the
           // setting; the game reads it when it starts, so a change lands on the next run.
           { id: 'haptic', type: 'select', label: 'settings.haptic.label', sec: 'pad', key: 'haptic', def: 'auto',
-            options: [['auto', 'settings.haptic.auto'], ['off', 'settings.haptic.off'], ['rumble', 'settings.haptic.rumble'],
-              ['dualsense', 'settings.haptic.dualsense']],
-            hint: 'settings.haptic.hint', restart: true },
+            options: [['auto', 'settings.haptic.auto'], ['off', 'settings.haptic.off'], ['rumble', 'settings.haptic.rumble']],
+            // "dualsense" was a choice of its own that did what automatic does: an older file shows, and saves, as automatic
+            unsupported: ['dualsense', 'haptics'], hint: 'settings.haptic.hint', restart: true },
           // [pad] haptic_strength: 0..100 percent for the haptic backends, or -1 to keep using the rumble strength above.
           { id: 'haptic_strength', type: 'number', label: 'settings.hapticStrength.label', sec: 'pad', key: 'haptic_strength',
             def: '-1', min: -1, max: 100, hint: 'settings.hapticStrength.hint' },
+          // [pad] hd_haptics: a DualSense also gets taps on its speaker.
+          { id: 'hd_haptics', type: 'toggle', label: 'settings.hdHaptics.label', sec: 'pad', key: 'hd_haptics', def: '1',
+            hint: 'settings.hdHaptics.hint', restart: true },
+          // [pad] dualsense_full_volume: a wired DualSense's volume goes to full while playing (Windows: the game; Linux: the
+          // launcher, pad_volume.rs).
+          { id: 'dualsense_full_volume', type: 'toggle', label: 'settings.padVolume.label', sec: 'pad', key: 'dualsense_full_volume',
+            def: '1', hint: 'settings.padVolume.hint', restart: true },
         ],
       },
       {
@@ -219,9 +236,8 @@ const TABS = [
       {
         title: 'settings.sec.general', icon: 'sliders-horizontal', file: 'config',
         fields: [
-          // The launcher's own interface language: kept in launcher.json, applied at once, no file patching involved.
-          { id: 'lang', type: 'language', label: 'settings.lang.label', hint: 'settings.lang.hint' },
           { id: 'minimize_on_play', type: 'toggle', label: 'settings.minimizeOnPlay.label', sec: '', key: 'minimize_on_play', def: '0' },
+          { id: 'send_reports', type: 'toggle', label: 'settings.sendReports.label', sec: '', key: 'send_reports', def: '0', hint: 'settings.sendReports.hint' },
         ],
       },
       {
@@ -291,7 +307,7 @@ export async function render(el, ctx) {
   let lsfgTimer = 0;
   const fieldCtx = { get lsfgReady() { return !!(lsfgSt && lsfgSt.layer && lsfgSt.dll); } };
   const data = await api('read_settings').catch(() => ({ game_dir: '', game: {}, controls: {}, controls_exists: false }));
-  const files = { game: data.game, controls: data.controls, config: { repo_dir: cfg.repo_dir, game_dir: cfg.game_dir, jobs: String(cfg.jobs || 0), minimize_on_play: cfg.minimize_on_play ? '1' : '0', runner: cfg.runner || '',
+  const files = { game: data.game, controls: data.controls, config: { repo_dir: cfg.repo_dir, game_dir: cfg.game_dir, jobs: String(cfg.jobs || 0), minimize_on_play: cfg.minimize_on_play ? '1' : '0', send_reports: cfg.send_reports ? '1' : '0', runner: cfg.runner || '',
     lsfg: cfg.lsfg ? '1' : '0', lsfg_multiplier: String(cfg.lsfg_multiplier || 2), lsfg_flow_scale: cfg.lsfg_flow_scale || '1', lsfg_performance: cfg.lsfg_performance ? '1' : '0' } };
   const exists = { game: true, controls: data.controls_exists, config: true };
   const keyOf = (f, k) => (f.file === 'config' ? k : `${f.sec}.${k}`);
@@ -302,7 +318,7 @@ export async function render(el, ctx) {
   const READ = {
     select: (f) => { const v = get(f, f.key, f.def); return f.unsupported?.includes(v) ? f.def : v; },
     toggle: (f) => (f.off !== undefined ? ![f.off, '0', 'false', 'no'].includes(String(get(f, f.key, f.def)).trim().toLowerCase()) : truthy(get(f, f.key, f.def))),
-    size: (f) => ({ w: get(f, f.keys[0], f.def[0]), h: get(f, f.keys[1], f.def[1]) }),
+    size: (f) => `${parseInt(get(f, f.keys[0], f.def[0]), 10) || f.def[0]}x${parseInt(get(f, f.keys[1], f.def[1]), 10) || f.def[1]}`,
     rate: (f) => (truthy(get(f, f.keys[1], '0')) ? '120' : truthy(get(f, f.keys[0], '0')) ? '60' : '30'),
     autonum: (f) => {
       const v = String(get(f, f.key, f.def));
@@ -312,23 +328,24 @@ export async function render(el, ctx) {
     path: (f) => get(f, f.key, f.def),
     text: (f) => get(f, f.key, f.def),
     number: (f) => String(get(f, f.key, f.def)),
-    language: () => getLang(),
     preset: () => '', // shown from the fields it sets (presetOf), never stored
   };
   const WRITE = {
     select: (f, x) => [[f.sec, f.key, x]],
     rate: (f, x) => [[f.sec, f.keys[0], x === '60' ? '1' : '0'], [f.sec, f.keys[1], x === '120' ? '1' : '0']],
     toggle: (f, x) => [[f.sec, f.key, x ? (f.on ?? '1') : (f.off ?? '0')]],
-    size: (f, x) => [
-      [f.sec, f.keys[0], String(clamp(parseInt(x.w, 10) || 1280, 320, 16384))],
-      [f.sec, f.keys[1], String(clamp(parseInt(x.h, 10) || 720, 320, 16384))],
-    ],
+    size: (f, x) => {
+      const [w, h] = String(x).split('x');
+      return [
+        [f.sec, f.keys[0], String(clamp(parseInt(w, 10) || 1280, 320, 16384))],
+        [f.sec, f.keys[1], String(clamp(parseInt(h, 10) || 720, 320, 16384))],
+      ];
+    },
     autonum: (f, x) => [[f.sec, f.key, x.auto ? 'auto' : String(clamp(Math.round(parseFloat(x.num)) || f.numDefault, f.min, f.max))]],
     range: (f, x) => [[f.sec, f.key, (x / 100).toFixed(2)]],
     path: (f, x) => [[f.sec, f.key, fwd(x)]],
     text: (f, x) => [[f.sec, f.key, String(x).trim()]],
     number: (f, x) => [[f.sec, f.key, String(clamp(parseInt(x, 10) || 0, f.min, f.max))]],
-    language: () => [],
     preset: () => (fixedRender ? [['fefw', 'render', '']] : []), // a preset was picked: the fixed render size would win over it
   };
 
@@ -348,7 +365,7 @@ export async function render(el, ctx) {
   const dirtyFields = () => all.filter((f) => (f.type !== 'preset' || fixedRender) && JSON.stringify(model[f.id]) !== orig[f.id]);
 
   // ----- markup -----
-  const dis = (f) => (exists[f.file] ? '' : 'disabled');
+  const dis = (f) => (exists[f.file] && !f.lockedIf?.(model, fieldCtx) ? '' : 'disabled');
   const CONTROL = {
     select: (f, x) => {
       // an NVIDIA-only option is kept when it is the value already set, so the file is shown as it is rather than as a raw word
@@ -357,8 +374,11 @@ export async function render(el, ctx) {
       return `<select id="f-${f.id}" data-f="${f.id}" ${dis(f)}>${opts.map(([v, l]) => `<option value="${esc(v)}" ${String(v) === String(x) ? 'selected' : ''}>${esc(optName(l))}</option>`).join('')}</select>`;
     },
     rate: (f, x) => CONTROL.select(f, x),
-    toggle: (f, x) => `<label class="switch"><input type="checkbox" id="f-${f.id}" data-f="${f.id}" ${x ? 'checked' : ''} ${dis(f) || (f.lockedIf?.(model, fieldCtx) ? 'disabled' : '')}>${esc(t(x ? f.onLabel || 'common.on' : f.offLabel || 'common.off'))}</label>`,
-    size: (f, x) => `<input type="number" id="f-${f.id}" data-f="${f.id}" data-part="w" min="320" max="16384" value="${esc(x.w)}" ${dis(f)}><span class="unit">x</span><input type="number" data-f="${f.id}" data-part="h" min="320" max="16384" value="${esc(x.h)}" ${dis(f)}>`,
+    toggle: (f, x) => `<label class="switch"><input type="checkbox" id="f-${f.id}" data-f="${f.id}" ${x ? 'checked' : ''} ${dis(f)}>${esc(t(x ? f.onLabel || 'common.on' : f.offLabel || 'common.off'))}</label>`,
+    size: (f, x) => {
+      const opts = f.options.some(([v]) => v === x) ? f.options : [...f.options, [x, String(x).replace('x', ' x ')]];
+      return `<select id="f-${f.id}" data-f="${f.id}" ${dis(f)}>${opts.map(([v, l]) => `<option value="${esc(v)}" ${v === x ? 'selected' : ''}>${esc(optName(l))}</option>`).join('')}</select>`;
+    },
     autonum: (f, x) => `<label class="switch"><input type="checkbox" id="f-${f.id}" data-f="${f.id}" data-part="auto" ${x.auto ? 'checked' : ''} ${dis(f)}>${esc(optName(f.autoLabel))}</label><input type="number" data-f="${f.id}" data-part="num" min="${f.min}" max="${f.max}" value="${esc(x.num)}" ${x.auto || !exists[f.file] ? 'disabled' : ''}><span class="unit">${esc(optName(f.unit))}</span>`,
     range: (f, x) => `<input type="range" id="f-${f.id}" data-f="${f.id}" min="0" max="${Math.round((f.max ?? 1) * 100)}" step="1" value="${x}" ${dis(f)}><span class="unit" data-readout="${f.id}" style="min-width: 4.5ch; text-align: right">${x}${esc(optName(f.unit || '%'))}</span>`,
     text: (f, x) => `<input type="text" id="f-${f.id}" data-f="${f.id}" spellcheck="false" placeholder="${esc(f.placeholder ? optName(f.placeholder) : '')}" value="${esc(x)}" ${dis(f)}>`,
@@ -369,7 +389,6 @@ export async function render(el, ctx) {
       const custom = cur ? '' : `<option value="" selected disabled>${esc(t('settings.preset.custom'))}</option>`;
       return `<select id="f-${f.id}" data-f="${f.id}" ${dis(f)}>${custom}${PRESETS.map(([v, l]) => `<option value="${v}" ${v === cur ? 'selected' : ''}>${esc(t(l))}</option>`).join('')}</select>`;
     },
-    language: (f, x) => `<select id="f-${f.id}" data-f="${f.id}">${listLangs().map((l) => `<option value="${esc(l.code)}" ${l.code === x ? 'selected' : ''}>${esc(l.name)}</option>`).join('')}</select>`,
   };
 
   /** The short form of a hint, or '' when it has none (or it would say the same as the full one). */
@@ -453,12 +472,7 @@ export async function render(el, ctx) {
   function applyModel() {
     for (const f of all) {
       const x = model[f.id];
-      if (f.type === 'size') {
-        const w = el.querySelector(`[data-f="${f.id}"][data-part="w"]`);
-        const h = el.querySelector(`[data-f="${f.id}"][data-part="h"]`);
-        if (w) w.value = x.w;
-        if (h) h.value = x.h;
-      } else if (f.type === 'autonum') {
+      if (f.type === 'autonum') {
         const a = el.querySelector(`[data-f="${f.id}"][data-part="auto"]`);
         const num = el.querySelector(`[data-f="${f.id}"][data-part="num"]`);
         if (a) a.checked = x.auto;
@@ -480,39 +494,6 @@ export async function render(el, ctx) {
       }
     }
     updateBar();
-  }
-
-  /**
-   * Switches the interface language: saved at once, then the page is redrawn in the new language with the
-   * unsaved edits kept. `draw()` rebuilds the markup from `model`, and `applyModel()` puts the edited values
-   * back into it, so nothing has to be read from disk again. Only the shell (navigation, window title) is
-   * repainted; the page itself is not re-rendered, or the edits kept here would be dropped with this closure.
-   */
-  async function liveLang(code) {
-    if (code === getLang()) return;
-    const keep = { ...model };
-    try {
-      await api('save_config', { config: { ...cfg, lang: code } });
-    } catch (e) {
-      toast(errText(e), 'error');
-      return;
-    }
-    cfg.lang = code;
-    // Keep the in-game F1 menu in step: it reads [gfx] ui_language from fefw.ini.
-    // zh maps to the zh pack; any other launcher language falls back to English there.
-    try {
-      await api('write_settings', { edits: [{ file: 'game', section: 'gfx', key: 'ui_language', value: code === 'zh' ? 'zh' : 'auto' }] });
-    } catch (e) { /* fefw.ini may not exist yet; the menu keeps its current language */ }
-    await setLang(code, () => {
-      for (const id of Object.keys(keep)) model[id] = keep[id];
-      // The switch was saved above, so it is not a pending edit: the picker shows the new language and the
-      // save bar does not count it. Everything else keeps the value it had before the switch.
-      model.lang = code;
-      orig.lang = JSON.stringify(code);
-      draw();
-      applyModel();
-      ctx.shell(); // navigation labels and the window title; the page keeps the edits above
-    });
   }
 
   // The upscaler files the game will find with the folders as typed (found only when every file a feature needs is in one folder).
@@ -717,10 +698,6 @@ export async function render(el, ctx) {
         }
         if (part) model[f.id] = { ...model[f.id], [part]: v };
         else model[f.id] = f.type === 'range' ? parseInt(v, 10) : v;
-        if (f.type === 'language') {
-          liveLang(v);
-          return;
-        }
         if (f.type === 'range') {
           el.querySelector(`[data-readout="${f.id}"]`).textContent = `${model[f.id]}${optName(f.unit || '%')}`;
           updateBar();
@@ -770,7 +747,7 @@ export async function render(el, ctx) {
     for (const f of dirtyFields()) {
       for (const [sec, key, value] of WRITE[f.type](f, model[f.id])) {
         if (f.file === 'config') {
-          cfgNew[key] = ['minimize_on_play', 'lsfg', 'lsfg_performance'].includes(key) ? value === '1' : key === 'jobs' ? parseInt(value, 10) || 0 : key === 'lsfg_multiplier' ? clamp(parseInt(value, 10) || 2, 2, 4) : key === 'lsfg_flow_scale' ? String(value) : key === 'runner' ? String(value).trim() : fwd(value);
+          cfgNew[key] = ['minimize_on_play', 'send_reports', 'lsfg', 'lsfg_performance'].includes(key) ? value === '1' : key === 'jobs' ? parseInt(value, 10) || 0 : key === 'lsfg_multiplier' ? clamp(parseInt(value, 10) || 2, 2, 4) : key === 'lsfg_flow_scale' ? String(value) : key === 'runner' ? String(value).trim() : fwd(value);
         } else {
           edits.push({ file: f.file, section: sec, key, value });
         }
@@ -792,6 +769,11 @@ export async function render(el, ctx) {
   }
 
   if (!live()) return; // another page was opened while this one was loading
+  // a language switch: the same page in the new words, with the unsaved edits kept (draw() builds it from the model)
+  ctx.onLanguage(() => {
+    draw();
+    applyModel();
+  });
   draw();
   pollFetch(); // picks up a download still running, or tells how one that ended while the page was closed went
 }

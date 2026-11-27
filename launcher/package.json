@@ -1,17 +1,22 @@
 {
   "name": "fefw-launcher",
   "private": true,
-  "version": "0.2.9",
+  "version": "0.5.0",
   "license": "GPL-3.0-or-later",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "screenshots": "node screenshots/capture.mjs",
+    "check-translations": "node scripts/check-translations.mjs",
     "tauri": "tauri"
   },
   "devDependencies": {
+    "@fontsource-variable/open-sans": "^5.3.0",
+    "@fontsource/cascadia-mono": "^5.3.0",
     "@tauri-apps/cli": "^2.12.4",
+    "playwright": "^1.65.1",
     "vite": "^8.3.5"
   },
   "dependencies": {

@@ -79,6 +79,7 @@ struct Frame {
     VkCommandBuffer cb = VK_NULL_HANDLE;
     uint64_t serial = 0;          // the timeline value this submission signals when the GPU has run it
     void* slot = nullptr;         // nvn_gpu.cpp: the submission slot (command pool, descriptor pools, upload memory)
+    uint32_t split_seq = 0;       // incremented each time split_submission hands the previous cb to the GPU
     bool split_ok = false;        // split_submission may hand the commands recorded so far to the GPU (a normal, signalled submission)
     // Host-visible memory valid until the submission has completed: small per-draw data (support buffer, driver constants,
     // inline uniform data). align is a power of two.
@@ -108,19 +109,26 @@ uint64_t completed_serial();      // cached timeline value; call poll_completed(
 uint64_t poll_completed();
 uint64_t current_serial();        // the serial of the submission being recorded (or the last one)
 
-// ---- GPU pass profiler ([prof] gpu_passes = true, needs the frame trace) --------------------------------------------------------------
-// Writes a GPU timestamp after everything recorded so far; the time since the previous stamp of the submission becomes a trace event
-// `gp:<label>` (arg = draws or 0). No-ops when the profiler is off.
+// ---- GPU pass profiler ([prof] gpu_passes = true) & GPU breadcrumbs ([diag] gpu_breadcrumbs = true) --------------------
+// Writes a GPU timestamp (pass profiler) and/or a serialising vkCmdFillBuffer step marker (breadcrumbs, outside a render pass).
+// No-ops when both are off.
 bool gpass_on();
-void gpass_stamp(Frame& f, const char* label, uint32_t arg = 0);
+// detail: what the breadcrumb report prints instead of label (the profiler keeps the constant label as its key)
+void gpass_stamp(Frame& f, const char* label, uint32_t arg = 0, bool in_pass = false, const char* detail = nullptr);
 
 // ---- barriers ---------------------------------------------------------------------------------------------------------------
 void image_barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to, VkImageAspectFlags aspect,
                    uint32_t base_level, uint32_t level_count, uint32_t base_layer, uint32_t layer_count);
 // All commands before, all commands after, all memory (used after passes, dispatches, copies and fills).
 void memory_barrier(VkCommandBuffer cb);
+// A memory barrier with the scopes given ([nvn] narrow_pass_conflicts / narrow_copy_barriers). It is not a full barrier:
+// memory_barrier_count does not change, so trackers that wait for one (open dispatches, batched updates) still record their own.
+void scoped_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
+                    VkAccessFlags2 dst_access);
 // Full memory barriers this thread recorded into `cb` so far: a change since a point in its recording means one lies between.
 uint64_t memory_barrier_count(VkCommandBuffer cb);
+// Monotonic barrier count within the command buffer currently being recorded on this thread (gen increments on each vkBeginCommandBuffer).
+uint64_t command_buffer_barriers(uint64_t* gen = nullptr);
 // [nvn] pass_barriers = tracked (S38): image_barrier derives its stage and access masks from the two layouts instead of all commands and
 // all memory. Set by the replay for each submission; any thread may record image barriers, so it is an atomic.
 void set_narrow_barriers(bool on);
@@ -156,19 +164,24 @@ bool mirror_enabled();
 enum ReadUse { kReadVertex = 0, kReadIndex = 1, kReadUniform = 2, kReadStorage = 3 };
 void storage_probe(uint64_t gpu_address, uint64_t size, bool vertex);   // [nvn] storage_read_copy diagnostics
 enum WriteUse { kWriteStorage = 0, kWriteXfb = 1, kWriteImageCopy = 2, kWriteUpdate = 3, kWriteFill = 4, kWriteCopy = 5 };
-BufRef resolve_read(uint64_t gpu_address, uint64_t size, int use);
+uint64_t mirror_evict_gen();   // monotonic count bumped whenever mirror_evict_idle evicts a chunk
+// Render thread: resolve_in_pool calls, and those its address cache missed, since start (replay_stats).
+void pool_resolve_counts(uint64_t* resolves, uint64_t* misses);
+BufRef resolve_read(uint64_t gpu_address, uint64_t size, int use, bool* from_mirror = nullptr);
 // The device-local copy of [gpu_address, +size) for the compute shadows (nvn_replay.cpp): its chunk and offset (buf null: no copy for it, or the
 // range spans two chunks), and whether the copy holds the pool's bytes right now. Call it before note_gpu_write invalidates the range.
 struct MirrorSpan { VkBuffer buf = VK_NULL_HANDLE; VkDeviceSize offset = 0; bool valid = false; VkDeviceSize avail = 0; };   // avail: bytes to the chunk's end
 MirrorSpan mirror_span(uint64_t gpu_address, uint64_t size);
 // The GPU wrote the same bytes of the range into the pool and into its copy (a shadow's result): the pages wholly inside the range hold the
-// pool's bytes again and are tracked again (unless hot or banned), so the next dispatch reads them from video memory.
-void mirror_span_written(uint64_t gpu_address, uint64_t size);
+// pool's bytes again and are tracked again (unless hot or banned), so the next dispatch reads them from video memory. True when at least one
+// full page was re-armed (callers can skip copying back into the mirror when false).
+bool mirror_span_written(uint64_t gpu_address, uint64_t size);
 // The compute bindings that use the copy directly (nvn_replay.cpp): records into cb the copies, from the pool, of the pages of the range the
-// copy does not hold, and tracks them like the copies of mirror_begin_submit. The caller orders earlier writes to the pool before cb's copies
-// and the copies before their readers. True when every page of the range is valid in the copy afterwards; false (nothing or only part of it
-// copied) when a page is hot, banned or cannot be tracked, or the range has no copy. *bytes (optional) receives the bytes copied.
-bool mirror_fill(VkCommandBuffer cb, uint64_t gpu_address, uint64_t size, uint64_t* bytes);
+// copy does not hold, and tracks them like the copies of mirror_begin_submit. If `barrier_done` is non-null and false, records a memory barrier
+// before the copies only when at least one copy is actually emitted (avoiding wasted barriers on hot/banned pages). True when every page of
+// the range is valid in the copy afterwards; false (nothing or only part of it copied) when a page is hot, banned or cannot be tracked, or
+// the range has no copy. *bytes (optional) receives the bytes copied.
+bool mirror_fill(VkCommandBuffer cb, uint64_t gpu_address, uint64_t size, uint64_t* bytes, bool* barrier_done = nullptr);
 bool note_gpu_write(uint64_t gpu_address, uint64_t size, int use);
 void mirror_begin_submit(Frame& f, bool on);
 void mirror_destroy(PoolGpu* p);
@@ -189,6 +202,40 @@ bool out_add(uint64_t addr, VkDeviceSize size, VkBuffer mbuf, VkDeviceSize moff,
 bool out_exact(uint64_t addr, VkDeviceSize size, VkBuffer* buf, VkDeviceSize* off);
 // Some page of [addr, +size) holds a result that is newer in the copy than in the pool.
 bool out_overlaps(uint64_t addr, uint64_t size);
+// Read-only snapshot of the render thread's out_overlaps index for `out_gen()`, so a draw checks all its slots inline without TLS/atomic/call overhead.
+struct OutOverlapSnap {
+    uint64_t gen = ~0ull;
+    uint64_t lo = 0, hi = 0;           // page-aligned bounding box of live entries
+    bool bloom_valid = false;
+    const uint64_t* bloom = nullptr;   // 512 words (2^15 bits)
+    const uint64_t* a0 = nullptr;
+    const uint64_t* a1max = nullptr;
+    size_t count = 0;
+};
+const OutOverlapSnap* out_overlap_snap();
+inline bool out_snap_overlaps(const OutOverlapSnap& s, uint64_t addr, uint64_t size) {
+    if (!size || !s.count) return false;
+    constexpr uint64_t kPg = 4096;
+    const uint64_t lo = addr & ~(kPg - 1);
+    const uint64_t hi = size >= UINT64_MAX - addr ? UINT64_MAX : (addr + size + kPg - 1) & ~(kPg - 1);
+    if (hi <= s.lo || lo >= s.hi) return false;
+    if (s.bloom_valid) {
+        if (hi - lo == kPg) {
+            const size_t h = static_cast<size_t>(((lo >> 12) * 0x9e3779b97f4a7c15ull) >> 49);
+            if (!((s.bloom[h >> 6] >> (h & 63)) & 1)) return false;
+        } else if (hi - lo <= 16 * kPg) {
+            bool any = false;
+            for (uint64_t pa = lo; pa < hi && !any; pa += kPg) {
+                const size_t h = static_cast<size_t>(((pa >> 12) * 0x9e3779b97f4a7c15ull) >> 49);
+                any = (s.bloom[h >> 6] >> (h & 63)) & 1;
+            }
+            if (!any) return false;
+        }
+    }
+    const uint64_t* it = std::lower_bound(s.a0, s.a0 + s.count, hi);
+    const size_t k = static_cast<size_t>(it - s.a0);
+    return k > 0 && s.a1max[k - 1] > lo;
+}
 // Moves whenever the held results change: out_overlaps' answer for a range is the same while it stays (rt agent, notes/rt.md).
 uint64_t out_gen();
 // No result held now in [addr, +size) was added since out_gen() was `gen`, given none was there then (false when the log of additions does
@@ -234,6 +281,12 @@ struct ViewRequest {
     VkComponentMapping swizzle = {};                  // identity when all IDENTITY
     bool depth_aspect = true;                         // depth/stencil images: sample depth (true) or stencil (false)
     uint8_t component = 0;                            // the shader's sampled type: 0 unknown, 1 float, 2 sint, 3 uint (raw-bit aliases of 32-bit formats)
+    bool operator==(const ViewRequest& o) const {
+        return type == o.type && depth_compare == o.depth_compare && base_level == o.base_level && level_count == o.level_count &&
+               base_layer == o.base_layer && layer_count == o.layer_count && format == o.format && swizzle.r == o.swizzle.r &&
+               swizzle.g == o.swizzle.g && swizzle.b == o.swizzle.b && swizzle.a == o.swizzle.a && depth_aspect == o.depth_aspect &&
+               component == o.component;
+    }
 };
 // Creates the VkImage if needed and returns it (null when the format cannot be created: logged once; callers then bind
 // the dummy). Does not upload.
@@ -284,6 +337,7 @@ void tex_mark_gpu_written(Texture* t);
 void tex_sparse_before_copy(Texture* t, uint32_t layer, uint32_t level);   // a sparse texture: bind the mapped tiles a copy writes
 VkImage tex_image(Texture* t);
 VkFormat tex_vk_format(Texture* t);
+bool tex_promote_for_test(Texture* t, Frame& f);   // the residency restore's new image (tex_promote), without a demotion before it
 bool tex_hdr_promoted(Texture* t);   // an 8-bit sRGB render target kept as RGBA16F for the HDR scene (hdr_promote_target)
 VkImageAspectFlags tex_aspect(Texture* t);
 VkExtent3D tex_extent(Texture* t, uint32_t level = 0);
@@ -305,6 +359,10 @@ bool tex_standin_swap_pending(Texture* t);
 bool tex_first_upload_uncompressed_deferrable(Texture* t);
 // Sampled image view for a binding (cached). Null when impossible (the caller binds the dummy view).
 VkImageView tex_sampled_view(Texture* t, const ViewRequest& req);
+// Combined sampled-binding lookup (render thread): resolves view + layout + aspect in one call using TexGpu's ViewRequest cache.
+VkImageView tex_bind_sampled(Texture* t, const ViewRequest& req, VkImageLayout* out_layout, VkImageAspectFlags* out_aspect);
+// Fast check for prepare_textures: true if t is CPU-dirty or not yet in its sampled layout (caller already verified tex_gpu(t) != null).
+bool tex_needs_sampled_prepare(Texture* t);
 // A float-declared sampler over this texture (the view format `requested`, UNDEFINED: the image's own): 0 when a float view gives the
 // shader the texel bits (float formats; 32-bit integer ones through their float alias), else 2 / 3: signed / unsigned integers that only
 // an integer view can read, so the shader needs its sampler retyped (spirv_int_samplers) and the binding an integer view.
@@ -356,11 +414,15 @@ bool snapshot_write(int index, const std::string& png_path, std::string* stats);
 // [nvn] trace_dump_tex = <dir>: writes the data prepare_texture builds for t (raw blocks of every level and layer) as t<id>.bin with a t<id>.txt describing it, once per texture.
 void trace_dump_prepared(Texture* t, const std::string& dir);
 int snapshot_record_raw(Texture* t, Frame& f);   // block-compressed level 0 as the GPU holds it; snapshot_write writes the bytes
+// render thread: the finalized texture t gives up its image, and when no other live texture holds it, so do the finalized ones that share it
+void tex_release(Texture* t);
 void tex_destroy(TexGpu* g);      // render thread
 void tex_shutdown();              // frees samplers and dummy resources (device idle)
 // Per-load census lines ([diag] load_census, render thread): live texture images by kind, the Vulkan side of the game pools.
 void log_texture_census(const char* why);
 void log_import_census(const char* why);
+uint64_t staging_ring_size();        // host memory of the staging ring (nvn_gpu.cpp)
+uint64_t staging_fallback_bytes();   // uploads that did not fit the ring and got a staging buffer of their own, in all
 // Image formats chosen: bool descriptor for tests and logs
 struct TexStats { uint64_t images = 0, uploads = 0, upload_bytes = 0, transcodes = 0, failed = 0; };
 TexStats tex_stats();

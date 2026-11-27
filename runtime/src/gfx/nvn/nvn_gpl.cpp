@@ -91,6 +91,7 @@ std::unordered_map<std::string, Entry> g_libs;             // node based: a refe
 std::deque<std::function<void()>> g_exact_q;   // [nvn] gpl_async: parts a deferred draw needs, exactly as it needs them (first in line)
 std::unordered_set<std::string> g_exact_pending;
 std::atomic<int64_t> g_frame_seen_ns{0};      // when the replay last saw the present count move
+std::atomic<uint64_t> g_frame_seen_presents{0};
 std::deque<std::function<void()>> g_pre_q;     // parts of the key file's pipelines (gpl_prebuild): after the hot programs, before the cold ones
 int g_pre_urgent = 0;                          // the first this many of g_pre_q were put in front because the game set their program (a draw is near)
 std::deque<std::function<void()>> g_task_q;    // gpl_queue_task (compute pipelines): after the exact parts, before the hot programs
@@ -120,7 +121,7 @@ int g_fail_streak = 0;
 int g_running = 0;                         // jobs being built by the workers right now
 
 // Tells the overlay how much shader work is waiting (queued + running). Caller holds g_mu.
-void publish_backlog_locked() { nxrt::gfx::set_shader_backlog(static_cast<int>(g_exact_q.size() + g_task_q.size() + g_hot_q.size() + g_pre_q.size() + g_cold_q.size() + g_up_q.size()) + g_running + g_up_running); }
+void publish_backlog_locked() { nxrt::gfx::set_shader_backlog(static_cast<int>(g_exact_q.size() + g_task_q.size() + g_hot_q.size() + g_pre_q.size() + (g_cold ? g_cold_q.size() : 0) + g_up_q.size()) + g_running + g_up_running); }
 
 thread_local const GraphicsKey* t_link_key = nullptr;      // the draw being linked on this thread, for the log line of a slow part
 
@@ -380,11 +381,14 @@ VkPipeline get_part(const std::string& key, bool render, const std::function<VkP
         Entry& e = it->second;
         if (e.state != 2) {
             const auto t0 = Clock::now();
+            const bool on_rt = render && nxrt::hitch_on_render_thread();
+            const uint64_t hp0 = on_rt ? nxrt::hitch_ticks() : 0;
             if (render && e.owner && !e.boosted.exchange(true)) boost_thread(e.owner);
             {
                 NXFT("pipe.libwait");
                 g_cv.wait(lk, [&] { return e.state == 2 || g_stop; });
             }
+            if (on_rt) nxrt::hitch_phase_add(nxrt::kHpRenderPipeline, nxrt::hitch_ticks() - hp0);
             if (render) {
                 ++g_stats.parts_waited;
                 g_stats.wait_ms += ms_since(t0);
@@ -654,6 +658,7 @@ void learn_raster(const RasterKey& r) {
     for (const RasterKey& k : g_rasters)
         if (k == r) return;
     g_rasters.push_back(r);
+    if (!g_cold) return;
     for (const auto& p : g_programs) {
         Job j;
         for (int i = 0; i < 3; ++i) j.st[i] = p[i];
@@ -811,6 +816,7 @@ void gpl_program(const ShaderInfo* const stages[6], bool covered) {
     }
     if (!g_seen.insert(prog).second) return;
     ++g_stats.prog_new;
+    if (!g_cold) return;
     g_programs.push_back(prog);
     if (g_programs.size() > 512) g_programs.pop_front();
     queue_program(prog, false);
@@ -825,7 +831,7 @@ void gpl_program_bound(const ShaderInfo* const stages[6]) {
     ++g_stats.prog_bound;
     if (g_stop || g_covered.count(prog) || !g_hot.insert(prog).second) return;
     ++g_stats.prog_bound_new;
-    if (g_seen.insert(prog).second) {
+    if (g_seen.insert(prog).second && g_cold) {
         g_programs.push_back(prog);
         if (g_programs.size() > 512) g_programs.pop_front();
     }
@@ -833,17 +839,17 @@ void gpl_program_bound(const ShaderInfo* const stages[6]) {
 }
 
 void gpl_note_presents(uint64_t presents) {
-    static uint64_t last = 0;
-    if (presents == last) return;
-    last = presents;
+    if (presents == g_frame_seen_presents.load(std::memory_order_relaxed)) return;
+    g_frame_seen_presents.store(presents, std::memory_order_relaxed);
     g_frame_seen_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
 }
 
 namespace {
+constexpr int64_t kFramesFlowingNs = 2000000000LL;   // 2 s: ride through slow frames/hitches without disabling async GPL deferral (#147)
 bool frames_flowing() {
     const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
     const int64_t seen = g_frame_seen_ns.load(std::memory_order_relaxed);
-    return seen != 0 && now - seen < 100000000;
+    return seen != 0 && now - seen < kFramesFlowingNs;
 }
 bool part_done_locked(const std::string& key) {
     auto it = g_libs.find(key);
@@ -1324,6 +1330,8 @@ bool gpl_prepare(const PrepareOptions& o, PrepareResult* res) {
 
 void gpl_shutdown() {
     gpl_stop();
+    g_frame_seen_ns.store(0, std::memory_order_relaxed);
+    g_frame_seen_presents.store(0, std::memory_order_relaxed);
     GplStats s;
     size_t n_rasters = 0, n_programs_seen = 0;
     {

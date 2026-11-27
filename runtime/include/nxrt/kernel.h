@@ -5,6 +5,7 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -70,6 +71,9 @@ struct KSharedMemory : KObject {
     std::string name;
     ObjType type() const override { return ObjType::SharedMemory; }
 };
+// Runs fn on s.host while MapSharedMemory and UnmapSharedMemory are held off, so the memory is neither moved nor released under it. For
+// service threads that write while the guest runs. fn must not call a memory SVC. (src/kernel/svc_memory.cpp)
+void with_shared_memory_host(const KSharedMemory& s, const std::function<void(uint64_t host)>& fn);
 
 struct KTransferMemory : KObject {
     uint64_t addr = 0, size = 0;
@@ -196,6 +200,7 @@ uint32_t wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t tag, int64
 uint32_t signal_process_wide_key(uint64_t key, int32_t count);
 uint32_t wait_for_address(uint64_t addr, uint32_t arb_type, int32_t value, int64_t timeout_ns);     // 0 less, 1 dec+less, 2 equal
 uint32_t signal_to_address(uint64_t addr, uint32_t signal_type, int32_t value, int32_t count);     // 0 signal, 1 +1 if equal, 2 modify by waiting
+size_t address_waiter_count(uint64_t addr);                                                         // threads currently queued in wait_for_address on addr (for tests)
 uint32_t wait_synchronization(const uint32_t* handles, int32_t count, int64_t timeout_ns, int32_t* index_out);
 uint32_t cancel_synchronization(uint32_t thread_handle);
 void notify_waitable_changed();          // wake threads blocked in wait_synchronization (call after changing an object's signaled state)

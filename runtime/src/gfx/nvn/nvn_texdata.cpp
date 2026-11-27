@@ -608,7 +608,7 @@ void set_entry_format_hook(EntryFormatHook fn, void* ctx) {
     t_entry_hook_ctx = ctx;
 }
 
-VkFormat cache_entry_format(const Texture& t, bool bc1, bool no_disk) {
+VkFormat cache_entry_format(const Texture& t, bool bc1, bool no_disk, bool allow_bc5) {
     if (!t.mem) return VK_FORMAT_UNDEFINED;
     // no_disk: what this process learned only. No non-BC7 entry seen yet (the usual case): BC7, without hashing the storage.
     // (With bc1 the alpha scan below still decides between BC1 and BC7.)
@@ -628,7 +628,8 @@ VkFormat cache_entry_format(const Texture& t, bool bc1, bool no_disk) {
             const uint64_t key = cache_key_of(t.storage_size, t.mem, L, geo, *L.fmt, q[i]);
             const VkFormat f = no_disk ? learned_entry_format(key) : cache_peek_format(bc7_cache_path(t, key), key);
             if (f == VK_FORMAT_UNDEFINED) continue;
-            if (f == rgba || (f == VK_FORMAT_BC5_UNORM_BLOCK && !L.fmt->srgb)) return f;   // the first valid entry decides
+            if (f == rgba || (allow_bc5 && f == VK_FORMAT_BC5_UNORM_BLOCK && !L.fmt->srgb)) return f;   // the first valid entry decides
+            if (f == VK_FORMAT_BC5_UNORM_BLOCK && !allow_bc5) continue;
             break;
         }
     }
@@ -693,6 +694,7 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
     // is only touched by the background job. Host pixel edits keep the synchronous path (their data never comes from the cache).
     const bool standin_now = caps.standin_first && caps.provisional && fmt.astc && !caps.astc && caps.bc7_transcode && !uncompressed &&
                              caps.image_format == bc7_format && !tex_edit_active();
+    bool bc1_unproven = false;   // BC1 because the image is BC1: neither an entry nor the alpha scan has said this content is opaque
     if (fmt.astc) {
         if (caps.astc) mode = Mode::Passthrough;
         else if (caps.bc7_transcode && !uncompressed) mode = Mode::Bc7;
@@ -725,8 +727,10 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
             entry_format = cand[use].ef;
             if (!entry_applies) {
                 if (want == rgba8_format) mode = Mode::Rgba8;     // an RGBA8 image and no entry for it: decode the ASTC
-                else if (want == bc5_format) return fail("the image is BC5 but its cache entry is gone");
-                else mode = Mode::Bc7;
+                else if (want == bc5_format) {
+                    out.bc5_unavailable = true;
+                    return fail("the image is BC5 but there is no BC5 cache entry for this content");
+                } else mode = Mode::Bc7;
             }
             // Upgrade: the high preset has no entry for this texture (the loop looked at it first and it was not there), and what the image takes is BC7.
             if (caps.upgrade && nq == 2 && filled >= 1 && q[0] > q[1] && cand[0].ef == VK_FORMAT_UNDEFINED && mode == Mode::Bc7 &&
@@ -735,6 +739,9 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
                 upgrade_key = cand[0].key;
                 upgrade_quality = q[0];
             }
+        } else if (!caps.astc && !uncompressed && caps.image_format == VK_FORMAT_BC5_UNORM_BLOCK) {
+            out.bc5_unavailable = true;
+            return fail("the image is BC5 but there is no BC5 cache entry for this content");
         }
         // [gfx] astc_bc = bc1 (nvn_texdata.h): BC1 for an image made as BC1, or (no image yet: a background job) the choice cache_entry_format
         // makes for the image: an RGBA8 / BC5 entry wins (mode is then not Bc7), then a BC1 entry, then the alpha scan.
@@ -747,6 +754,7 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
             const VkFormat bef = bpath.empty() ? VK_FORMAT_UNDEFINED : cache_peek_format(bpath, bkey);
             if (want == bc1_format || bef == bc1_format || astc_bc1_candidate(t, src_mem)) {
                 mode = Mode::Bc1;
+                bc1_unproven = want == bc1_format && bef != bc1_format;
                 key = bkey;
                 cache_file = bpath;
                 entry_format = bef;
@@ -873,7 +881,10 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
             if (upgrade_possible && !edit_make) schedule_upgrade(t, src_mem, upgrade_key, upgrade_quality, cache_dir());   // a fast entry served now; the high one is made behind
             return true;
         }
-        if (mode == Mode::Bc5) return fail("the BC5 cache entry could not be read");
+        if (mode == Mode::Bc5) {
+            out.bc5_unavailable = true;
+            return fail("the BC5 cache entry could not be read");
+        }
     }
     // ---- [gfx] astc_gpu (nvn_astc_gpu.h) ------------------------------------------------------------------------------------
     // An entry the GPU encoders stored (their own key) serves like any other, also with the GPU path off. Without one, and with caps.gpu_astc,
@@ -1181,9 +1192,12 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
     }
     NXLOG_I(kTag, "texture %u: %s %ux%u, %u levels, %u layers%s: %.1f ms", t.id, bc7 ? "ASTC -> BC7" : bc1 ? "ASTC -> BC1" : "ASTC -> RGBA8",
             geo[0].w, geo[0].h, L.levels, L.layers, provisional ? " (quick stand-in, preset 0)" : "", ms_since(t0));
-    if (bc1_alpha_seen && g_bc1_alpha_misses.fetch_add(1) < 16)
+    if (bc1_alpha_seen && !bc1_unproven && g_bc1_alpha_misses.fetch_add(1) < 16)   // (an image that is BC1 takes content with alpha too)
         NXLOG_W(kTag, "texture %u: stored as BC1 but its ASTC decodes with alpha under 255 (alpha scan wrong?): drawn opaque", t.id);
 
+    // A BC1 entry says its content is opaque: a texture takes BC1 from it without a scan. Not written for data encoded from texels with alpha
+    // (a BC1 image takes them; or the storage changed after the scan), nor for content nothing has called opaque.
+    if (!cache_file.empty() && (bc1_alpha_seen || (bc1_unproven && !astc_bc1_candidate(t, src_mem)))) cache_file.clear();
     if (!cache_file.empty() && !cache_write(cache_file, key, out))
         NXLOG_W(kTag, "texture %u: could not write cache file %s", t.id, cache_file.c_str());
     if (upgrade_possible && !edit_make && !provisional) schedule_upgrade(t, src_mem, upgrade_key, upgrade_quality, cache_dir());   // the fast transcode serves now; the high preset is made behind

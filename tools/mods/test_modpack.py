@@ -45,6 +45,8 @@ class ModPackTests(unittest.TestCase):
         header[:4] = b"NSO0"
         header[0x40:0x60] = bytes.fromhex(BUILD_ID)
         struct.pack_into("<III", header, 0x10, 0x100, 0x0, 0x400)
+        for segment_header in (0x20, 0x30):
+            struct.pack_into("<III", header, segment_header, 0x500, 0x400, 0)
         self.main.write_bytes(header)
         self.info = modpack.main_info(self.main)
 

@@ -21,6 +21,13 @@
 // entry hook) for 3 more letters each frame; off the 30 Hz ticks the entry hook answers "not finished" (0) without running it, as
 // Fortune's Eden v1.6.8.6 did. Showing the whole line (a button press asks for more than 3) is left alone.
 //
+// Cloth gravity and wind ([fefw] cloth_gravity): each cloth point is moved by (velocity kept + gravity + wind) and then turned a share k
+// of the way back to its parent bone's direction. That turn acts on the position, so where a point settles is about gravity x (1 - k) / k.
+// With k -> 1 - (1 - k)^s (about k x s) and gravity x s^2 (`accel`, the first rule), a point settles s times as far from its rest pose as
+// at 30 fps: half the sag at 60, a quarter at 120. Hair whose rest pose points up (a high ponytail) then stands up. `match` scales
+// gravity and wind by F = Q (1 - Q^s) / ((1 - Q) Q^s), Q = 1 - k, which keeps the settled position of the 30 fps step for every k (F is
+// about s for a weak turn and tends to s^2 only as k -> 0, where nothing holds the point and gravity is a plain acceleration).
+//
 // [fefw] frame_fixes = 1 (default; the menu changes it live) and [fefw] frame_fixes_skip = a comma list of groups to leave alone: dt, shader,
 // physics, cloth, quake, anim, map, ui, text. At 30 fps every hook leaves the game's values as they are.
 #include "fefw_game.h"
@@ -30,12 +37,16 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "nxrt/config.h"
 #include "nxrt/dispatch.h"
 #include "nxrt/hooks.h"
 #include "nxrt/log.h"
+#include "nxrt/memory.h"
 
 namespace nxrt::games::fefw {
 namespace {
@@ -52,6 +63,7 @@ enum class Rule : uint8_t {
     Pow,     // q^s: a factor per frame
     Ease,    // 1 - (1 - k)^s: an ease / lerp weight per frame
     Div,     // / s: frames to hold
+    Force,   // the cloth step's gravity: x s^2 ([fefw] cloth_gravity = accel) or the factor that keeps the settled position (match)
 };
 
 struct MovkSite {
@@ -73,7 +85,7 @@ constexpr MovkSite kMovk[] = {
     {0x0ab248c, 8, 0x3d08ab85, Rule::Mul, kShader},     // shader time per frame
     {0x0da1f48, 9, 0x3d088889, Rule::Mul, kPhysics},    // PhysX async step 1/30
     {0x14cfdbc, 8, 0x3d088889, Rule::Mul, kPhysics},    // PhysX sync step
-    {0x0a687e4, 8, 0xbc888889, Rule::Mul2, kCloth},     // cloth gravity per step
+    {0x0a687e4, 8, 0xbc888889, Rule::Force, kCloth},    // cloth gravity per step
     {0x112bfc8, 9, 0x3f733333, Rule::Pow, kAnim},       // CustomModifier_Auto x0.95 per frame
     {0x112c010, 9, 0x3f733333, Rule::Pow, kAnim},
     {0x11e62c0, 9, 0x3f4ccccd, Rule::Div, kAnim},       // CharacterBuilder hold frames
@@ -109,6 +121,8 @@ struct State {
     std::atomic<float> s{1.0f};                 // the frame's share of a 1/30 s step
     std::atomic<float> s_count{1.0f};           // native / target, for frame counts
     std::atomic<bool> tick{true};               // a 30 Hz step falls in this frame
+    std::atomic<bool> cloth_match{true};        // [fefw] cloth_gravity = match
+    std::atomic<bool> cloth_logged{false};
     float tick_acc = 0.0f;                      // main thread (frame_step)
     // Separate cache line from the read-mostly per-frame fields above so worker-thread counter flushes
     // do not invalidate on/skip/s on every other core.
@@ -172,6 +186,28 @@ float pow_cached(float q, float s) {
 }
 inline float ease(float k, float s) { return 1.0f - pow_cached(std::clamp(1.0f - k, 0.0f, 1.0f), s); }
 
+// What the cloth step's gravity and wind are multiplied by for a point turned back by k each step (see the top of the file). The gravity
+// site sets it for the point; the wind site, later in the same pass of the loop, uses it.
+thread_local float t_cloth_force = 1.0f;
+float cloth_force(::Ctx* c, float s) {
+    State& st_ = st();
+    float f = s * s;
+    const float k = c->v[5].f[0];      // s5: the point's turn back to its parent's direction (its own or the module's)
+    if (st_.cloth_match.load(std::memory_order_relaxed) && k > 1e-4f && k < 1.0f) {
+        const float q = 1.0f - k, qs = pow_cached(q, s);
+        if (qs > 0.0f) f = std::clamp(q * (1.0f - qs) / (k * qs), s * s, 1.0f);
+    }
+    if (!st_.cloth_logged.load(std::memory_order_relaxed) && !st_.cloth_logged.exchange(true)) {
+        float step = 0.0f;             // sp + 0x90: min(the step's argument, 1), which the whole move is multiplied by
+        if (c->x[31] >= 0x10000) std::memcpy(&step, reinterpret_cast<const void*>(c->x[31] + 0x90), 4);
+        NXLOG_I(kTag, "frame-rate fixes: cloth gravity ([fefw] cloth_gravity = %s): first point: s %.3f, turn back k %.4f, the step's own "
+                      "factor %.3f, gravity and wind x %.4f (accel would be %.4f)",
+                st_.cloth_match.load() ? "match" : "accel", s, k, step, f, s * s);
+    }
+    t_cloth_force = f;
+    return f;
+}
+
 void hook_movk(::Ctx* c, uint64_t, void* user) {
     const MovkSite& m = *static_cast<const MovkSite*>(user);
     const float s = scale(m.group);
@@ -184,6 +220,7 @@ void hook_movk(::Ctx* c, uint64_t, void* user) {
         case Rule::Pow: r = std::pow(v, s); break;
         case Rule::Ease: r = ease(v, s); break;
         case Rule::Div: r = v / s; break;
+        case Rule::Force: r = v * cloth_force(c, s); break;
     }
     c->x[m.reg] = f_bits(r);      // as the movk left it: the upper half zero
     count(m.group);
@@ -218,11 +255,12 @@ void hook_cloth_damp(::Ctx* c, uint64_t, void*) {
     c->v[2].f[0] = pow_cached(q, s);
     count(kCloth);
 }
-// the wind force added this step (v0, four lanes): an acceleration, x s^2
+// the wind force added this step (v0, four lanes): scaled like the gravity of the same point
 void hook_cloth_wind(::Ctx* c, uint64_t, void*) {
     const float s = scale(kCloth);
     if (full(s)) return;
-    for (float& f : c->v[0].f) f *= s * s;
+    const float k = st().cloth_match.load(std::memory_order_relaxed) ? t_cloth_force : s * s;
+    for (float& f : c->v[0].f) f *= k;
     count(kCloth);
 }
 // the pull towards the parent bone's direction: s2 = 1 - k (s5 = k) -> s2 = (1 - k)^s, s5 = 1 - that
@@ -370,6 +408,138 @@ uint32_t parse_skip(const std::string& list) {
     return m;
 }
 
+// ---- combat death cries (anim group; ported from ObeliskChamber#217) -------------------------------------------------------------------
+// game::combat::ActionDamageCore::DoDie (0x1084840) starts a disposable::EveryFrameProc (0x10c8cc0) of 1.0 s with a callback (a
+// std::function; its operator() 0x1085350: x0 = the closure, +8 the unit index; x1 -> t, the proc's elapsed / 1.0 s). Each frame the proc
+// (0x10c9690) adds its clock's step and calls the callback; it ends when the callback returns 0 or t reaches 1. The callback waits for
+// t > 0.04 and for the dying unit's own clock (unit [+88] + 304, its step this frame at + 16, frames of 1/59.94 s) to have moved more than
+// 0.0001 s this frame, then asks for the voice "Damage_D" or "Damage_H" (0x10b0500 on the unit + 872) and returns 0.
+// At a death the unit's clock stands still (the slow death camera) and then eases back. At 30 fps it passes 0.0001 s a frame at about
+// t = 0.97, two frames before the proc ends. The threshold is per frame, so at 60 fps the same clock speed moves half as far a frame and
+// passes it only after the proc has ended: no cry (at 120 a quarter). The callback is only ever called through its std::function, so it is
+// wrapped through the function table (no hook site needed): the step it reads is divided by s for the call (the 30 fps step for the same
+// clock speed) and put back after. [fefw] diag_voice (off) logs each death's first wait and how it ended.
+constexpr uint32_t kDieCb = 0x1085350, kVoiceBusy = 0x100100, kUnitTableGot = 0x216b488;
+GuestFn g_die_cb_orig = nullptr;
+bool g_voice_log = false;
+std::atomic<bool> g_die_cb_tried{false};
+template <class T> bool vrd(uint64_t a, T* out) {
+    if (!a || !mem::is_mapped(a, sizeof(T))) return false;
+    std::memcpy(out, reinterpret_cast<const void*>(a), sizeof(T));
+    return true;
+}
+uint64_t vcall(::Ctx* c, uint64_t fn, uint64_t x0) {
+    const ::Ctx saved = *c;
+    c->x[0] = x0;
+    dispatch_call(c, fn);
+    const uint64_t r = c->x[0];
+    *c = saved;
+    return r;
+}
+void die_cb_wrap(::Ctx* c) {
+    const uint64_t base = st().base, closure = c->x[0];
+    float t = -1.f, step = -1.f;
+    uint32_t unit = 0xffffffffu;
+    uint64_t got = 0, table = 0, unit_obj = 0, inner = 0, clock = 0;
+    vrd(c->x[1], &t);
+    vrd(closure + 8, &unit);
+    const bool have = vrd(base + kUnitTableGot, &got) && vrd(got, &table) && table && unit <= 3 && vrd(table + unit * 0x18 + 40, &unit_obj) &&
+                      vrd(unit_obj + 88, &inner) && vrd(inner + 304, &clock) && vrd(clock + 16, &step);
+    const float sc = scale(kAnim);
+    const bool scaled = have && sc < 1.0f && step > 0.0f;
+    const float seen = scaled ? step / sc : step;
+    if (scaled) std::memcpy(reinterpret_cast<void*>(clock + 16), &seen, sizeof(float));
+    std::string why;
+    if (g_voice_log && t > 0.04f && seen * 16.683f * 0.001f > 1e-4f) {     // the frame the callback asks for the voice: will 0x10b0500 play it?
+        int busy = -1;
+        uint8_t mode = 0;
+        uint64_t combat = 0, comp = 0, v = 0, vh = 0;
+        if (vrd(table + 8, &combat) && combat) vrd(combat + 113, &mode);
+        if (vrd(unit_obj + 872 + 8, &comp) && vrd(comp + 88, &v) && v && vrd(v + 136, &vh) && vh)
+            busy = static_cast<int>(vcall(c, base + kVoiceBusy, vh + 104) & 1);
+        why = (mode >> 7 & 1) ? ", voices off: not played" : busy == 1 ? ", the unit's voice is busy: not played" : busy == 0 ? ", played" : ", voice handle not found";
+    }
+    g_die_cb_orig(c);
+    if (scaled) {
+        std::memcpy(reinterpret_cast<void*>(clock + 16), &step, sizeof(float));
+        count(kAnim);
+    }
+    if (!g_voice_log) return;
+    static std::unordered_set<uint64_t> active_waits;   // main thread
+    const bool waits = static_cast<uint32_t>(c->x[0]) & 1;
+    const bool done = !waits || t >= 0.999f;
+    if (active_waits.size() > 64) active_waits.clear();
+    const bool first = !done && active_waits.insert(closure).second;
+    if (done) active_waits.erase(closure);
+    const char* end = !waits ? "asks for the voice" : t >= 0.999f ? "the wait ran out: no cry" : first ? "waits" : nullptr;
+    if (!end) return;
+    NXLOG_I(kTag, "voice: death cry, unit %u, t %.3f, unit clock step %.4f (the callback sees %.4f) -> %s%s", unit, t, step, seen, end, why.c_str());
+}
+// The lifted modules are registered after play mode installs its hooks: wrap the callback at the first frame step.
+void die_cb_try_install() {
+    if (g_die_cb_tried.exchange(true)) return;
+    g_voice_log = config_get_bool("fefw", "diag_voice", false);
+    const uint64_t at = st().base + kDieCb;
+    g_die_cb_orig = fn_lookup(at);
+    if (!g_die_cb_orig || !fn_lookup(st().base + kVoiceBusy)) {
+        NXLOG_W(kTag, "frame-rate fixes: the combat death cry callback (0x%x) is not in this build: death cries stay as they are", kDieCb);
+        return;
+    }
+    fn_register(at, &die_cb_wrap);
+    NXLOG_I(kTag, "frame-rate fixes: combat death cries wrapped (anim)%s", g_voice_log ? ", logged ([fefw] diag_voice)" : "");
+}
+
+// ---- talk portraits (Spine): one call per 30 Hz step (ported from ObeliskChamber#217) --------------------------------------------------
+// The talk portraits are Spine skeletons (spine-cpp). The game's wrapper (0x1947dd0) poses each one at its skeleton data's fps
+// (+0x358) from an accumulator of its own (+0x35c): when it passes one step it applies the animation state, updates the world
+// transform and advances the state by that step; otherwise it still calls spine::AnimationState::update(0.0001), with no apply.
+// At 30 fps every call is a step. At 60 every other call is not, and when the game starts an animation with no mix (the eye blink,
+// talk::Seq::BindFaceEyeBlinkSync: mix duration 0) just before such a call, that update gives the new entry a mix time above 0 and
+// Spine drops the entry it replaces as finished mixing before it was ever applied mixing out. What that entry had set (the open eye's
+// images) is never reset while the blink moves the lids: half-closed lids over open eyes, on several of Fortuna's lines.
+// The manager that calls the wrapper for every skeleton (0x1940d60, only called through a pointer) is wrapped through the function
+// table: between 30 Hz steps it is not called at all, and on a step it is called with the clock frames since the last one
+// ([+0x48] + 0x68, frames of 1/59.94 s; put back after the call), so every skeleton is called once per 30 Hz step, as at 30 fps.
+// Group anim: off with the frame-rate fixes, and with [fefw] frame_fixes_skip = anim.
+constexpr uint32_t kSpineManager = 0x1940d60;
+GuestFn g_spine_orig = nullptr;
+std::mutex g_spine_mu;
+std::unordered_map<uint64_t, float> g_spine_acc;   // manager -> clock frames since its last 30 Hz step; under g_spine_mu
+std::atomic<bool> g_spine_tried{false};
+void spine_mgr_wrap(::Ctx* c) {
+    const uint64_t mgr = c->x[0];
+    uint64_t clock = 0;
+    float step = 0.f;
+    if (full(scale(kAnim)) || !vrd(mgr + 0x48, &clock) || !vrd(clock + 0x68, &step) || !(step >= 0.f && step < 64.f)) {
+        g_spine_orig(c);
+        return;
+    }
+    float use = 0.f;
+    {
+        std::lock_guard<std::mutex> lk(g_spine_mu);
+        if (g_spine_acc.size() > 256) g_spine_acc.clear();
+        float& acc = g_spine_acc[mgr];
+        acc += step;
+        if (st().tick.load(std::memory_order_relaxed)) use = acc, acc = 0.f;
+    }
+    count(kAnim);
+    if (use == 0.f) return;   // no 30 Hz step in this frame
+    std::memcpy(reinterpret_cast<void*>(clock + 0x68), &use, 4);
+    g_spine_orig(c);
+    float now = 0.f;
+    if (vrd(clock + 0x68, &now) && now == use) std::memcpy(reinterpret_cast<void*>(clock + 0x68), &step, 4);
+}
+void spine_try_install() {
+    if (g_spine_tried.exchange(true)) return;
+    const uint64_t at = st().base + kSpineManager;
+    if (!(g_spine_orig = fn_lookup(at))) {
+        NXLOG_W(kTag, "frame-rate fixes: the Spine manager (0x%x) is not in this build: talk portraits stay as they are", kSpineManager);
+        return;
+    }
+    fn_register(at, &spine_mgr_wrap);
+    NXLOG_I(kTag, "frame-rate fixes: talk portraits (Spine) called once per 30 Hz step (anim)");
+}
+
 }  // namespace
 
 void frame_install(uint64_t base) {
@@ -379,6 +549,11 @@ void frame_install(uint64_t base) {
     s.base = base;
     s.on.store(config_get_bool("fefw", "frame_fixes", true));
     s.skip = parse_skip(config_get_str("fefw", "frame_fixes_skip", ""));
+    {
+        const std::string g = config_get_str("fefw", "cloth_gravity", "match");
+        if (g != "accel" && g != "match") NXLOG_W(kTag, "[fefw] cloth_gravity = %s: not match or accel, match is used", g.c_str());
+        s.cloth_match.store(g != "accel");
+    }
     size_t n = 0;
     for (const MovkSite& m : kMovk) n += hook_add_inline(base + m.off + 4, &hook_movk, const_cast<MovkSite*>(&m)) ? 1 : 0;
     struct { uint32_t off; InlineHookFn fn; } const items[] = {
@@ -406,6 +581,8 @@ void frame_install(uint64_t base) {
 void frame_step(float step, int target) {
     State& s = st();
     if (!s.installed || target <= 0) return;
+    die_cb_try_install();
+    spine_try_install();
     int native = s.native.load(std::memory_order_relaxed);
     if (native <= 0) native = target;
     const float sc = std::clamp(static_cast<float>(native) / static_cast<float>(target), 0.125f, 1.0f);

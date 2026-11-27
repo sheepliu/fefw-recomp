@@ -45,6 +45,7 @@ struct Region {
     uint64_t nwords = 0;
     std::unique_ptr<std::atomic<uint64_t>[]> prot, valid, written, ban;
     std::unique_ptr<std::atomic<uint64_t>[]> guard;     // PAGE_NOACCESS because of guard() (a subset of prot)
+    std::atomic<bool> has_written{false};               // set after any written[] bit is set; cleared before take_written() scans
     std::atomic<Region*>* slot = nullptr;
     SRWLOCK lock = SRWLOCK_INIT;
     std::unique_ptr<std::atomic<uint16_t>[]> releasing;   // per page: releasers that saw it armed and have not finished its VirtualProtect (release_page)
@@ -108,6 +109,7 @@ std::atomic<int> g_busy{0};            // fault handlers and os-write calls look
 std::atomic<int> g_live{0};
 std::atomic<uint64_t> g_generation{0};
 std::atomic<uint64_t> g_faults{0};
+std::atomic<uint64_t> g_write_seq{0};  // bumped after any region sets written[] + has_written
 std::atomic<uint64_t> g_waits{0};      // rounds a fault waited for another releaser (statistics, tests)
 std::atomic<uint64_t> g_guard_faults{0};   // accesses that hit a guarded page
 std::atomic<GuardHandler> g_guard_fn{nullptr};
@@ -265,7 +267,9 @@ bool release_page(Region* r, uint64_t page) {
     if (armed) rel.fetch_add(1, std::memory_order_seq_cst);
     const uint64_t old = r->prot[w].fetch_and(~b, std::memory_order_acq_rel);
     r->valid[w].fetch_and(~b, std::memory_order_acq_rel);
-    r->written[w].fetch_or(b, std::memory_order_acq_rel);
+    r->written[w].fetch_or(b, std::memory_order_seq_cst);
+    r->has_written.store(true, std::memory_order_seq_cst);
+    g_write_seq.fetch_add(1, std::memory_order_seq_cst);
     const uint64_t addr = r->base + page * kPage;
     if (old & b) {
         bool ok = true;
@@ -297,6 +301,52 @@ bool release_page(Region* r, uint64_t page) {
         else if (i < 1000) Sleep(0);
         else Sleep(1);
     }
+}
+
+// Coalesces contiguous armed pages ahead of a sequential write fault into a single VirtualProtect call.
+// Caller holds SharedLock(r) and g_busy > 0. Returns the number of extra pages released starting at `start_page`.
+uint64_t release_pages_ahead(Region* r, uint64_t start_page, uint64_t max_count) {
+    if (start_page >= r->npages || max_count == 0) return 0;
+    const uint64_t limit = std::min(r->npages, start_page + max_count);
+    uint64_t cand = 0;
+    for (uint64_t p = start_page; p < limit; ++p) {
+        if (!test(r->prot.get(), p) || test(r->guard.get(), p)) break;
+        const uint64_t a = r->base + p * kPage;
+        if (freeze_overlaps(a, a + kPage)) break;
+        bool other_armed = false;
+        for (RegionCursor cursor; Region* o = cursor.next();) {
+            if (o == r || a < o->base || a >= o->base + o->npages * kPage) continue;
+            const uint64_t opg = (a - o->base) / kPage;
+            if (test(o->prot.get(), opg) || test(o->guard.get(), opg)) { other_armed = true; break; }
+        }
+        if (other_armed) break;
+        ++cand;
+    }
+    if (cand == 0) return 0;
+    uint64_t claimed = 0;
+    for (uint64_t i = 0; i < cand; ++i) {
+        const uint64_t p = start_page + i;
+        const uint64_t b = bit(p);
+        const uint64_t w = p >> 6;
+        std::atomic<uint16_t>& rel = r->releasing[p];
+        rel.fetch_add(1, std::memory_order_seq_cst);
+        const uint64_t old = r->prot[w].fetch_and(~b, std::memory_order_acq_rel);
+        if (!(old & b)) {
+            rel.fetch_sub(1, std::memory_order_seq_cst);
+            break;
+        }
+        r->valid[w].fetch_and(~b, std::memory_order_acq_rel);
+        r->written[w].fetch_or(b, std::memory_order_seq_cst);
+        ++claimed;
+    }
+    if (claimed > 0) {
+        r->has_written.store(true, std::memory_order_seq_cst);
+        g_write_seq.fetch_add(1, std::memory_order_seq_cst);
+        DWORD was = 0;
+        VirtualProtect(reinterpret_cast<void*>(r->base + start_page * kPage), static_cast<SIZE_T>(claimed * kPage), PAGE_READWRITE, &was);
+        for (uint64_t i = 0; i < claimed; ++i) r->releasing[start_page + i].fetch_sub(1, std::memory_order_seq_cst);
+    }
+    return claimed;
 }
 
 // [diag] ww_stats (env NXRT_DIAG_WW_STATS=1): faults per region and per 64 KiB block, the 10 busiest blocks logged every 10 s.
@@ -360,6 +410,7 @@ LONG CALLBACK on_fault(EXCEPTION_POINTERS* ep) {
     const ULONG_PTR kind = rec->ExceptionInformation[0];     // 0 read, 1 write, 8 execute
     if (kind != 0 && kind != 1) return EXCEPTION_CONTINUE_SEARCH;
     const uint64_t addr = static_cast<uint64_t>(rec->ExceptionInformation[1]);
+    if (heap_lazy_fault(addr)) return EXCEPTION_CONTINUE_EXECUTION;   // [memory] heap_lazy_commit: the first use of a heap page
     // A write into a range an import has frozen (ImportFreeze): wait for the import, then let the write run again (the page is
     // read-write again, or armed and handled below on the next fault).
     if (kind == 1 && freeze_overlaps(addr, addr + 1)) {
@@ -418,7 +469,26 @@ retry:
             if (test(r->guard.get(), pg)) { guarded_now = true; continue; }
             if (pass == 0 && !test(r->prot.get(), pg)) continue;
             const bool mine = release_page(r, pg);
-            if (mine) fault_stat(r, addr);
+            if (mine) {
+                fault_stat(r, addr);
+                if (pass == 0) {
+                    // Sequential bulk-write coalescing: after 2+ consecutive sequential page faults on the same region,
+                    // release a small contiguous run (8-16 pages = 32-64 KiB) in one VirtualProtect call.
+                    thread_local const Region* tl_seq_r = nullptr;
+                    thread_local uint64_t tl_seq_next_pg = ~0ull;
+                    thread_local uint32_t tl_seq_run = 0;
+                    if (r == tl_seq_r && pg == tl_seq_next_pg) {
+                        ++tl_seq_run;
+                        uint64_t extra = 0;
+                        if (tl_seq_run >= 2) extra = release_pages_ahead(r, pg + 1, tl_seq_run >= 6 ? 15 : 7);
+                        tl_seq_next_pg = pg + 1 + extra;
+                    } else {
+                        tl_seq_r = r;
+                        tl_seq_next_pg = pg + 1;
+                        tl_seq_run = 0;
+                    }
+                }
+            }
             ours |= mine;
         }
     }
@@ -671,6 +741,7 @@ bool all_valid(const Region* r, uint64_t first, uint64_t count) {
 }
 
 bool page_valid(const Region* r, uint64_t page) { return r && page < r->npages && test(r->valid.get(), page); }
+const std::atomic<uint64_t>* valid_bitmap(const Region* r) { return r ? r->valid.get() : nullptr; }
 bool any_valid(const Region* r, uint64_t first, uint64_t count) {
     if (!r || !count || first >= r->npages) return false;
     const uint64_t end = first + std::min(count, r->npages - first);
@@ -741,10 +812,23 @@ bool all_valid_or_armed(const Region* r, uint64_t first, uint64_t count, const s
 
 uint64_t guard_faults() { return g_guard_faults.load(std::memory_order_relaxed); }
 
+bool has_written(const Region* r) { return r && r->has_written.load(std::memory_order_acquire); }
+uint64_t write_seq() { return g_write_seq.load(std::memory_order_seq_cst); }
+
+uint64_t count_valid(const Region* r) {
+    if (!r) return 0;
+    uint64_t n = 0;
+    for (uint64_t w = 0; w < r->nwords; ++w) n += static_cast<uint64_t>(__builtin_popcountll(r->valid[w].load(std::memory_order_relaxed)));
+    return n;
+}
+
 void take_written(Region* r, std::vector<uint64_t>& out) {
-    if (!r) return;
+    if (!r || !r->has_written.load(std::memory_order_acquire)) return;
+    // Clear before scanning with seq_cst so any concurrent release_page()/forget() that sets written[] after this point
+    // either becomes visible in the scan below or sets has_written = true after our exchange for the next call.
+    r->has_written.exchange(false, std::memory_order_seq_cst);
     for (uint64_t w = 0; w < r->nwords; ++w) {
-        if (!r->written[w].load(std::memory_order_relaxed)) continue;
+        if (!r->written[w].load(std::memory_order_acquire)) continue;
         uint64_t v = r->written[w].exchange(0, std::memory_order_acq_rel);
         while (v) {
             const unsigned long b = static_cast<unsigned long>(__builtin_ctzll(v));
@@ -963,6 +1047,8 @@ void forget(uint64_t addr, uint64_t size, bool ban) {
             if (test(r->prot.get(), q)) release_page(r, q);
         set_bits(r->valid.get(), first, count, false);
         set_bits(r->written.get(), first, count, true);
+        r->has_written.store(true, std::memory_order_seq_cst);
+        g_write_seq.fetch_add(1, std::memory_order_seq_cst);
     });
 }
 

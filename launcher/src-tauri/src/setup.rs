@@ -52,11 +52,15 @@ pub struct Paths {
     pub repo: PathBuf,
     pub exefs: PathBuf,
     pub romfs: PathBuf,
-    /// the dump's dlc/ folder (add-on content the player dumped), when it holds any
+    /// the dump's dlc/ folder (add-on content the player dumped), when it holds any; or the folder given with `--prepare --dlc`
     pub dlc: Option<PathBuf>,
     pub game_dir: PathBuf,
     /// the release package's tools/ folder (tools/build/fefw_build.py next to the launcher); None in a checkout
     pub package: Option<PathBuf>,
+    /// the launcher's picked interface language (launcher.json `lang`; empty: none picked), for the F1 menu
+    pub lang: String,
+    /// "Check for updates at start (launcher and game)" is off (launcher.json `skip_update_check`)
+    pub skip_update_check: bool,
 }
 
 impl Paths {
@@ -205,7 +209,7 @@ type ModSite = (String, String, String, u64);
 const MAIN_BASE: u64 = 0x71_0000_0000;
 const NEXT_MODULE: u64 = 0x75_0000_0000;
 /// This game's program ID (04007EF01F8AE000): a 16-digit hex mods subfolder that is another title's ID is skipped.
-const PROGRAM_ID: u64 = 0x0400_7EF0_1F8A_E000;
+pub const PROGRAM_ID: u64 = 0x0400_7EF0_1F8A_E000;
 
 /// The mods as the runtime finds them (runtime/src/services/common.cpp find_mods, game-build/release/fefw_build.py find_mod_dirs):
 /// a folder below mods/ that has romfs/ or exefs/ is a mod; names starting with -, _ or . are off; a 16-digit hex folder that is
@@ -244,9 +248,10 @@ fn find_mod_dirs(root: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// The installed mods' sites for this game build, checked as game-build/release/fefw_build.py collect_mod_sites and write_sites
-/// check them, with the same messages: a kind a mod cannot add, a line that is not `<kind> <hex address>`, a file without
-/// @nsobid, an address that is not an instruction in main's code. The first problem is the error. A mod's exefs/ folder counts
-/// whether or not its mod.ini switches exefs off (fefw_build.py keeps those sites too, so switching a mod needs no Set up).
+/// check them, with the same messages: a line that is not `<kind> <hex address>`, a file without @nsobid, an address that is not
+/// an instruction in main's code. Unknown site kinds are skipped (issue #165). The first problem is the error. A mod's exefs/
+/// folder counts whether or not its mod.ini switches exefs off (fefw_build.py keeps those sites too, so switching a mod needs no
+/// Set up).
 fn mod_sites(p: &Paths) -> Result<Vec<ModSite>, String> {
     let header = main_header(p);
     let bid = header.as_ref().map(|h| h.0.clone()).unwrap_or_default();
@@ -276,7 +281,8 @@ fn mod_sites(p: &Paths) -> Result<Vec<ModSite>, String> {
                     continue;
                 }
                 if !MOD_SITE_KINDS.contains(&t[0]) {
-                    return Err(format!("{where_}:{ln}: \"{}\" is not a site a mod can add ({})", t[0], MOD_SITE_KINDS.join(", ")));
+                    // a kind another port defines, or a later one: skipped, as the release script does (issue #165)
+                    continue;
                 }
                 let addr = (t.len() == 2)
                     .then(|| u64::from_str_radix(t[1].trim_start_matches("0x").trim_start_matches("0X"), 16).ok())
@@ -332,6 +338,25 @@ fn lift_sites_path(p: &Paths) -> PathBuf {
     }
 }
 
+/// A site list's lines without comments, each as its words (a patch line has two more than a hook's kind and address).
+fn site_lines(path: &Path) -> Option<std::collections::HashSet<String>> {
+    let text = fs::read_to_string(path).ok()?;
+    let words = |l: &str| l.split('#').next().unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase();
+    Some(text.lines().map(words).filter(|l| !l.is_empty()).collect())
+}
+
+/// Whether the libraries were lifted with another main.sites than the repo has now (an update changed it): main.sites against
+/// CMake's copy beside the libraries (work/build/fefw/main.sites). A line the copy lacks counts, and so does a line only the copy
+/// has unless it is a hook: the copy may hold mods' hooks, and a hook nobody attaches to does no harm, but a patch that is gone
+/// is still in the code. Comments do not count. CMake writes the copy before compiling; a Set up lift that was paused or failed
+/// is caught by cpu_variant.txt instead (lift_variant_ok). False when either list is missing (nothing to compare).
+fn lifted_sites_stale(p: &Paths) -> bool {
+    let own = p.repo.join("recomp").join("games").join("fefw").join("main.sites");
+    let (Some(want), Some(lifted)) = (site_lines(&own), site_lines(&p.libs().join("main.sites"))) else { return false };
+    let hook = |l: &str| l.split(' ').next().is_some_and(|kind| MOD_SITE_KINDS.contains(&kind));
+    !want.is_subset(&lifted) || lifted.difference(&want).any(|l| !hook(l))
+}
+
 /// Mods with a hook site that the lifted module libraries lack (the lift step's note).
 pub fn mods_missing_lift_sites(p: &Paths) -> Vec<String> {
     mods_missing_from(p, &lift_sites_path(p))
@@ -349,15 +374,15 @@ fn mod_sites_problem(p: &Paths) -> Option<String> {
     mod_sites(p).err()
 }
 
-/// Whether the lift step has nothing to do: the libraries are newer than the NSO and no mod site is missing from the list they
-/// were lifted with. When Set up wrote a combined list, main's library must also be newer than it: Set up writes the list before
-/// starting the lift (and CMake copies it beside the libraries at configure time, before compiling), so a lift that was paused
-/// or failed is not mistaken for a finished one and Set up lifts again.
+/// Whether the lift step has nothing to do: the libraries are newer than the NSO, were lifted with the current main.sites and no
+/// mod site is missing from the list they were lifted with. When Set up wrote a combined list, main's library must also be newer
+/// than it: Set up writes the list before starting the lift (and CMake copies it beside the libraries at configure time, before
+/// compiling), so a lift that was paused or failed is not mistaken for a finished one and Set up lifts again.
 fn lift_done(p: &Paths) -> bool {
     if p.dev_mod_build() {
         return dev_build_ok(p);
     }
-    if !libs_ok(p) || mod_sites_problem(p).is_some() || !mods_missing_lift_sites(p).is_empty() {
+    if !libs_ok(p) || lifted_sites_stale(p) || mod_sites_problem(p).is_some() || !mods_missing_lift_sites(p).is_empty() {
         return false;
     }
     let combined = p.libs().join("main_with_mods.sites");
@@ -516,6 +541,8 @@ pub struct Progress {
     /// "idle", "running", "done", "cancelled", "error"
     pub state: String,
     pub step: String,
+    /// the part of the step the tool says it is in (fefw_build.py's "lift", "compile", "link"...), empty when it says none
+    pub part: String,
     pub done: u64,
     pub total: u64,
     pub message: String,
@@ -638,7 +665,7 @@ fn textures_ok(p: &Paths) -> bool {
     p.repo.join("tools").join("textures").join("third_party").join("astc-encoder").join("Source").join("astcenc.h").is_file()
 }
 
-const SHADER_TRANSLATOR_VERSION: u32 = 3; // 3: real derivatives for the NVN2 shuffle pattern (#29 eyes); 2: portable 32-lane warps (game-build/release/fefw_build.py has the same number)
+const SHADER_TRANSLATOR_VERSION: u32 = 4; // 4: integer abs without SAbs, which hangs NVIDIA GPUs; 3: real derivatives for the NVN2 shuffle pattern (#29 eyes); 2: portable 32-lane warps (game-build/release/fefw_build.py has the same number)
 
 fn shaders_ok(p: &Paths) -> bool {
     let stamp = fs::read_to_string(p.shader_stamp()).unwrap_or_default();
@@ -743,17 +770,26 @@ pub(crate) fn host_env(cmd: &mut Command) {
 
 /// What host_env changes in `vars` (an environment with an AppImage's APPDIR in it): (name, new value), None removes it.
 pub(crate) fn appimage_fixes(vars: &[(String, String)]) -> Vec<(String, Option<String>)> {
-    // only an AppImage's AppRun: on Windows (';' lists) or with an APPDIR some other program set, nothing is touched
-    if !cfg!(target_os = "linux") || !vars.iter().any(|(k, v)| k == "APPIMAGE" && !v.is_empty()) {
+    // only an AppImage's AppRun (mounted via $APPIMAGE, or unpacked with <APPDIR>/AppRun): on Windows (';' lists) or with an
+    // unrelated APPDIR, nothing is touched
+    if !cfg!(target_os = "linux") {
         return vec![];
     }
     let Some(appdir) = vars.iter().find(|(k, _)| k == "APPDIR").map(|(_, d)| d.trim_end_matches('/').to_string()).filter(|d| d.len() > 1) else {
         return vec![];
     };
+    let has_appimage = vars.iter().any(|(k, v)| k == "APPIMAGE" && !v.is_empty());
+    let unpacked_apprun = Path::new(&appdir).join("AppRun").is_file();
+    if !has_appimage && !unpacked_apprun {
+        return vec![];
+    }
     let mut out = vec![];
     for (k, v) in vars {
         if matches!(k.as_str(), "APPDIR" | "APPIMAGE" | "ARGV0" | "OWD" | "PYTHONHOME" | "PYTHONPATH" | "PYTHONDONTWRITEBYTECODE" | "PERLLIB") {
             out.push((k.clone(), None));
+        } else if k.starts_with("RECOMPLAUNCHER") || matches!(k.as_str(), "TMPDIR" | "TEMP" | "TMP" | "PWD") {
+            // an unpacked AppImage puts AppRun in the install folder, so RecompLauncher's own paths live under APPDIR too
+            continue;
         } else if v.contains(&appdir) {
             let kept: Vec<&str> = v.split(':').filter(|p| !p.is_empty() && !p.contains(&appdir)).collect();
             out.push((k.clone(), (!kept.is_empty()).then(|| kept.join(":"))));
@@ -805,17 +841,19 @@ fn ninja_progress(line: &str) -> Option<(u64, u64)> {
     Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
 }
 
-/// "scan: 12 345" (extract_corpus.py --progress) or the harness's "done N/M" style lines.
-fn tool_progress(line: &str) -> Option<(u64, u64)> {
+/// "@progress <part> N M <text>" (fefw_build.py), "scan: 12 345" (extract_corpus.py --progress) or the harness's "done N/M" style
+/// lines: the part (empty when the line names none), done and total.
+fn tool_progress(line: &str) -> Option<(String, u64, u64)> {
     if let Some(rest) = line.strip_prefix("@progress ") {
-        let mut it = rest.split_whitespace().skip(1);
-        return Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?));
+        let mut it = rest.split_whitespace();
+        let part = it.next()?.to_string();
+        return Some((part, it.next()?.parse().ok()?, it.next()?.parse().ok()?));
     }
     if let Some(rest) = line.strip_prefix("scan: ").or_else(|| line.strip_prefix("prepare: ")) {
         let mut it = rest.split_whitespace();
-        return Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?));
+        return Some((String::new(), it.next()?.parse().ok()?, it.next()?.parse().ok()?));
     }
-    ninja_progress(line)
+    ninja_progress(line).map(|(d, t)| (String::new(), d, t))
 }
 
 pub struct Runner<'a> {
@@ -850,8 +888,8 @@ impl Runner<'_> {
         (self.emit_log)(lines);
     }
 
-    fn progress(&self, step: &str, done: u64, total: u64, message: &str) {
-        let p = Progress { state: "running".into(), step: step.into(), done, total, message: message.into() };
+    fn progress(&self, step: &str, part: &str, done: u64, total: u64, message: &str) {
+        let p = Progress { state: "running".into(), step: step.into(), part: part.into(), done, total, message: message.into() };
         *self.shared.progress.lock().unwrap() = p.clone();
         (self.emit)(p);
     }
@@ -861,7 +899,7 @@ impl Runner<'_> {
         if self.shared.cancel.load(Ordering::SeqCst) {
             return Ok(false);
         }
-        self.progress(step, 0, 0, message);
+        self.progress(step, "", 0, 0, message);
         self.log(vec![format!("> {:?}", cmd)]);
         cmd.current_dir(cwd);
         cmd.env("PYTHONUNBUFFERED", "1").env("NINJA_STATUS", "[%f/%t] ");
@@ -907,9 +945,9 @@ impl Runner<'_> {
             }
             match rx.recv_timeout(Duration::from_millis(150)) {
                 Ok(l) => {
-                    if let Some((d, t)) = tool_progress(&l) {
+                    if let Some((part, d, t)) = tool_progress(&l) {
                         let text = l.strip_prefix("@progress ").and_then(|r| r.splitn(4, ' ').nth(3)).unwrap_or(message).to_string();
-                        self.progress(step, d, t, &text);
+                        self.progress(step, &part, d, t, &text);
                     }
                     if let Some(e) = l.strip_prefix("@error ") {
                         script_error = Some(e.replace("\\n", "\n"));
@@ -1070,8 +1108,10 @@ fn run_package_steps(r: &Runner, p: &Paths, tools: &Path, jobs: usize, runner_se
     if r.shared.cancel.load(Ordering::SeqCst) {
         return Ok(false);
     }
-    r.progress("ini", 0, 0, "Writing fefw.ini");
-    crate::settings::ensure_play_paths(&p.game_dir, p)?;
+    r.progress("ini", "", 0, 0, "Writing fefw.ini");
+    if let Some(note) = crate::settings::ensure_play_paths(&p.game_dir, p)? {
+        r.log(vec![note]);
+    }
     prepare_step(r, p, jobs, runner_setting)
 }
 
@@ -1187,6 +1227,14 @@ fn shader_steps(r: &Runner, p: &Paths, jobs: usize, cwd: &Path) -> Result<bool, 
     Ok(true)
 }
 
+/// Linux with no display for fefw.exe (a launcher run without the window, say by a background service): it does not fail then, it waits
+/// for ever. A runner the player set may bring a display of its own (xvfb-run, gamescope), so only the automatic one is judged.
+fn no_display(runner_setting: &str, var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    cfg!(target_os = "linux")
+        && runner_setting.trim().is_empty()
+        && ["DISPLAY", "WAYLAND_DISPLAY"].iter().all(|k| var(k).is_none_or(|v| v.is_empty()))
+}
+
 /// Compiles the shader parts of every program of the game on this GPU and driver (fefw.exe --prepare-shaders), so the first play session has no
 /// shader to compile. Needs the translated shaders and fefw.ini. It saves time and nothing else: when it cannot run or fails, Set up goes on
 /// (the game then compiles while it is played) and the step is marked given up. Instant when the runtime's state file says this GPU and driver
@@ -1201,6 +1249,10 @@ fn prepare_step(r: &Runner, p: &Paths, jobs: usize, runner_setting: &str) -> Res
         r.log(vec![format!("Shader preparation skipped ({what}). The game compiles shaders while you play instead; Set up tries again next time.")]);
         let _ = fs::write(&skipped, what);
     };
+    if no_display(runner_setting, |k| std::env::var_os(k)) {
+        give_up("there is no display: DISPLAY and WAYLAND_DISPLAY are not set".into());
+        return Ok(true);
+    }
     if !p.programs_bin().is_file() {
         // a Set up from before the list existed: list the programs again (about half a minute), keeping nothing else of the extraction
         let tmp = p.prepare_file("programs-tmp");
@@ -1339,8 +1391,10 @@ fn run_steps(r: &Runner, p: &Paths, jobs: usize, runner_setting: &str) -> Result
     if !shader_steps(r, p, jobs, repo)? {
         return Ok(false);
     }
-    r.progress("ini", 0, 0, "Writing fefw.ini");
-    crate::settings::ensure_play_paths(&p.game_dir, p)?;
+    r.progress("ini", "", 0, 0, "Writing fefw.ini");
+    if let Some(note) = crate::settings::ensure_play_paths(&p.game_dir, p)? {
+        r.log(vec![note]);
+    }
     r.log(vec![format!("fefw.ini is in {}", crate::dump::fwd(&p.game_dir))]);
     prepare_step(r, p, jobs, runner_setting)
 }
@@ -1393,6 +1447,11 @@ pub fn run(
         log_path: p.log(),
     };
     r.log(vec![format!("--- setup: dump exefs {}, romfs {}", crate::dump::fwd(&p.exefs), crate::dump::fwd(&p.romfs))]);
+    // Clear any cached base RomFS tree so re-running Set up after updating/re-dumping the game always rescans fresh.
+    let _ = fs::remove_file(p.game_dir.join("romfs_cache.bin"));
+    if let Some(exe_dir) = p.exe().parent() {
+        let _ = fs::remove_file(exe_dir.join("romfs_cache.bin"));
+    }
     #[cfg(target_os = "linux")]
     let _inhibit = SleepInhibit::acquire();
     #[cfg(target_os = "linux")]
@@ -1420,8 +1479,10 @@ mod tests {
         assert_eq!(ninja_progress("[12/345] Building CXX object x.obj"), Some((12, 345)));
         assert_eq!(ninja_progress("[ 3/ 9] x"), Some((3, 9)));
         assert_eq!(ninja_progress("no"), None);
-        assert_eq!(tool_progress("scan: 5 10"), Some((5, 10)));
-        assert_eq!(tool_progress("prepare: 4900 9943"), Some((4900, 9943)));
+        assert_eq!(tool_progress("scan: 5 10"), Some((String::new(), 5, 10)));
+        assert_eq!(tool_progress("prepare: 4900 9943"), Some((String::new(), 4900, 9943)));
+        assert_eq!(tool_progress("@progress link 0 1 Linking fefw.exe"), Some(("link".into(), 0, 1)));
+        assert_eq!(tool_progress("[12/345] Building CXX object x.obj"), Some((String::new(), 12, 345)));
         assert_eq!(tool_progress("prepare: ready"), None);
         assert_eq!(tool_progress("prepare: done programs=9943 prepared=9943 failed=0 seconds=42.0"), None);
     }
@@ -1494,7 +1555,16 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let repo = root.join("repo");
         let game = root.join("play");
-        let p = Paths { repo: repo.clone(), exefs: root.join("dump"), romfs: root.join("dump"), dlc: None, game_dir: game.clone(), package: None };
+        let p = Paths {
+            repo: repo.clone(),
+            exefs: root.join("dump"),
+            romfs: root.join("dump"),
+            dlc: None,
+            game_dir: game.clone(),
+            package: None,
+            lang: String::new(),
+            skip_update_check: false,
+        };
         // main's NSO header: .text size at +0x18 covering every site below, the build ID at +0x40
         let mut nso = vec![0u8; 0x60];
         nso[0x18..0x1C].copy_from_slice(&0x0200_0000u32.to_le_bytes());
@@ -1585,6 +1655,29 @@ mod tests {
             fs::write(p.libs().join(format!("fefw_{m}.lib")), "lib").unwrap();
         }
         assert!(lift_done(&p));
+        // an update changes main.sites: CMake's copy beside the libraries no longer matches it, so the lift is todo again
+        let copy = p.libs().join("main.sites");
+        fs::write(&copy, &text).unwrap(); // the combined list: main.sites plus mods' hooks
+        assert!(lift_done(&p));
+        let before = fs::read_to_string(&own).unwrap();
+        fs::write(&own, format!("{before}# a new comment\n")).unwrap();
+        assert!(lift_done(&p), "a comment is no change");
+        fs::write(&own, format!("{before}inline 0x71007bf1c4\n")).unwrap();
+        assert!(!lift_done(&p), "a new site");
+        fs::write(&copy, format!("{text}inline 0x71007bf1c4\n")).unwrap();
+        assert!(lift_done(&p));
+        fs::write(&own, &before).unwrap();
+        assert!(lift_done(&p), "a hook that is gone does no harm");
+        fs::write(&own, format!("{before}patch 0x71007bf1c8 d503201f d65f03c0\n")).unwrap();
+        assert!(!lift_done(&p), "a new patch");
+        fs::write(&copy, format!("{text}patch 0x71007bf1c8 d503201f d65f03c0\n")).unwrap();
+        assert!(lift_done(&p));
+        fs::write(&own, format!("{before}patch 0x71007bf1c8 d503201f d503201f\n")).unwrap();
+        assert!(!lift_done(&p), "a patch with another word");
+        fs::write(&own, &before).unwrap();
+        assert!(!lift_done(&p), "a patch that is gone");
+        fs::write(&copy, &text).unwrap();
+        assert!(lift_done(&p));
         // the exe built from that list: nothing missing there either
         fs::write(&list, &text).unwrap();
         assert!(mods_missing_sites(&p).is_empty());
@@ -1600,10 +1693,11 @@ mod tests {
             assert_eq!(missing_sites_detail(&p), e);
             assert_eq!(mod_sites_problem(&p).as_deref(), Some(e.as_str()));
         };
-        check(
-            "@nsobid DB93B0125F4850601D61C3EDDE012F8EB2ECFE77\npatch 0x7100000000\n",
-            "Some_Mod/exefs/bad.sites:2: \"patch\" is not a site a mod can add",
-        );
+        // a kind a mod cannot add here (another port's, or a later one) is skipped, not an error (issue #165)
+        fs::write(&bad, "@nsobid DB93B0125F4850601D61C3EDDE012F8EB2ECFE77\npatch 0x7100000000\ndynimm 0x7100000004\n").unwrap();
+        let kept = mod_sites(&p).unwrap();
+        assert!(!kept.iter().any(|(_, _, k, _)| k == "patch" || k == "dynimm"), "{kept:?}");
+        assert!(kept.iter().all(|(_, _, k, _)| MOD_SITE_KINDS.contains(&k.as_str())), "{kept:?}");
         check("@nsobid DB93B0125F4850601D61C3EDDE012F8EB2ECFE77\nmidhook zz\n", "bad.sites:2: expected \"<kind> <guest address in hex>\"");
         check("midhook 0x71016f21f4\n", "Some_Mod/exefs/bad.sites has no @nsobid line");
         check("@nsobid DB93B0125F4850601D61C3EDDE012F8EB2ECFE77\nmidhook 0x71016f21f2\n", "is not an instruction address in main");
@@ -1621,6 +1715,18 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn shader_preparation_needs_a_display() {
+        let env =
+            |set: &'static [(&'static str, &'static str)]| move |k: &str| set.iter().find(|(n, _)| *n == k).map(|(_, v)| std::ffi::OsString::from(v));
+        assert!(no_display("", env(&[])));
+        assert!(no_display(" ", env(&[("DISPLAY", "")])));
+        assert!(!no_display("", env(&[("DISPLAY", ":0")])));
+        assert!(!no_display("", env(&[("WAYLAND_DISPLAY", "wayland-1")])));
+        assert!(!no_display("xvfb-run wine", env(&[])));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn prepare_step_runs_exe_through_linux_runner() {
         let root = std::env::temp_dir().join(format!("fefw-prepare-runner-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -1632,6 +1738,8 @@ mod tests {
             dlc: None,
             game_dir: game.clone(),
             package: Some(root.join("tools")),
+            lang: String::new(),
+            skip_update_check: false,
         };
         fs::create_dir_all(p.spirv()).unwrap();
         fs::write(p.exe(), b"MZ").unwrap(); // non-executable PE stub: fails if invoked directly without a runner

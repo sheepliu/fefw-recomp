@@ -44,6 +44,7 @@
 #include "fefw/fefw_game.h"   // the Fortune's Weave game module (runtime/games/fefw)
 #include "fefw_cpu.h"         // the CPU features the lifted code needs (per build: FMA3 + AVX or SSE4.2 + POPCNT; CX16), checked first
 #include "fefw_paths.h"       // FEFW_EXEFS_DEFAULT, FEFW_MAIN_DEFAULT, FEFW_ROMFS_DEFAULT (game-build/fefw/CMakeLists.txt)
+#include "fefw_build_id.h"    // FEFW_BUILD_ID: version and git describe (cmake/build_id.cmake)
 
 // Two builds of this file (game-build/fefw/CMakeLists.txt):
 //   fefw.exe     (default): the lifted libraries are linked in, main() below names their module tables.
@@ -360,6 +361,7 @@ int fefw_run(int argc, char** argv) {
     nxrt::InitOptions opt;
     opt.ini_path = ini;
     opt.log_path = logp;
+    opt.app_build = FEFW_BUILD_ID;   // the log's first line and the crash reports name the build
     if (!nxrt::init(opt)) die("runtime start-up failed (address-space layout)");
     for (const auto& kv : boot_opts) nxrt::config_set("boot", kv.first.c_str(), kv.second.c_str());
     const std::string exefs = fs_path("exefs", exefs_arg, FEFW_EXEFS_DEFAULT);
@@ -385,6 +387,7 @@ int fefw_run(int argc, char** argv) {
         if (gfxmode != "none") {
             const bool headless = gfxmode != "window";
             nxrt::play::DisplayConfig disp;
+            if (prepare_mode) nxrt::play::load();   // controls.ini's [display] gpu becomes [gfx] gpu before the device is created, so the shader cache is built for the card the game will normally use (headless skips the present-support checks, so an unusual setup can still differ)
             if (!headless) {
                 disp = nxrt::play::display();       // controls.ini: window size, present mode, frame cap
                 nxrt::platform::init();

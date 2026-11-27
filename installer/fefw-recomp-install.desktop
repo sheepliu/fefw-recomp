@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Install FEFW Recomp
+Comment=Installs the recomp, its Decky plugin and its Steam shortcut
+Icon=system-software-install
+Terminal=false
+StartupNotify=false
+Exec=sh -c "mkdir -p ~/.cache/fefw-recomp-install && exec 9>~/.cache/fefw-recomp-install/lock && { flock -n 9 || { if command -v zenity; then zenity --info --title='FEFW Recomp installer' --text='The installer is already running.'; else kdialog --title 'FEFW Recomp installer' --msgbox 'The installer is already running.'; fi; exit 1; }; } && curl -fsSL --connect-timeout 60 -o ~/.cache/fefw-recomp-install/install.py https://github.com/metrist38/fefw-recomp/releases/latest/download/fefw-recomp-install.py || { if command -v zenity; then zenity --error --title='FEFW Recomp installer' --text='The installer could not be downloaded. Check the internet connection and try again.'; else kdialog --title 'FEFW Recomp installer' --error 'The installer could not be downloaded. Check the internet connection and try again.'; fi; exit 1; }; exec python3 -I ~/.cache/fefw-recomp-install/install.py"

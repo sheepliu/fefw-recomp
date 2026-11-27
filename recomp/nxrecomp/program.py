@@ -15,12 +15,15 @@ Generated files, in <outdir>:
 """
 import bisect
 import collections
+import concurrent.futures
 import multiprocessing
 import os
 import re
 import struct
 import sys
+import threading
 import time
+from concurrent.futures.process import BrokenProcessPool
 
 from .image import Image
 from .lift import Lifter, Fn, Unimpl, bits, sext
@@ -141,6 +144,7 @@ class Env:
         self.starts = []
         self.jt = {}                  # address of a `br` -> sorted list of target addresses (jumptables.py)
         self.tailbr = set()           # addresses of unresolved `br xN` that are indirect tail calls (jumptables.py)
+        self.nonabi = frozenset()     # entries reached by a branch inside one guest function, not by an ABI call (opt.temps_local)
         self.pads = []                # sorted landing pad addresses
         self.catchers = set()         # entries of functions entered through nx_catch_call
         self.eh_starts = set()        # entries of functions that have an LSDA
@@ -418,7 +422,7 @@ def lift_function(env, entry):
         if info.get('flag_entry') or info.get('flag_after_call'):
             env.opt_flag_notes.append((entry, bool(info.get('flag_entry')), bool(info.get('flag_after_call'))))
         if 'tregs' in env.opt and not info.get('skipped'):
-            text, _ = opt.temps_local(text)
+            text, _ = opt.temps_local(text, env.nonabi)
     if two:
         text += '\n%svoid f_%x(Ctx *__restrict NX_NOESC c) { %s }' % (sec, entry, 'nx_catch_call(c, u_%x);' % entry if entry in env.catchers else 'u_%x(c, 0);' % entry)
     return text, len(lines), bad, [(lp, entry) for lp in pads]
@@ -440,6 +444,7 @@ def make_env(spec):
     env.starts = sorted(env.ends)
     env.jt = {int(k): v for k, v in spec['jt'].items()}
     env.tailbr = set(spec.get('tailbr', ()))
+    env.nonabi = frozenset(spec.get('nonabi', ()))
     env.pads = spec['pads']
     env.catchers = set(spec['catchers'])
     env.full = True
@@ -527,6 +532,112 @@ def inline_copy(env, callee):
     return 'static inline void fi_%x(Ctx *__restrict NX_NOESC c) {' % callee + t[len(head):]
 
 
+# ProcessPoolExecutor refuses more workers than this on Windows (it waits on all of them with one WaitForMultipleObjects)
+WINDOWS_MAX_WORKERS = 61
+_worker_init_error = None
+
+
+def _exit_with_parent():
+    multiprocessing.parent_process().join()
+    os._exit(1)
+
+
+def _worker_start(init, spec):
+    """First thing in every process of Workers."""
+    global _worker_init_error
+    # A ProcessPoolExecutor worker can outlive a lifter process that crashes or is killed, and holds the output pipe that
+    # fefw_build.py reads to its end: Set up would wait for ever. So every worker ends with the lifter.
+    threading.Thread(target=_exit_with_parent, daemon=True).start()
+    try:
+        init(spec)
+    except MemoryError:
+        raise                           # breaks the pool: tried again with fewer processes
+    except Exception as e:
+        _worker_init_error = e          # a bug or a bad input, not a dead worker: the first task raises it
+
+
+def _worker_call(fn, item):
+    if _worker_init_error is not None:
+        raise _worker_init_error
+    return fn(item)
+
+
+class Workers:
+    """The worker processes of lift_module; jobs <= 1 runs the tasks in this process.
+
+    A worker can die without raising anything: a native crash on a machine that is not stable with every core busy, or a kill
+    by the system or a security tool (GitHub issue #105). multiprocessing.Pool replaces such a worker and waits for its task
+    for ever. A ProcessPoolExecutor reports it, so the tasks without a result run again, in a new pool with fewer processes.
+    The lift gives up only when a new pool of a single process dies without finishing any task."""
+
+    def __init__(self, jobs, spec, log=print, init=_worker_init):
+        self.jobs = min(jobs, WINDOWS_MAX_WORKERS) if sys.platform == 'win32' else jobs
+        self.local = jobs <= 1
+        self.spec, self.log, self.init = spec, log, init
+        self.pool = None
+        if self.local:
+            init(spec)
+
+    def reset(self, spec):
+        """Workers from here on are set up from `spec`."""
+        self.close()
+        self.spec = spec
+        if self.local:
+            self.init(spec)
+
+    def map(self, fn, items):
+        """[fn(item) for item in items], in that order."""
+        if self.local:
+            return [fn(i) for i in items]
+        results = {}
+        todo = list(range(len(items)))
+        while todo:
+            fresh = self.pool is None
+            if fresh:
+                self.pool = concurrent.futures.ProcessPoolExecutor(self.jobs, initializer=_worker_start,
+                                                                   initargs=(self.init, self.spec))
+            futures = {}
+            try:
+                for i in todo:
+                    futures[self.pool.submit(_worker_call, fn, items[i])] = i
+            except BrokenProcessPool:       # a worker died while the tasks were being handed out
+                pass
+            except BaseException:
+                # When a fork fails, the processes started before it have no manager thread yet: shutdown would not tell
+                # them to stop, and the exit of this process would wait for them for ever.
+                for p in list(self.pool._processes.values()):
+                    p.kill()
+                raise
+            for f in concurrent.futures.as_completed(futures):
+                if not isinstance(f.exception(), BrokenProcessPool):
+                    results[futures[f]] = f.result()         # raises what the task raised
+            left = [i for i in todo if i not in results]
+            if left:
+                self.close()
+                if len(left) == len(todo) and not fresh:
+                    continue                # it may have broken while idle, after the last map: a new pool, not counted
+                if self.jobs == 1 and len(left) == len(todo):
+                    raise RuntimeError('the lifter\'s worker process stopped unexpectedly, also when only one was running. '
+                                       'Check that the PC is stable (CPU overclock or undervolt, memory) and that no security '
+                                       'software stops python.exe.')
+                jobs = max(1, self.jobs * 3 // 4)
+                how = 'in a new process'
+                if jobs < self.jobs:
+                    how = 'with %d process%s instead of %d' % (jobs, '' if jobs == 1 else 'es', self.jobs)
+                self.log('nxrecomp: warning: a worker process stopped unexpectedly; running %d unfinished task%s again %s. If '
+                         'this keeps happening, check the CPU overclock or undervolt, the memory and the security software.'
+                         % (len(left), '' if len(left) == 1 else 's', how))
+                sys.stdout.flush()          # fefw_build.py reads a pipe and passes this line on while the lift still runs
+                self.jobs = jobs
+            todo = left
+        return [results[i] for i in range(len(items))]
+
+    def close(self):
+        if self.pool:
+            self.pool.shutdown(cancel_futures=True)
+            self.pool = None
+
+
 def _write_if_changed(path, content):
     if os.path.exists(path):
         with open(path, encoding='utf-8', newline='') as f:
@@ -566,11 +677,8 @@ def lift_module(spec, outdir, jobs=8, shards=0, bucket=0xC000, log=print):
     known = set(starts)
     pending = list(starts)
     all_funcs, total, bad = [], 0, 0
-    pool = multiprocessing.Pool(jobs, _worker_init, (spec,)) if jobs > 1 else None
-    if pool is None:
-        _worker_init(spec)
+    workers = Workers(jobs, spec, log)
     try:
-        mapper = pool.imap_unordered if pool else map
         # discovery: lifting finds branch targets that are not listed functions (tail calls, fall-through ends).
         # A found entry has no exact end (no FDE covers it): it ends at the next known entry and falls through into it. Each round can
         # find entries inside earlier found ones (code without unwind tables); those shrink and are scanned again, so no stretch of
@@ -580,7 +688,7 @@ def lift_module(spec, outdir, jobs=8, shards=0, bucket=0xC000, log=print):
             pending.sort()
             parts = [[(a, env.ends.get(a) if a in found else None) for a in pending[i:i + 400]] for i in range(0, len(pending), 400)]
             new = set()
-            for n, b, wanted in mapper(_worker_scan, parts):
+            for n, b, wanted in workers.map(_worker_scan, parts):
                 total += n
                 bad += b
                 new.update(w for w in wanted if w not in known and env.text_lo <= w < env.text_hi)
@@ -600,15 +708,17 @@ def lift_module(spec, outdir, jobs=8, shards=0, bucket=0xC000, log=print):
                     env.ends[a] = end
             pending = sorted(new | set(again))
         all_funcs.sort()
+        # Entries a plain branch reaches, with the caller's temporaries live (opt.temps_local): what discovery found (no listed
+        # function starts there) and the functions the hook sites make of their addresses. An entry hook on a real function entry
+        # is in the set too, and so is a real function that only tail calls reach: a branch there then syncs x9..x17 as well,
+        # which costs a few stores and is always right. PLT stubs are left out: a branch to one is a tail call of an import, and
+        # they are most of what discovery finds (5,509 branches to one stub in Fortune's Weave's main).
+        nonabi = sorted(a for a in found | set(env.sites['midhook']) | set(env.sites['entryhook']) if env.plt_symbol(a) is None)
         # workers must know the new entries too (their extents are by the next start): rebuild the spec
-        if len(all_funcs) != len(starts):
+        if len(all_funcs) != len(starts) or nonabi:
+            spec['nonabi'] = nonabi
             spec['ends'] = {a: env.ends.get(a, env.extent(a)) for a in all_funcs}
-            if pool:
-                pool.close()
-                pool = multiprocessing.Pool(jobs, _worker_init, (spec,))
-                mapper = pool.imap_unordered
-            else:
-                _worker_init(spec)
+            workers.reset(spec)
         # shard assignment
         sizes = {a: max(1, (spec['ends'][a] - a) // 4) for a in all_funcs}
         groups = collections.OrderedDict()
@@ -629,7 +739,7 @@ def lift_module(spec, outdir, jobs=8, shards=0, bucket=0xC000, log=print):
             names = {k: 'c_%04x.cpp' % k for k in groups}
         jobs_list = [(k, v) for k, v in groups.items()]
         resume, files, changed, insns, notes, mism = [], [], 0, 0, [], []
-        for (k, entries), (text, res, n, (nt, mm)) in zip(jobs_list, map_ordered(pool, _worker_text, [v for _, v in jobs_list])):
+        for (k, entries), (text, res, n, (nt, mm)) in zip(jobs_list, workers.map(_worker_text, [v for _, v in jobs_list])):
             resume += res
             insns += n
             notes += nt
@@ -638,8 +748,7 @@ def lift_module(spec, outdir, jobs=8, shards=0, bucket=0xC000, log=print):
             files.append(names[k])
             changed += _write_if_changed(os.path.join(outdir, names[k]), content)
     finally:
-        if pool:
-            pool.close()
+        workers.close()
     first = {}
     for lp, e in sorted(resume):
         first.setdefault(lp, e)
@@ -663,10 +772,6 @@ def lift_module(spec, outdir, jobs=8, shards=0, bucket=0xC000, log=print):
             '; NOT replaced (instruction words differ, lifted as usual): ' + ' '.join('%x' % a for a in sorted(mism))) if mism else ''))
     return {'functions': len(all_funcs), 'files': files, 'instructions': insns, 'not_translated': bad, 'opt_flag_notes': sorted(notes),
             'replace_mismatch': sorted(mism)}
-
-
-def map_ordered(pool, fn, items):
-    return pool.map(fn, items) if pool else [fn(i) for i in items]
 
 
 def write_module_files(env, outdir, all_funcs, resume, catchers):

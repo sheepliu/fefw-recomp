@@ -3,18 +3,29 @@
 //! repository's own lift and build scripts on this PC, writes fefw.ini in a run folder and starts the game. It ships no game files.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod art;
 mod cpu;
+mod decky;
 mod dump;
 mod fetch;
 mod gpu;
+mod headless;
 mod ini;
+mod lang;
 mod mods;
 mod locale;
+mod lock;
 mod lsfg;
+mod manifest;
+mod memory;
 mod nup;
+mod pad_volume;
 mod play;
+mod report;
+mod screen;
 mod settings;
 mod setup;
+mod shipped;
 mod steam;
 mod update;
 
@@ -23,7 +34,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use tauri::Emitter;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -43,10 +54,17 @@ struct Config {
     minimize_on_play: bool,
     /// do not ask GitHub for a newer release when the launcher starts
     skip_update_check: bool,
+    /// opt-in: send anonymized crash/performance logs after a run when an issue is detected
+    send_reports: bool,
+    /// whether the one-time opt-in prompt for issue reports has already been answered
+    reports_prompted: bool,
+    /// Linux: the offer of the Decky plugin on the Play page was declined
+    decky_declined: bool,
     /// Linux: the command that starts fefw.exe (Wine or Proton, e.g. `umu-run` or `wine`). Empty: Steam's own Proton if it is
     /// installed, else umu-run, else wine. Unused on Windows.
     runner: String,
-    /// The launcher's own interface language ("en", "zh", or the code of a language pack in locales/). Empty: English.
+    /// The picked interface language ("en", "zh", or the code of a language pack in locales/), for the launcher and the F1 menu.
+    /// Empty: none picked, so both follow the system (lang.rs). Only set_language changes it.
     lang: String,
     /// Linux: LSFG-VK frame generation on top of the game (lsfg.rs)
     lsfg: bool,
@@ -79,19 +97,54 @@ fn load_config(app: &AppHandle) -> Config {
     cfg
 }
 
-fn exe_dir() -> PathBuf {
-    // an AppImage runs from a temporary mount: the package is the folder the .AppImage file is in
+fn is_package_dir(dir: &Path) -> bool {
+    dir.join("tools").join("build").join("fefw_build.py").is_file()
+}
+
+fn resolve_exe_dir(current_exe: Option<&Path>, appdir: Option<&Path>, appimage: Option<&Path>) -> PathBuf {
     #[cfg(target_os = "linux")]
-    if let Some(d) = std::env::var_os("APPIMAGE").map(PathBuf::from).and_then(|p| p.parent().map(|d| d.to_path_buf())) {
-        return d;
+    {
+        // RecompLauncher (and --appimage-extract) unpacks the AppImage into the install folder, putting the binary at
+        // <install>/usr/bin/fefw-launcher with tools/ at <install>/tools/ and no $APPIMAGE.
+        if let Some(exe) = current_exe {
+            if let Some(bin) = exe.parent() {
+                if bin.file_name() == Some(std::ffi::OsStr::new("bin")) {
+                    if let Some(usr) = bin.parent() {
+                        if usr.file_name() == Some(std::ffi::OsStr::new("usr")) {
+                            if let Some(root) = usr.parent() {
+                                if is_package_dir(root) {
+                                    return root.to_path_buf();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(dir) = appdir.filter(|d| !d.as_os_str().is_empty() && is_package_dir(d)) {
+            return dir.to_path_buf();
+        }
+        // Mounted .AppImage: runs from a temporary mount, while the package sits next to the .AppImage file.
+        if let Some(d) = appimage.filter(|p| !p.as_os_str().is_empty()).and_then(|p| p.parent()).filter(|d| !d.as_os_str().is_empty()) {
+            return d.to_path_buf();
+        }
     }
-    std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_else(|| PathBuf::from("."))
+    #[cfg(not(target_os = "linux"))]
+    let _ = (appdir, appimage);
+    current_exe.and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn exe_dir() -> PathBuf {
+    let current_exe = std::env::current_exe().ok();
+    let appdir = std::env::var_os("APPDIR").map(PathBuf::from);
+    let appimage = std::env::var_os("APPIMAGE").map(PathBuf::from);
+    resolve_exe_dir(current_exe.as_deref(), appdir.as_deref(), appimage.as_deref())
 }
 
 /// The release package's tools/ folder, when the launcher runs from the release zip (tools/build/fefw_build.py next to it).
 fn package_tools() -> Option<PathBuf> {
-    let t = exe_dir().join("tools");
-    t.join("build").join("fefw_build.py").is_file().then_some(t)
+    let dir = exe_dir();
+    is_package_dir(&dir).then(|| dir.join("tools"))
 }
 
 fn is_repo(dir: &Path) -> bool {
@@ -148,6 +201,8 @@ fn paths(cfg: &Config) -> Result<setup::Paths, String> {
         dlc: report.dlc_dir.map(PathBuf::from),
         game_dir,
         package: package_tools(),
+        lang: cfg.lang.clone(),
+        skip_update_check: cfg.skip_update_check,
     })
 }
 
@@ -191,8 +246,110 @@ fn save_config(app: AppHandle, mut config: Config) -> Result<(), String> {
     if GAME_ARG.get().is_some_and(|g| *g == config.dump_dir) {
         config.dump_dir = load_saved_config(&app).dump_dir;
     }
-    let text = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    settings::write_atomic(&config_path(&app)?, &text).map_err(|e| format!("cannot save launcher settings: {e}"))
+    // a page holding an older configuration must not undo a language switch or report-prompt answer made since it loaded
+    let saved = load_saved_config(&app);
+    config.lang = saved.lang;
+    config.reports_prompted = saved.reports_prompted || config.reports_prompted || config.send_reports != saved.send_reports;
+    config.decky_declined = saved.decky_declined || config.decky_declined;
+    // the game makes the same check when it is started: a switch here covers it too. fefw.ini first: when it cannot be written, the
+    // switch stays unsaved and can be made again.
+    if config.skip_update_check != saved.skip_update_check {
+        let _lock = lock::for_write(&exe_dir())?;
+        if let Some(repo) = repo_of(&config) {
+            settings::set_update_check(&game_dir_of(&config, &repo), !config.skip_update_check)?;
+        }
+    }
+    store_config(&app, &config)
+}
+
+#[tauri::command]
+fn set_send_reports(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let mut cfg = load_saved_config(&app);
+    cfg.send_reports = enabled;
+    cfg.reports_prompted = true;
+    store_config(&app, &cfg)
+}
+
+/// What the Play page's offer of the Decky plugin shows. None: nothing to offer.
+#[derive(Serialize)]
+struct DeckyOffer {
+    /// the install's folder, for the installer's question, when it would not find it by itself
+    folder: Option<String>,
+}
+
+#[tauri::command]
+fn decky_offer(app: AppHandle) -> Option<DeckyOffer> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    // the installer takes a release package's folder: a checkout's launcher offers nothing
+    let offered = cfg!(target_os = "linux") && package_tools().is_some() && !load_saved_config(&app).decky_declined;
+    if !offered || !decky::wanted(&home, Path::new(decky::SESSIONS)) {
+        return None;
+    }
+    let install = exe_dir();
+    Some(DeckyOffer { folder: (install != home.join("Games").join("fefw-recomp")).then(|| dump::fwd(&install)) })
+}
+
+#[tauri::command]
+fn open_decky_installer() -> Result<(), String> {
+    play::open_with_shell(Path::new(&decky::installer_url()))
+}
+
+#[tauri::command]
+fn decline_decky(app: AppHandle) -> Result<(), String> {
+    let mut cfg = load_saved_config(&app);
+    cfg.decky_declined = true;
+    store_config(&app, &cfg)
+}
+
+fn store_config(app: &AppHandle, config: &Config) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
+    settings::write_atomic(&config_path(app)?, &text).map_err(|e| format!("cannot save launcher settings: {e}"))
+}
+
+/// Windows: a warning when little memory is left for the game to take.
+#[tauri::command]
+fn memory_warning() -> Option<memory::Warning> {
+    memory::warning()
+}
+
+/// The language the launcher shows: the picked one, else the system's.
+#[tauri::command]
+fn ui_language(app: AppHandle) -> String {
+    let picked = load_saved_config(&app).lang;
+    if picked.is_empty() {
+        lang::system_choice()
+    } else {
+        picked
+    }
+}
+
+/// A language picked in the sidebar: saved, and written to fefw.ini for the F1 menu when the file is there.
+#[tauri::command]
+fn set_language(app: AppHandle, code: String) -> Result<(), String> {
+    let mut cfg = load_saved_config(&app);
+    cfg.lang = code;
+    store_config(&app, &cfg)?;
+    // under another process's setup or update the run folder is left alone: Set up and Play bring it in step
+    let Ok(_lock) = lock::for_write(&exe_dir()) else { return Ok(()) };
+    sync_run_folder(&cfg)
+}
+
+/// A release package's own language files, brought up to this launcher's (shipped.rs). A checkout's are the sources: left alone.
+fn refresh_package_locales() {
+    if package_tools().is_some() {
+        shipped::refresh(&locale::locales_dir());
+    }
+}
+
+/// The run folder's language tables, [gfx] ui_language and an update check turned off, brought in step with the launcher (settings.rs).
+fn sync_run_folder(cfg: &Config) -> Result<(), String> {
+    // no checkout or package found: no run folder to keep in step
+    let Some(repo) = repo_of(cfg) else { return Ok(()) };
+    let game_dir = game_dir_of(cfg, &repo);
+    // each is tried, whether or not the other fails
+    let opt_out = settings::apply_update_opt_out(&game_dir, cfg.skip_update_check);
+    let language = settings::apply_menu_language(&game_dir, &repo, package_tools().as_deref(), &cfg.lang);
+    opt_out.and(language)
 }
 
 #[tauri::command]
@@ -311,6 +468,8 @@ async fn import_nup(app: AppHandle, state: State<'_, Arc<setup::Shared>>, path: 
     if state.progress.lock().unwrap().state == "running" {
         return Err("Setup is running. Pause it first.".into());
     }
+    // held while the dump is written: a rebuild reads it
+    let _lock = lock::acquire(&exe_dir())?;
     let cfg = load_config(&app);
     let repo = need_repo(&cfg)?;
     let out = if package_tools().is_some() { game_dir_of(&cfg, &repo).join("nup_dump") } else { repo.join("game").join("nup_dump") };
@@ -360,6 +519,7 @@ fn read_settings(app: AppHandle) -> Result<settings::SettingsDump, String> {
 
 #[tauri::command]
 fn write_settings(app: AppHandle, edits: Vec<settings::Edit>) -> Result<(), String> {
+    let _lock = lock::for_write(&exe_dir())?;
     let cfg = load_config(&app);
     settings::apply(&game_dir_of(&cfg, &need_repo(&cfg)?), &edits)
 }
@@ -378,6 +538,8 @@ struct UpscalerFiles {
     fsr_framegen: FeatureFiles,
     dlss: FeatureFiles,
     dlss_framegen: FeatureFiles,
+    /// the Streamline folder the game uses (the one holding sl.interposer.dll), empty when none does: where a download has to go
+    dlss_dir: String,
     /// NVIDIA files in the Streamline folder the game does not use (not needed by DLSS, nor by frame generation when it is off)
     dlss_unused: Vec<String>,
     xess: FeatureFiles,
@@ -422,19 +584,55 @@ fn files_in(dirs: &[PathBuf], sets: &[&[&str]], what: &str) -> FeatureFiles {
 }
 
 #[tauri::command]
-fn upscaler_files(app: AppHandle, fsr_dir: String, dlss_dir: String, xess_dir: Option<String>) -> Result<UpscalerFiles, String> {
-    let cfg = load_config(&app);
-    let repo = need_repo(&cfg)?;
-    let game = game_dir_of(&cfg, &repo);
+fn upscaler_files(
+    app: AppHandle,
+    fsr_dir: String,
+    dlss_dir: String,
+    xess_dir: Option<String>,
+    frame_gen_dir: Option<String>,
+) -> Result<UpscalerFiles, String> {
+    upscaler_state(&load_config(&app), fsr_dir, dlss_dir, xess_dir, frame_gen_dir)
+}
+
+/// upscaler_files for these settings, also for a run without the window (headless.rs).
+fn upscaler_state(
+    cfg: &Config,
+    fsr_dir: String,
+    dlss_dir: String,
+    xess_dir: Option<String>,
+    frame_gen_dir: Option<String>,
+) -> Result<UpscalerFiles, String> {
+    let repo = need_repo(cfg)?;
+    let game = game_dir_of(cfg, &repo);
     let exe = if package_tools().is_some() { game.join("fefw.exe") } else { setup::exe_path(&repo) };
-    let fsr = upscaler_dirs(&fsr_dir, "fsr", &game, &exe);
+    let with_extra_defaults = |mut v: Vec<PathBuf>| {
+        if let Some(d) = exe.parent() {
+            for extra in [d.join("upscalers").join("fsr3"), d.to_path_buf()] {
+                if !v.contains(&extra) {
+                    v.push(extra);
+                }
+            }
+        }
+        v
+    };
+    // ffx_files.cpp default_dirs also looks in upscalers/fsr3 and in the executable's own folder
+    let fsr = with_extra_defaults(upscaler_dirs(&fsr_dir, "fsr", &game, &exe));
+    // frame generation: [dlss] frame_gen_dll, else the FSR folder setting (never both), then the same defaults
+    let fg_setting = frame_gen_dir.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or(&fsr_dir);
+    let fsr_fg = with_extra_defaults(upscaler_dirs(fg_setting, "fsr", &game, &exe));
     // Streamline: the game takes the setting's folder, else the first default folder holding sl.interposer.dll, and needs every file there
     let sl = upscaler_dirs(&dlss_dir, "streamline", &game, &exe);
     let sl_pick: Vec<PathBuf> = if !dlss_dir.trim().is_empty() {
         sl[..1].to_vec()
     } else {
-        sl.iter().find(|d| d.join("sl.interposer.dll").is_file()).cloned().map(|d| vec![d]).unwrap_or(sl.clone())
+        // none holds sl.interposer.dll: temporal_dlss.cpp sl_dir() then settles on the executable's own folder
+        let mut all = sl.clone();
+        if let Some(d) = exe.parent() {
+            all.push(d.to_path_buf());
+        }
+        sl.iter().find(|d| d.join("sl.interposer.dll").is_file()).cloned().map(|d| vec![d]).unwrap_or(all)
     };
+    let dlss_dir_used = sl_pick.iter().find(|d| d.join("sl.interposer.dll").is_file()).map(|d| dump::fwd(d)).unwrap_or_default();
     // XeSS (runtime/src/gfx/extras/temporal_xess.cpp): libxess.dll in the setting's folder, upscalers/xess, else next to the game
     let mut xess = upscaler_dirs(xess_dir.as_deref().unwrap_or(""), "xess", &game, &exe);
     if let Some(d) = exe.parent() {
@@ -463,9 +661,10 @@ fn upscaler_files(app: AppHandle, fsr_dir: String, dlss_dir: String, xess_dir: O
     };
     Ok(UpscalerFiles {
         fsr_upscaling: files_in(&fsr, &[&["amd_fidelityfx_upscaler_vk.dll"], &["amd_fidelityfx_vk.dll"]], "amd_fidelityfx_upscaler_vk.dll"),
-        fsr_framegen: files_in(&fsr, &[&["amd_fidelityfx_vk.dll"]], "amd_fidelityfx_vk.dll (FidelityFX SDK v1.1.4)"),
+        fsr_framegen: files_in(&fsr_fg, &[&["amd_fidelityfx_vk.dll"]], "amd_fidelityfx_vk.dll (FidelityFX SDK v1.1.4)"),
         dlss: files_in(&sl_pick, &[&DLSS], "the Streamline files"),
         dlss_framegen: files_in(&sl_pick, &[&DLSS_G], "the Streamline frame generation files"),
+        dlss_dir: dlss_dir_used,
         dlss_unused,
         xess: files_in(&xess, &[&["libxess.dll"]], "libxess.dll"),
     })
@@ -475,6 +674,8 @@ fn upscaler_files(app: AppHandle, fsr_dir: String, dlss_dir: String, xess_dir: O
 /// (`dir`), else upscalers/<name> next to the launcher. The page asks the player first (the licence and the source are shown there); see fetch.rs.
 #[tauri::command]
 fn fetch_upscaler(app: AppHandle, state: State<Arc<fetch::Shared>>, kind: String, dir: Option<String>) -> Result<(), String> {
+    // not begun under another process's job; not held on to, as Play need not wait for a download
+    drop(lock::for_write(&exe_dir())?);
     {
         let mut s = state.lock();
         if s.state == "running" {
@@ -569,11 +770,13 @@ fn start_setup(app: AppHandle, state: State<Arc<setup::Shared>>) -> Result<(), S
     }
     let cfg = load_config(&app);
     let p = paths(&cfg)?;
+    let lock;
     {
         let mut pr = state.progress.lock().unwrap();
         if pr.state == "running" {
             return Err("Setup is already running.".into());
         }
+        lock = lock::acquire(&exe_dir())?;
         *pr = setup::Progress { state: "running".into(), step: "python".into(), message: "Starting...".into(), ..Default::default() };
     }
     let shared = state.inner().clone();
@@ -590,6 +793,7 @@ fn start_setup(app: AppHandle, state: State<Arc<setup::Shared>>) -> Result<(), S
             let _ = a2.emit("setup-log", lines);
         };
         let end = setup::run(&shared, &p, jobs, &runner, &emit, &emit_log);
+        drop(lock); // before the page hears the end, and may start the next job
         let _ = app.emit("setup-status", end);
     });
     Ok(())
@@ -611,6 +815,8 @@ fn play(app: AppHandle, state: State<Arc<setup::Shared>>) -> Result<(), String> 
     if !setup::complete(&p) {
         return Err("Setup is not finished: open Setup and press Set up.".into());
     }
+    // not while an update or a rebuild changes the files, and held until the game's process is there for them to see
+    let lock = lock::acquire(&exe_dir())?;
     settings::ensure_play_paths(&p.game_dir, &p)?;
     let mut extra_env = Vec::new();
     if cfg.lsfg && cfg!(target_os = "linux") {
@@ -620,7 +826,21 @@ fn play(app: AppHandle, state: State<Arc<setup::Shared>>) -> Result<(), String> 
         }
         extra_env = lsfg::env(Path::new(&st.dll), cfg.lsfg_multiplier, &cfg.lsfg_flow_scale, cfg.lsfg_performance);
     }
-    play::start(&app, &p.exe(), &p.game_dir, &exe_dir(), cfg.minimize_on_play, &cfg.runner, extra_env)
+    let report_opts = report::Options {
+        config_dir: app.path().app_config_dir().ok(),
+        dump_dir: cfg.dump_dir.clone(),
+        launcher_dir: exe_dir(),
+        launcher_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    // a DualSense on a cable vibrates as strongly as its audio output is loud; on Windows the game sees to that itself
+    let controls = std::fs::read_to_string(p.game_dir.join(settings::CONTROLS_INI)).ok();
+    let volume = (cfg!(target_os = "linux") && pad_volume::wanted(controls.as_deref())).then(|| pad_volume_file(&app)).flatten();
+    play::start(&app, &p.exe(), &p.game_dir, &exe_dir(), cfg.minimize_on_play, &cfg.runner, extra_env, lock, report_opts, volume)
+}
+
+/// Where the controller volumes to put back are kept (pad_volume.rs).
+fn pad_volume_file(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_config_dir().ok().map(|d| d.join("pad-volume.json"))
 }
 
 /// Opens LSFG-VK's install instructions in the browser (Settings, when the layer is missing). A fixed address, nothing from the page.
@@ -649,9 +869,9 @@ async fn lsfg_status() -> lsfg::Status {
 
 /// The variables a Steam shortcut puts in front of %command% (steam::launch_options): NXRT_LAUNCHER_DIR when the game does not find
 /// the upscalers next to itself, and LSFG-VK's when it is on (Err: it is on but cannot be used, why).
-fn steam_vars(cfg: &Config, p: &setup::Paths) -> Result<Vec<(String, String)>, String> {
+fn steam_vars(cfg: &Config, game_dir: &Path) -> Result<Vec<(String, String)>, String> {
     let mut v = Vec::new();
-    if p.game_dir != exe_dir() {
+    if game_dir != exe_dir() {
         v.push(("NXRT_LAUNCHER_DIR".to_string(), dump::game_path(&exe_dir())));
     }
     if cfg.lsfg {
@@ -676,7 +896,8 @@ async fn steam_status(app: AppHandle) -> steam::State {
         match paths(&cfg) {
             // LSFG-VK on but unusable: compare with what it would be without it (Add to Steam then says why it cannot add it)
             Ok(p) => {
-                let vars = steam_vars(&cfg, &p).unwrap_or_else(|_| steam_vars(&Config { lsfg: false, ..cfg.clone() }, &p).unwrap_or_default());
+                let without = || steam_vars(&Config { lsfg: false, ..cfg.clone() }, &p.game_dir).unwrap_or_default();
+                let vars = steam_vars(&cfg, &p.game_dir).unwrap_or_else(|_| without());
                 steam::state(&p.exe(), &vars)
             }
             Err(_) => steam::State::default(),
@@ -696,7 +917,7 @@ async fn add_to_steam(app: AppHandle) -> Result<String, String> {
     if !exe.is_file() {
         return Err("fefw.exe is not built yet. Run Set up first.".into());
     }
-    let vars = steam_vars(&cfg, &p)?;
+    let vars = steam_vars(&cfg, &p.game_dir)?;
     let close = if steam::state(&exe, &vars).running {
         app.dialog()
             .message(
@@ -771,13 +992,18 @@ async fn gpu_info() -> gpu::Gpus {
     tauri::async_runtime::spawn_blocking(gpu::get).await.unwrap_or_default()
 }
 
-#[tauri::command]
-async fn check_update(app: AppHandle) -> Result<update::Check, String> {
-    // FEFW_LAUNCHER_PRETEND_VERSION: test the update path against the published release from an older-looking launcher
-    let current = std::env::var("FEFW_LAUNCHER_PRETEND_VERSION")
+/// The version updates are compared with: FEFW_BUILD_ID's when the build has one, else the launcher's `own`.
+/// FEFW_LAUNCHER_PRETEND_VERSION: test the update path against the published release from an older-looking launcher.
+fn current_version(own: String) -> String {
+    std::env::var("FEFW_LAUNCHER_PRETEND_VERSION")
         .ok()
         .filter(|v| update::parse_version(v).is_some())
-        .unwrap_or_else(|| update::BUILD_ID.map(String::from).unwrap_or_else(|| app.package_info().version.to_string()));
+        .unwrap_or_else(|| update::BUILD_ID.map(String::from).unwrap_or(own))
+}
+
+#[tauri::command]
+async fn check_update(app: AppHandle) -> Result<update::Check, String> {
+    let current = current_version(app.package_info().version.to_string());
     let package = package_tools().is_some();
     tauri::async_runtime::spawn_blocking(move || update::check(&current, package)).await.map_err(|e| e.to_string())?
 }
@@ -811,11 +1037,13 @@ fn start_update(
     if play_state.0.lock().unwrap().state == "running" {
         return Err("The game is running. Close it first.".into());
     }
+    let lock;
     {
         let mut s = state.status.lock().unwrap();
         if s.state == "running" {
             return Err("An update is already running.".into());
         }
+        lock = lock::acquire(&exe_dir())?;
         *s = update::Status {
             state: "running".into(),
             phase: "download".into(),
@@ -834,11 +1062,13 @@ fn start_update(
         let emit = move |s: update::Status| {
             let _ = a.emit("update-status", s);
         };
-        let run = update::Run { shared: &shared, install, game_dir, emit: &emit };
+        // the window's own game was checked above
+        let run = update::Run { shared: &shared, install, game_dir, emit: &emit, ready: &|| Ok(()) };
         let end = match run.run(&release) {
             Ok(s) => s,
             Err(e) => update::Status { state: "error".into(), message: e, version: release.version.clone(), ..Default::default() },
         };
+        drop(lock);
         *shared.status.lock().unwrap() = end.clone();
         let _ = app.emit("update-status", end);
     });
@@ -853,13 +1083,25 @@ fn cancel_update(state: State<Arc<update::Shared>>) {
 /// Starts the (new) launcher from the install folder and closes this one.
 #[tauri::command]
 fn restart_launcher(app: AppHandle) -> Result<(), String> {
-    let exe = match std::env::var_os("APPIMAGE") {
-        Some(a) if !cfg!(windows) => PathBuf::from(a),
-        _ => exe_dir().join(if cfg!(windows) { "fefw-launcher.exe" } else { "fefw-launcher" }),
+    let dir = exe_dir();
+    let exe = if !cfg!(windows) {
+        // After an in-launcher update, update::install() places the new fefw-launcher.AppImage in `dir` even if we were
+        // started from an unpacked AppRun, so prefer it over the stale extracted AppRun.
+        if dir.join("fefw-launcher.AppImage").is_file() {
+            dir.join("fefw-launcher.AppImage")
+        } else if let Some(a) = std::env::var_os("APPIMAGE").filter(|a| !a.is_empty()) {
+            PathBuf::from(a)
+        } else if dir.join("AppRun").is_file() {
+            dir.join("AppRun")
+        } else {
+            dir.join("fefw-launcher")
+        }
+    } else {
+        dir.join("fefw-launcher.exe")
     };
     let mut c = std::process::Command::new(&exe);
     setup::host_env(&mut c); // not this AppImage's environment: its mount goes away when this launcher exits
-    c.current_dir(exe_dir()).spawn().map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
+    c.current_dir(&dir).spawn().map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
     app.exit(0);
     Ok(())
 }
@@ -893,9 +1135,9 @@ fn prepare_fail(msg: &str) -> i32 {
     1
 }
 
-/// --prepare --game <dump folder or .nup>: the same setup the Setup page runs (setup::run), without a window.
+/// --prepare --game <dump folder or .nup> [--dlc <folder of add-ons>]: the same setup the Setup page runs (setup::run), without a window.
 /// Prints `progress <0..1> <text>` lines; returns the exit code.
-fn prepare_headless(game: Option<String>) -> i32 {
+fn prepare_headless(game: Option<String>, dlc: Option<String>) -> i32 {
     let game = match game.filter(|g| !g.trim().is_empty()) {
         Some(g) => g,
         None => return prepare_fail("--prepare needs --game <dump folder or .nup file>."),
@@ -903,6 +1145,26 @@ fn prepare_headless(game: Option<String>) -> i32 {
     if let Some(why) = cpu::check() {
         return prepare_fail(&why);
     }
+    let mut dlc_dir = None;
+    if let Some(d) = dlc.filter(|d| !d.trim().is_empty()) {
+        let d = match std::path::absolute(d.trim()) {
+            Ok(d) => d,
+            Err(e) => return prepare_fail(&format!("Cannot use the DLC folder {}: {e}", d.trim())),
+        };
+        let ours = |id: &String| u64::from_str_radix(id, 16).is_ok_and(|id| id & !0xFFF == setup::PROGRAM_ID + 0x1000 && id & 0xFFF != 0);
+        if !dump::scan_dlc(&d).iter().any(ours) {
+            return prepare_fail(&format!(
+                "No add-ons for this game found in {}. Pick the folder that holds one folder per title id, each with a romfs folder in it.",
+                d.display()
+            ));
+        }
+        dlc_dir = Some(d);
+    }
+    let _lock = match lock::acquire(&exe_dir()) {
+        Ok(l) => l,
+        Err(e) => return prepare_fail(&e),
+    };
+    refresh_package_locales();
     let mut cfg = Config { dump_dir: game.trim().to_string(), ..Default::default() };
     let mut base = 0.0f64;
     let src = PathBuf::from(&cfg.dump_dir);
@@ -936,27 +1198,23 @@ fn prepare_headless(game: Option<String>) -> i32 {
             Err(e) => return prepare_fail(&e),
         }
     }
-    let p = match paths(&cfg) {
+    let mut p = match paths(&cfg) {
         Ok(p) => p,
         Err(e) => return prepare_fail(&e),
     };
+    if dlc_dir.is_some() {
+        p.dlc = dlc_dir;
+    }
     let shared = Arc::new(setup::Shared::default());
     *shared.progress.lock().unwrap() =
         setup::Progress { state: "running".into(), step: "python".into(), message: "Starting...".into(), ..Default::default() };
     shared.cancel.store(false, Ordering::SeqCst);
     let jobs = jobs_of(&cfg);
-    let n = setup::steps(&p, None).iter().filter(|s| s.state != "done").count().max(1) as f64;
-    let seen = Arc::new(Mutex::new((String::new(), 0usize)));
+    let overall = headless::Overall::new(&p, base);
     let emit = move |pr: setup::Progress| {
-        let mut g = seen.lock().unwrap();
-        if g.0 != pr.step {
-            g.0 = pr.step.clone();
-            g.1 += 1;
-        }
-        let within = if pr.total > 0 { (pr.done as f64 / pr.total as f64).min(1.0) } else { 0.0 };
-        let f = base + (1.0 - base) * (g.1.saturating_sub(1) as f64 + within) / n;
+        let f = overall.at(&pr);
         let text = pr.message.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(pr.step.as_str()).to_string();
-        out_line(&format!("progress {:.3} {}", f.clamp(0.0, 1.0), text));
+        out_line(&format!("progress {f:.3} {text}"));
     };
     let emit_log = move |_lines: Vec<String>| {};
     let end = setup::run(&shared, &p, jobs, &cfg.runner, &emit, &emit_log);
@@ -977,15 +1235,21 @@ fn prepare_headless(game: Option<String>) -> i32 {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(cmd) = headless::command(&args) {
+        std::process::exit(headless::run(cmd));
+    }
     let game_arg = arg_value(&args, "--game");
     if args.iter().any(|a| a == "--prepare") {
-        std::process::exit(prepare_headless(game_arg));
+        std::process::exit(prepare_headless(game_arg, arg_value(&args, "--dlc")));
     }
     if let Some(g) = game_arg.filter(|g| PathBuf::from(g.trim()).is_dir()) {
         let _ = GAME_ARG.set(g.trim().to_string());
     }
     if package_tools().is_some() {
-        update::cleanup(&exe_dir());
+        // not under an update that is running: these are its files
+        if let Ok(_lock) = lock::acquire(&exe_dir()) {
+            update::cleanup(&exe_dir());
+        }
     }
     // probed now, off the main thread, so the Settings page finds the answer ready (PowerShell takes a moment on Windows)
     std::thread::spawn(gpu::get);
@@ -995,6 +1259,24 @@ fn main() {
         .manage(Arc::new(setup::Shared::default()))
         .manage(Arc::new(update::Shared::default()))
         .manage(Arc::new(fetch::Shared::default()))
+        .setup(|app| {
+            // a controller volume an earlier session could not put back; not while a game it was raised for may still run
+            if let Some(file) = pad_volume_file(app.handle()).filter(|_| cfg!(target_os = "linux")) {
+                if !headless::game_running(&headless::install_dirs(&load_config(app.handle()))) {
+                    pad_volume::recover(file);
+                }
+            }
+            // at every start, so that an update or a new default also reaches a game started without Play; the package first,
+            // as the run folder takes its tables from there
+            // not under another process's setup or update: Set up and Play bring the run folder in step
+            if let Ok(_lock) = lock::acquire(&exe_dir()) {
+                refresh_package_locales();
+                if let Err(e) = sync_run_folder(&load_config(app.handle())) {
+                    eprintln!("[run folder] {e}");
+                }
+            }
+            Ok(())
+        })
         .on_window_event(|window, event| {
             // closing the window pauses a running setup rather than leaving its compilers behind
             if let tauri::WindowEvent::Destroyed = event {
@@ -1006,6 +1288,13 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_config,
             save_config,
+            set_send_reports,
+            decky_offer,
+            open_decky_installer,
+            decline_decky,
+            ui_language,
+            memory_warning,
+            set_language,
             get_overview,
             pick_folder,
             pick_nup,
@@ -1048,4 +1337,37 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running the launcher");
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_exe_dir_handles_unpacked_and_mounted_appimage() {
+        let base = std::env::temp_dir().join(format!("fefw-exe-dir-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let install = base.join("install");
+        std::fs::create_dir_all(install.join("tools/build")).unwrap();
+        std::fs::write(install.join("tools/build/fefw_build.py"), "").unwrap();
+        let unpacked_exe = install.join("usr/bin/fefw-launcher");
+        std::fs::create_dir_all(unpacked_exe.parent().unwrap()).unwrap();
+        std::fs::write(&unpacked_exe, "").unwrap();
+
+        // 1. Unpacked AppImage (RecompLauncher): $APPIMAGE unset
+        assert_eq!(resolve_exe_dir(Some(&unpacked_exe), Some(&install), None), install);
+        // 2. Unpacked AppImage with a leaked parent $APPIMAGE (e.g. RecompLauncher's own AppImage)
+        let foreign_appimage = base.join("other/RecompLauncher.AppImage");
+        assert_eq!(resolve_exe_dir(Some(&unpacked_exe), None, Some(&foreign_appimage)), install);
+        // 3. Mounted .AppImage (/tmp/.mount_.../usr/bin/fefw-launcher)
+        let mount = base.join("mount");
+        let mounted_exe = mount.join("usr/bin/fefw-launcher");
+        let own_appimage = install.join("fefw-launcher.AppImage");
+        assert_eq!(resolve_exe_dir(Some(&mounted_exe), Some(&mount), Some(&own_appimage)), install);
+        // 4. Dev build (no tools/build/fefw_build.py, no $APPIMAGE)
+        let dev_exe = base.join("checkout/target/debug/fefw-launcher");
+        assert_eq!(resolve_exe_dir(Some(&dev_exe), None, None), base.join("checkout/target/debug"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

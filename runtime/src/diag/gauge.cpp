@@ -21,6 +21,7 @@
 #include "nxrt/config.h"
 #include "nxrt/diag.h"
 #include "nxrt/log.h"
+#include "nxrt/runtime.h"
 
 namespace nxrt {
 namespace {
@@ -61,6 +62,7 @@ std::atomic<size_t> g_nsrc{0};
 uint64_t g_prev_val[kMaxSources];                 // the sources at the previous frame; the presenting thread only
 std::atomic<bool> g_hitch_on{false};
 std::atomic<uint64_t> g_hitch_ticks{0};           // a frame longer than this is a hitch
+double g_stamp_s = 60.0;                          // [diag] session_stamp_s: set by hitch_start before the monitor thread starts
 std::atomic<uint64_t> g_t0_ticks{0};
 
 // phase timers (HitchPhase): QPC ticks summed over all threads
@@ -107,7 +109,7 @@ std::vector<HitchEvent> g_pending;
 // Render thread work = replay - GPU slot waits - lock waits + present - limiter - acquire; its CPU time comes from QueryThreadCycleTime (TSC
 // cycles on the core). Game work = the gap between two presents - the present's back pressure (waiting for the render thread).
 struct RFrame { float dt = 0, work = 0, gpu = 0, idle = 0, lim = 0, kcyc = 0, sub = 0, split = 0; };
-struct GFrame { float gap = 0, bp = 0, sync = 0, wait = 0, kcyc = 0; };
+struct GFrame { float gap = 0, bp = 0, sync = 0, wait = 0, ipc = 0, guest_sync = 0, kcyc = 0; };
 constexpr size_t kBRing = 8192;
 std::atomic<bool> g_budget_on{false};
 RFrame g_rf[kBRing];
@@ -259,6 +261,7 @@ std::string format_event(const HitchEvent& ev, size_t others) {
             game += b;
         }
     }
+    part(game, "guest sync waits", kHpGameGuestSync);
     if (ev.game_cpu_ms >= 0) {
         snprintf(b, sizeof b, ", presenting thread on the CPU %.1f", ev.game_cpu_ms);
         game += b;
@@ -370,11 +373,16 @@ void budget_report() {
                 [&] { std::vector<float> v = gsync; std::sort(v.begin(), v.end()); return pct(v, 0.99); }(), slow, by_game, by_render, by_gpu);
     if (!gap.empty()) {   // where the game thread's waits go and what the render thread's submissions cost (waits track): a line of its own, so the parsers of
         // the two lines above see them unchanged
-        std::vector<float> gbp;
-        for (uint64_t i = g0; i < gn; i++) gbp.push_back(g_gf[i % kBRing].bp);
-        NXLOG_I("budget", "waits per present: game thread system-call waits %s; GPU sync waits (all threads) %s; present back pressure %s | render thread per frame: "
-                "queue submits + present submit %s; split submissions %s",
-                pcts2(gwait).c_str(), pcts2(gsync).c_str(), pcts2(gbp).c_str(), pcts2(sub).c_str(), pcts2(split).c_str());
+        std::vector<float> gbp, gipc, ggsync;
+        for (uint64_t i = g0; i < gn; i++) {
+            const GFrame& f = g_gf[i % kBRing];
+            gbp.push_back(f.bp);
+            gipc.push_back(f.ipc);
+            ggsync.push_back(f.guest_sync);
+        }
+        NXLOG_I("budget", "waits per present: game thread system-call waits %s; guest sync waits %s; IPC %s; GPU sync waits (all threads) %s; present back pressure %s | "
+                "render thread per frame: queue submits + present submit %s; split submissions %s",
+                pcts2(gwait).c_str(), pcts2(ggsync).c_str(), pcts2(gipc).c_str(), pcts2(gsync).c_str(), pcts2(gbp).c_str(), pcts2(sub).c_str(), pcts2(split).c_str());
     }
 }
 
@@ -504,6 +512,10 @@ void monitor_run(double summary_s) {
     auto last_line = Clock::now() - std::chrono::seconds(10);
     uint64_t last_n = g_ring_n.load(std::memory_order_acquire);
     bool seen_frames = last_n > 0;
+    // The build and the GPU, again: reports are often cut to their last few MB, which loses the first lines of the log.
+    const double stamp_s = g_stamp_s;
+    const auto stamp_period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(stamp_s > 0 ? stamp_s : 1e6));
+    auto next_stamp = Clock::now() + stamp_period;
     for (;;) {
         {
             std::unique_lock<std::mutex> lk(s.m);
@@ -523,6 +535,10 @@ void monitor_run(double summary_s) {
                 NXLOG_W("hitch", "%s", format_event(worst, cnt - 1).c_str());
                 last_line = now;
             }
+        }
+        if (stamp_s > 0 && now >= next_stamp) {
+            next_stamp = now + stamp_period;
+            NXLOG_I("runtime", "session: %s", session_stamp().c_str());
         }
         if (summary_s > 0 && now >= next_summary) {
             next_summary = now + period;
@@ -544,6 +560,13 @@ void monitor_run(double summary_s) {
                         (unsigned long long)window_frames, st.span_s, st.mean_fps, st.low1_fps, st.worst_ms, st.over2x, st.median_ms);
             } else if (seen_frames) {
                 NXLOG_W("hitch", "no frame presented in the last %.1f s", summary_s);
+            }
+            // Warn once about ini lines nothing read (a typo, a key in the wrong section), 20 s or more into presenting frames
+            static double unread_s = 0;
+            static bool unread_done = false;
+            if (seen_frames && !unread_done && (unread_s += summary_s) >= 20.0) {
+                unread_done = true;
+                config_log_unread(unread_s);
             }
             if (g_budget_on.load(std::memory_order_relaxed)) {
                 if (!dt.empty()) budget_report();
@@ -620,7 +643,7 @@ void run(double interval_s, double t0) {
                  "{\"t\":%.1f,\"frame\":%llu,\"win_frames\":%llu,\"ft_p50\":%.3f,\"ft_p99\":%.3f,\"ft_max\":%.2f,\"ws\":%llu,\"private\":%llu,\"peak_ws\":%llu,"
                  "\"pagefile\":%llu,\"handles\":%lu,\"threads\":%u,\"gdi\":%lu,\"user\":%lu,\"cpu_ms\":%.0f",
                  now - t0, (unsigned long long)diag_frame_count(), (unsigned long long)window_frames, p50, p99, mx, (unsigned long long)pm.WorkingSetSize,
-                 (unsigned long long)pm.PrivateUsage, (unsigned long long)pm.PeakWorkingSetSize, (unsigned long long)pm.PagefileUsage, (unsigned long)handles,
+                 (unsigned long long)(pm.PrivateUsage ? pm.PrivateUsage : pm.PagefileUsage), (unsigned long long)pm.PeakWorkingSetSize, (unsigned long long)pm.PagefileUsage, (unsigned long)handles,
                  thread_count(), (unsigned long)GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS), (unsigned long)GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS),
                  cpu_ms);
         std::string line = buf;
@@ -781,10 +804,11 @@ void hitch_note_game_present() {
     const uint64_t t = qpc();
     const uint64_t prev = g_game_present_last.exchange(t, std::memory_order_relaxed);
     if (g_budget_on.load(std::memory_order_relaxed)) {
-        static thread_local uint64_t p_cyc = 0, p_bp = 0, p_sync = 0, p_wait = 0;
+        static thread_local uint64_t p_cyc = 0, p_bp = 0, p_sync = 0, p_wait = 0, p_ipc = 0, p_gsync = 0;
         const uint64_t cyc = thread_cycles();
         const uint64_t bp = g_phase[kHpGameBackpressure].load(std::memory_order_relaxed), sy = g_phase[kHpGameSyncWait].load(std::memory_order_relaxed),
-                       wt = g_phase[kHpGameWait].load(std::memory_order_relaxed);
+                       wt = g_phase[kHpGameWait].load(std::memory_order_relaxed), ip = g_phase[kHpGameIpc].load(std::memory_order_relaxed),
+                       gs = g_phase[kHpGameGuestSync].load(std::memory_order_relaxed);
         if (prev && t > prev && p_cyc) {
             const double tm = 1000.0 / qpc_freq();
             GFrame f;
@@ -792,12 +816,14 @@ void hitch_note_game_present() {
             f.bp = (float)((double)(bp - p_bp) * tm);
             f.sync = (float)((double)(sy - p_sync) * tm);
             f.wait = (float)((double)(wt - p_wait) * tm);
+            f.ipc = (float)((double)(ip - p_ipc) * tm);
+            f.guest_sync = (float)((double)(gs - p_gsync) * tm);
             f.kcyc = (float)((double)(cyc - p_cyc) / 1000.0);
             const uint64_t k = g_gf_n.load(std::memory_order_relaxed);
             g_gf[k % kBRing] = f;
             g_gf_n.store(k + 1, std::memory_order_release);
         }
-        p_cyc = cyc, p_bp = bp, p_sync = sy, p_wait = wt;
+        p_cyc = cyc, p_bp = bp, p_sync = sy, p_wait = wt, p_ipc = ip, p_gsync = gs;
     }
     if (!prev || t <= prev) return;
     const uint64_t d = t - prev;
@@ -826,6 +852,7 @@ void hitch_start() {
     if (s.th.joinable()) return;
     const double summary_s = config_get_double("diag", "hitch_summary_s", 10.0);
     const double hitch_ms = config_get_double("diag", "hitch_ms", 50.0);
+    g_stamp_s = config_get_double("diag", "session_stamp_s", 60.0);   // 0: off
     g_t0_ticks.store(qpc());
     g_qpc0 = qpc();
     g_tsc0 = __rdtsc();

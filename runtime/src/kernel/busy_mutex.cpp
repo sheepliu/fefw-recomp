@@ -19,6 +19,7 @@
 #include "nxrt/abi.h"
 #include "nxrt/config.h"
 #include "nxrt/dispatch.h"
+#include "nxrt/gauge.h"
 #include "nxrt/kernel.h"
 #include "nxrt/log.h"
 #include "nxrt/module.h"
@@ -35,12 +36,17 @@ void lock_busy_mutex(::Ctx* c) {
     auto* word = reinterpret_cast<std::atomic<uint32_t>*>(c->x[0] + kWordOffset);
     auto* disable = reinterpret_cast<uint16_t*>(c->tpidrro + kTlsDisableCount);
     const uint16_t held = *disable;
-    for (uint32_t spins = 0;; spins++) {
-        uint32_t expected = 0;
-        if (word->load(std::memory_order_relaxed) == 0 && word->compare_exchange_weak(expected, 1, std::memory_order_acquire)) break;
-        if (spins < 64) YieldProcessor();
-        else if (spins < 20000) yield_host();
-        else Sleep(1);
+    uint32_t expected = 0;
+    if (word->load(std::memory_order_relaxed) != 0 || !word->compare_exchange_weak(expected, 1, std::memory_order_acquire)) {
+        const uint64_t t0 = hitch_on_game_present_thread() ? hitch_ticks() : 0;
+        for (uint32_t spins = 0;; spins++) {
+            expected = 0;
+            if (word->load(std::memory_order_relaxed) == 0 && word->compare_exchange_weak(expected, 1, std::memory_order_acquire)) break;
+            if (spins < 64) YieldProcessor();
+            else if (spins < 20000) yield_host();
+            else Sleep(1);
+        }
+        if (t0) hitch_phase_add(kHpGameGuestSync, hitch_ticks() - t0);
     }
     *disable = static_cast<uint16_t>(held + 1);
 }
@@ -49,8 +55,13 @@ void lock_busy_mutex(::Ctx* c) {
 // once. YIELD marks a spin loop that expects the other side to run soon: a PAUSE, and every 64th call a real hand-over.
 void spin_hint(int kind) {
     thread_local uint32_t n = 0;
-    if (kind == 1 || (++n & 63) == 0) yield_host();
-    else YieldProcessor();
+    if (kind == 1 || (++n & 63) == 0) {
+        const uint64_t t0 = hitch_on_game_present_thread() ? hitch_ticks() : 0;
+        yield_host();
+        if (t0) hitch_phase_add(kHpGameGuestSync, hitch_ticks() - t0);
+    } else {
+        YieldProcessor();
+    }
 }
 
 }  // namespace

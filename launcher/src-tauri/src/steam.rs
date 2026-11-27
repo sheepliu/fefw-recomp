@@ -146,6 +146,35 @@ fn is_ours(e: &[(Vec<u8>, Node)], exe: &Path) -> bool {
     str_of(e, "Exe").trim().trim_matches('"') == exe.to_string_lossy()
 }
 
+/// The ids in `files` (accounts' shortcuts.vdf) of the shortcuts that start `exe`, each once. A file that cannot be read as one,
+/// and an entry without an id, say nothing.
+fn ids_in(files: impl Iterator<Item = Vec<u8>>, exe: &Path) -> Vec<u32> {
+    let mut ids = Vec::new();
+    for top in files.filter_map(|d| parse(&d).ok()) {
+        let Some(Node::Map(list)) = get(&top, "shortcuts") else { continue };
+        for (_, v) in list {
+            if let Node::Map(e) = v {
+                if let (true, Some(Node::Int(id))) = (is_ours(e, exe), get(e, "appid")) {
+                    if !ids.contains(id) {
+                        ids.push(*id);
+                    }
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// Linux: the ids of the Steam shortcuts that start this fefw.exe, as saved on disk, at most one an account unless the player made
+/// more. Steam starts a shortcut by its id (the Decky plugin's Play).
+pub fn shortcut_ids(exe: &Path) -> Vec<u32> {
+    let Some(inst) = find_install().filter(|_| cfg!(target_os = "linux")) else {
+        return vec![];
+    };
+    let files = accounts(&inst.root).into_iter().filter_map(|a| fs::read(a.join("config").join("shortcuts.vdf")).ok());
+    ids_in(files, exe)
+}
+
 /// The variables the launcher puts in front of %command% in a shortcut's launch options: NXRT_LAUNCHER_DIR, and LSFG-VK's (lsfg.rs)
 /// with the game's own frame generation turned off while it is on. Any of them the shortcut has is replaced; the rest is the player's.
 const OUR_VARS: [&str; 7] = [
@@ -357,6 +386,20 @@ pub fn state(exe: &Path, vars: &[(String, String)]) -> State {
     State { available: true, running: running().is_some(), added, stale }
 }
 
+/// The library art for the shortcut that starts `exe`, in `config` (its account's), and its icon in the entry when that has none.
+fn add_art(top: &mut [(Vec<u8>, Node)], exe: &Path, config: &Path) {
+    let Some(Node::Map(list)) = top.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(b"shortcuts")).map(|(_, v)| v) else { return };
+    for (_, v) in list {
+        let Node::Map(e) = v else { continue };
+        let Some(&Node::Int(id)) = get(e, "appid").filter(|_| is_ours(e, exe)) else { continue };
+        if let Some(icon) = crate::art::apply(config, id) {
+            if str_of(e, "icon").is_empty() {
+                set(e, "icon", Node::Str(icon.to_string_lossy().into_owned().into_bytes()));
+            }
+        }
+    }
+}
+
 fn update_file(path: &Path, exe: &Path, start_dir: &Path, vars: &[(String, String)]) -> Result<bool, String> {
     let old = fs::read(path).ok();
     let mut top = match &old {
@@ -370,6 +413,9 @@ fn update_file(path: &Path, exe: &Path, start_dir: &Path, vars: &[(String, Strin
         None => vec![],
     };
     let existed = upsert(&mut top, exe, start_dir, vars)?;
+    if let Some(config) = path.parent() {
+        add_art(&mut top, exe, config);
+    }
     // the file as it was before the launcher first changed it: a later Add to Steam does not replace it
     let backup = path.with_extension("vdf.fefw-backup");
     if let (Some(d), false) = (&old, backup.exists()) {
@@ -516,6 +562,27 @@ mod tests {
         assert_eq!(get("HOME"), None);
         assert!(crate::setup::appimage_fixes(&env[1..]).is_empty());
         assert!(crate::setup::appimage_fixes(&[v("APPDIR", "C:\\Apps"), v("PATH", "C:\\Apps\\bin;C:\\Windows")]).is_empty());
+
+        // unpacked AppImage (RecompLauncher): no $APPIMAGE, but <APPDIR>/AppRun exists; RecompLauncher's own paths stay intact
+        let tmp = std::env::temp_dir().join(format!("fefw-unpacked-appimage-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let _ = std::fs::write(tmp.join("AppRun"), "#!/bin/sh\n");
+        let appdir = tmp.to_string_lossy().to_string();
+        let unpacked = [
+            v("APPDIR", &appdir),
+            v("LD_LIBRARY_PATH", &format!("{appdir}/usr/lib:/usr/lib")),
+            v("GTK_DATA_PREFIX", &appdir),
+            v("RECOMPLAUNCHER_DATA", &format!("{appdir}/recompdata")),
+            v("TMPDIR", &format!("{appdir}/.recomplauncher-tmp")),
+        ];
+        let uf = crate::setup::appimage_fixes(&unpacked);
+        let uget = |k: &str| uf.iter().find(|(n, _)| n == k).map(|(_, x)| x.clone());
+        assert_eq!(uget("APPDIR"), Some(None));
+        assert_eq!(uget("LD_LIBRARY_PATH"), Some(Some("/usr/lib".into())));
+        assert_eq!(uget("GTK_DATA_PREFIX"), Some(None));
+        assert_eq!(uget("RECOMPLAUNCHER_DATA"), None);
+        assert_eq!(uget("TMPDIR"), None);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -546,6 +613,54 @@ mod tests {
         assert_eq!(launch_options(&on, &none()), "PROTON_LOG=1 %command% -x");
         // an unquoted value, and a name that only ends like one of ours, are handled
         assert_eq!(launch_options("LSFGVK_MULTIPLIER=4 MY_LSFGVK_ENV=1 %command%", &none()), "MY_LSFGVK_ENV=1 %command%");
+    }
+
+    #[test]
+    fn the_shortcuts_that_start_an_exe() {
+        let exe = Path::new("/games/fefw/fefw.exe");
+        let file = |exes: &[&str]| {
+            let mut top = vec![];
+            for e in exes {
+                upsert(&mut top, Path::new(e), Path::new("/games"), &[]).unwrap();
+            }
+            write(&top)
+        };
+        let ours = shortcut_id("\"/games/fefw/fefw.exe\"", APP_NAME);
+        // two accounts with the same shortcut and one without it, beside other games and a file that is not one
+        let files = vec![file(&["/games/other.exe", "/games/fefw/fefw.exe"]), file(&["/games/fefw/fefw.exe"]), file(&["/games/other.exe"])];
+        assert_eq!(ids_in(files.into_iter().chain([b"junk".to_vec()]), exe), vec![ours]);
+        assert_eq!(ids_in(std::iter::empty(), exe), Vec::<u32>::new());
+        assert_eq!(ids_in(std::iter::once(file(&["/games/fefw-old/fefw.exe"])), exe), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn adding_brings_the_art_and_keeps_the_players_icon() {
+        let d = std::env::temp_dir().join(format!("fefw-steam-art-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let vdf = d.join("config").join("shortcuts.vdf");
+        let exe = Path::new("/games/fefw/fefw.exe");
+        let entry = |key: &str| {
+            let top = parse(&fs::read(&vdf).unwrap()).unwrap();
+            let Some(Node::Map(list)) = get(&top, "shortcuts") else { panic!("no list") };
+            let Node::Map(e) = &list[0].1 else { panic!("no entry") };
+            str_of(e, key)
+        };
+        assert_eq!(update_file(&vdf, exe, Path::new("/games/fefw"), &[]), Ok(false));
+        let id = shortcut_id("\"/games/fefw/fefw.exe\"", APP_NAME);
+        let icon = d.join("config").join("grid").join(format!("{id}_icon.png"));
+        assert_eq!(entry("icon"), icon.to_string_lossy());
+        assert!(d.join("config").join("grid").join(format!("{id}p.png")).is_file());
+        // the player's own icon is not replaced
+        let mut top = parse(&fs::read(&vdf).unwrap()).unwrap();
+        if let Node::Map(list) = &mut top[0].1 {
+            if let Node::Map(e) = &mut list[0].1 {
+                set(e, "icon", Node::Str(b"/mine.png".to_vec()));
+            }
+        }
+        fs::write(&vdf, write(&top)).unwrap();
+        assert_eq!(update_file(&vdf, exe, Path::new("/games/fefw"), &[]), Ok(true));
+        assert_eq!(entry("icon"), "/mine.png");
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -76,9 +76,9 @@ def hitch_lines(log):
     loading = False
     with open(log, encoding='utf-8', errors='replace') as f:
         for line in f:
-            if 'pacing off: loading' in line:
+            if 'nvn.replay: loading start' in line or 'pacing off: loading' in line:
                 loading = True
-            elif 'nvn.replay: pacing on' in line:
+            elif 'nvn.replay: loading end' in line or 'nvn.replay: pacing on' in line:
                 loading = False
             m = rx.search(line)
             if m:

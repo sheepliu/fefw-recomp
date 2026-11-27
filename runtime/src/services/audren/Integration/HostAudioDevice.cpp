@@ -2,7 +2,9 @@
 // Implementation of HostAudioDevice / HostAudioDeviceDriver (see HostAudioDevice.h).
 #include "HostAudioDevice.h"
 
+#include <chrono>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "../Dsp/PcmHelper.h"
@@ -20,6 +22,9 @@ std::mutex gSinkMutex;
 std::shared_ptr<::nxrt::audio::AudioSink> gOpenSink;
 uint32_t gOpenRate = 0;
 uint32_t gOpenChannels = 0;
+bool gOpenOk = false;
+std::wstring gFailedDefaultId;
+std::chrono::steady_clock::time_point gNextEndpointCheck{};
 
 }  // namespace
 
@@ -62,21 +67,42 @@ void HostAudioDevice::AppendBuffer(Span<const int16_t> data, uint32_t channelCou
 
     std::shared_ptr<::nxrt::audio::AudioSink> sink = ::nxrt::audio::sink();
 
-    if (sink != gOpenSink || _sampleRate != gOpenRate || _channelCount != gOpenChannels) {
-        // A new sink object was installed with set_sink (it closes the previous one), or the stream format changed: (re)open.
-        if (gOpenSink != nullptr && sink == gOpenSink) {
-            gOpenSink->close();
+    const bool changed = sink != gOpenSink || _sampleRate != gOpenRate || _channelCount != gOpenChannels;
+    if (changed || !gOpenOk) {
+        if (!changed) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < gNextEndpointCheck) {
+                return;
+            }
+            gNextEndpointCheck = now + std::chrono::seconds(1);
+            // Only retry when the default output endpoint actually changes to a different non-empty device, so a broken or dummy
+            // endpoint never churns XAudio2 while a newly connected (or reconnected) device recovers automatically.
+            const std::wstring def = ::nxrt::audio::default_output_id();
+            if (def.empty()) {
+                gFailedDefaultId.clear();
+                return;
+            }
+            if (def == gFailedDefaultId) {
+                return;
+            }
         }
-
-        if (!sink->open(_sampleRate, _channelCount)) {
-            NXLOG_W("AudioRenderer", "host audio sink %s failed to open (%u Hz, %u channels)", sink->name(), _sampleRate, _channelCount);
-            gOpenSink.reset();
-            return;
+        // A new sink object was installed with set_sink (it closes the previous one), or the stream format changed: (re)open.
+        if (gOpenOk && gOpenSink != nullptr && sink == gOpenSink) {
+            gOpenSink->close();
         }
 
         gOpenSink = sink;
         gOpenRate = _sampleRate;
         gOpenChannels = _channelCount;
+        gOpenOk = sink->open(_sampleRate, _channelCount);
+        if (!gOpenOk) {
+            gFailedDefaultId = ::nxrt::audio::default_output_id();
+            gNextEndpointCheck = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            NXLOG_W("AudioRenderer", "host audio sink %s failed to open (%u Hz, %u channels): playing without sound", sink->name(),
+                    _sampleRate, _channelCount);
+            return;
+        }
+        gFailedDefaultId.clear();
     }
 
     sink->write(out.data(), static_cast<uint32_t>(frames));
@@ -86,7 +112,7 @@ int64_t HostAudioDevice::GetQueuedNanoseconds() {
     // Under the mutex AppendBuffer holds while it opens, closes and writes the sink: the sink cannot be reopened under this call.
     std::lock_guard<std::mutex> guard(gSinkMutex);
 
-    if (gOpenSink == nullptr || !gOpenSink->has_device_clock() || _sampleRate == 0) {
+    if (!gOpenOk || gOpenSink == nullptr || !gOpenSink->has_device_clock() || _sampleRate == 0) {
         return -1;   // nothing written yet, or a sink without a clock (the renderer paces itself by the host clock)
     }
 

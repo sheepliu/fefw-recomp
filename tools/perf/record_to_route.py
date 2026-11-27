@@ -67,6 +67,8 @@ def main():
     ap.add_argument('--scene', action='append', default=[], help='name:start_s:end_s')
     ap.add_argument('--min-hold-ms', type=float, default=120.0,
                     help='a button is held at least this long (default 120): a quick tap can fall between two game updates and be missed')
+    ap.add_argument('--sleep', action='store_true',
+                    help='emit relative @sleep waits instead of @at (compatible with older builds before v0.2.7, e.g. v0.2.0)')
     a = ap.parse_args()
     nx = os.path.join(a.rec, 'input.nxin') if os.path.isdir(a.rec) else a.rec
     tr = os.path.join(os.path.dirname(nx), 'trace.jsonl')
@@ -147,19 +149,20 @@ def main():
     for t, _, text in events:
         ms = int(round(t))
         if ms > now:
-            lines.append(f'@at {ms}')
+            lines.append(f'@sleep {ms - now}' if a.sleep else f'@at {ms}')
             now = ms
         lines.append(text)
     end_ms = int(round(at(last_f)))
     if end_ms > now:
-        lines.append(f'@at {end_ms}')
+        lines.append(f'@sleep {end_ms - now}' if a.sleep else f'@at {end_ms}')
         now = end_ms
     lines += ['release all', 'stick left 0 0', 'stick right 0 0', '@pass', '']
     text = '\n'.join(lines)
     if a.out:
         with open(a.out, 'w', encoding='utf-8', newline='\n') as f:
             f.write(text)
-        print(f'{a.out}: {len(events)} steps, {now / 1000.0:.1f} s (needs a runtime that knows @at: PR #90)')
+        compat = 'uses @sleep (works on v0.2.0+)' if a.sleep else 'needs a runtime that knows @at: v0.2.7+'
+        print(f'{a.out}: {len(events)} steps, {now / 1000.0:.1f} s ({compat})')
     else:
         sys.stdout.write(text)
     return 0

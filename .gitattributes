@@ -1,0 +1,2 @@
+# LLVM profiles are binary
+*.profdata binary

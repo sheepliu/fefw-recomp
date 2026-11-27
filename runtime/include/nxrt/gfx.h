@@ -60,6 +60,8 @@ struct DeviceDesc {
     int headless = -1;                    // 1 no window/surface, 0 use the platform window, -1: [gfx] headless (env NXRT_GFX_HEADLESS)
 };
 
+struct VideoAllocStats;   // src/gfx/video_alloc_stats.h
+
 struct ValidationStats {
     uint64_t errors = 0, warnings = 0, infos = 0, verbose = 0;
     std::string first_error;              // text of the first error since the last reset
@@ -127,6 +129,9 @@ struct DeviceFeatures {
     bool dynamic_rendering_unused_attachments = false;
     bool transform_feedback = false, transform_feedback_queries = false;   // VK_EXT_transform_feedback (the feedback queries: transformFeedbackQueries)
     bool index_type_uint8 = false;        // VK_EXT/KHR_index_type_uint8 (8-bit index buffers, indexTypeUint8)
+    bool device_fault = false;                // VK_EXT_device_fault: after a device loss the driver can say what faulted (vk_renderer.cpp)
+    bool gpu_checkpoints = false;             // VK_NV_device_diagnostic_checkpoints, enabled by [gfx] gpu_checkpoints (nvn_checkpoints.cpp)
+    bool buffer_marker_amd = false;           // VK_AMD_buffer_marker, enabled by [gfx] gpu_checkpoints where the NVIDIA extension is missing
     bool buffer_float32_atomic_add = false;   // VK_EXT_shader_atomic_float: shaderBufferFloat32AtomicAdd (OpAtomicFAddEXT on storage buffers)
     bool debug_labels = false;            // VK_EXT_debug_utils is enabled on the instance (command buffer labels)
     bool occlusion_query = false, occlusion_query_precise = false, pipeline_statistics_query = false;
@@ -142,7 +147,7 @@ struct DeviceFeatures {
     bool anti_lag = false;                // VK_AMD_anti_lag (AMD Anti-Lag 2)
 };
 
-// Video memory workarounds, decided once at device creation (vk_device.cpp; the "gfx: GPU quirks" log line names those in effect).
+// GPU workarounds, decided once at device creation (vk_device.cpp; the "gfx: GPU quirks" log line names those in effect).
 // Each key takes auto (the default: on for Intel GPUs, vendor 0x8086), 1 (on for any GPU) or 0 (off).
 struct GpuQuirks {
     bool intel = false, intel_integrated = false;   // vendor 0x8086; integrated (UHD, Iris Xe, Core Ultra graphics) or discrete (Arc)
@@ -158,12 +163,21 @@ struct GpuQuirks {
     // either of these two on alone was enough (#18), so turning off only one never helped (#5). The discrete Arc A770 and B580 lost
     // the device in the first scene the same way and ran with it on (#45). A key set in the ini or the environment still wins.
     bool igpu_compat = false;
+    // [gfx] borderless_only (auto: on for the AMD Radeon 8050S / 8060S, vendor 0x1002 device 0x1586, on Windows, not under Wine): windowed
+    // mode becomes borderless. On a Radeon 8060S the first frames of a windowed run never finished on the GPU (an amdkmdag.sys timeout),
+    // and so did a switch from borderless to windowed, with every GPU path switch tried (#81); borderless and fullscreen ran.
+    bool borderless_only = false;
 };
 const GpuQuirks& gpu_quirks();
 uint64_t video_budget_bytes();      // the OS's video memory budget for this process on the largest device-local heap (0: no device yet)
+// The device-lost report appends what this returns (nvn_checkpoints.cpp: the draws and dispatches the GPU was at). Set once; may be null.
+void set_device_lost_extra(std::string (*fn)());
 bool video_memory_pressure();       // [gfx] pressure_detail is on and the usage is over 90% of that budget (sampled at most every 250 ms)
 int video_usage_percent();          // this process' use of that budget in percent, on every GPU (sampled at most every 250 ms; -1: not known)
 int video_live_percent();           // the same less the room free inside VMA's blocks (reused by the next allocations): [gfx] residency
+// On a unified-memory GPU (integrated GPU whose device-local heap is shared system RAM, i.e. vk_guard_discount_heap < 0),
+// returns host physical RAM usage in percent (sampled at most every 250 ms); returns -1 on discrete GPUs or if unknown.
+int video_sysram_usage_percent();
 
 struct DeviceLimitsExt {
     uint64_t min_imported_host_alignment = 0;   // VK_EXT_external_memory_host (0: not available)
@@ -205,6 +219,8 @@ public:
     // Validation (debug builds, or [gfx] validation). The counters cover everything the layer reported since create/reset.
     bool validation_enabled() const { return validation_; }
     ValidationStats validation_stats() const;
+    // What the allocator holds and has handed out (video_alloc_stats.h). Walks the allocator: a few ms, once per load census.
+    void alloc_stats(VideoAllocStats* out) const;
     void validation_reset();
 
     // Image formats: every image is checked with vkGetPhysicalDeviceImageFormatProperties2 (format, type, tiling, usage,

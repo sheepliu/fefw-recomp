@@ -148,6 +148,9 @@ private:
     bool follow_default_ = false;          // opened on the default endpoint: follow it when it moves
     std::wstring opened_default_id_;       // the default endpoint when the device was opened
     ULONGLONG next_device_check_ms_ = 0;
+    ULONGLONG reopen_window_start_ms_ = 0;   // follow_device's reopen limit (write thread)
+    int reopens_in_window_ = 0;
+    bool reopen_gave_up_ = false;
     bool com_owned_ = false;          // this sink called CoInitializeEx successfully and must balance it
     DWORD com_thread_ = 0;            // the thread that did, so CoUninitialize runs there
     uint32_t channels_ = 0;
@@ -295,6 +298,23 @@ void XAudio2Sink::follow_device() {
     const std::wstring def = default_output_id();
     if (def.empty()) return;                                               // no output device at all: look again in a second
     if (!lost && def == opened_default_id_) return;
+    // Each reopen destroys and rebuilds the engine. Under Wine/Proton with a bogus endpoint that teardown can crash (issue #44), so a
+    // device that keeps going away is given up on: after kMaxReopens inside kReopenWindowMs the sink stays as it is.
+    constexpr int kMaxReopens = 3;
+    constexpr ULONGLONG kReopenWindowMs = 30000;
+    if (now - reopen_window_start_ms_ > kReopenWindowMs) {
+        reopen_window_start_ms_ = now;
+        reopens_in_window_ = 0;
+    }
+    if (reopens_in_window_ >= kMaxReopens) {
+        if (!reopen_gave_up_) {
+            reopen_gave_up_ = true;
+            NXLOG_W("audio", "xaudio2: the output device keeps changing; not opening it again for a while");
+        }
+        return;
+    }
+    reopens_in_window_++;
+    reopen_gave_up_ = false;
     NXLOG_I("audio", "xaudio2: %s: opening the output device again", lost ? "the output device was lost" : "the default output device changed");
     open(want_rate_, want_channels_);
 }
@@ -306,10 +326,6 @@ void XAudio2Sink::close_device() {
         started_.store(false);
         source_->Stop(0);
         source_->FlushSourceBuffers();
-        // DestroyVoice waits for the audio thread to leave the callbacks.
-        std::lock_guard<std::mutex> vl(voice_mu_);
-        source_->DestroyVoice();
-        source_ = nullptr;
     }
     teardown();
     std::lock_guard<std::mutex> lk(mu_);
@@ -320,7 +336,11 @@ void XAudio2Sink::close_device() {
 }
 
 void XAudio2Sink::teardown() {
-    if (source_) {   // open_device failing after CreateSourceVoice: the voice would outlive its engine and be used by submit/stats
+    // Stop the engine before destroying voices or releasing it: under Wine/Proton (FAudio) with a broken or missing output sink,
+    // tearing down an active engine can race with its audio thread (issue #44).
+    if (engine_) engine_->StopEngine();
+    if (source_) {
+        // DestroyVoice waits for the audio thread to leave the callbacks.
         std::lock_guard<std::mutex> vl(voice_mu_);
         source_->DestroyVoice();
         source_ = nullptr;

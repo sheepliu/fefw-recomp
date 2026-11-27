@@ -101,6 +101,16 @@ pub struct Shared {
     pub cancel: AtomicBool,
 }
 
+/// What the player is asked to accept before a download, for a run without the window: the words of the Settings page
+/// (locales/en.js, settings.fetch.ask.*; a test holds them equal). None for the downloads the window alone offers.
+pub fn consent(kind: &str) -> Option<&'static str> {
+    match kind {
+        "fsr" => Some("This downloads three AMD FidelityFX files (about 46 MB) from AMD's own GitHub repository (GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, tags v2.4.0 and v1.1.4) into upscalers/fsr next to the launcher. They are AMD's files, not part of this project, and are used under AMD's licence (docs/license.md in that repository): binary use only, no reverse engineering."),
+        "xess" => Some("This downloads Intel's libxess.dll (about 78 MB) from Intel's own GitHub repository (intel/xess, tag v3.0.2) into upscalers/xess next to the launcher. It is Intel's file, not part of this project, and is used under Intel's licence (LICENSE.txt in that repository): unmodified, no reverse engineering."),
+        _ => None,
+    }
+}
+
 /// What a cancelled run returns as its error, so the caller can tell it from a failure.
 pub const CANCELLED: &str = "Download cancelled.";
 
@@ -400,6 +410,15 @@ impl Zip {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_consent_is_the_settings_pages() {
+        let en = include_str!("../../src/locales/en.js");
+        for kind in ["fsr", "xess"] {
+            assert!(en.contains(&format!("'settings.fetch.ask.{kind}': \"{}\",", consent(kind).unwrap())), "{kind}");
+        }
+        assert!(consent("dlss").is_none());
+    }
 
     /// Downloads everything for real (about 160 MB): FEFW_FETCH_TEST_DIR=<empty folder> cargo test fetch -- --ignored --nocapture
     #[test]

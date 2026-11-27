@@ -6,7 +6,7 @@
 Streams the log (it can be large). Each "hitch: frame N took X ms" line is put in one bucket by where the frame's time went:
 the render thread busy in replay (texture uploads, BC7 cache reads and transcodes, pipeline creation, pool copies), the render thread
 waiting on present (GPU / swapchain), or the render thread idle while the game had not submitted the next frame (guest CPU, system
-calls, GPU sync waits, memory pool imports). Frames between "pacing off: loading" and "pacing on" count as loading.
+calls, GPU sync waits, memory pool imports). Frames between "loading start" and "loading end" (or legacy "pacing off: loading" / "pacing on") count as loading.
 It also counts BC7 cache reads by thread (render thread vs background jobs), the quick stand-ins, and the pipeline lines.
 """
 import argparse
@@ -29,9 +29,9 @@ def parse(path):
     pipe_last = prewarm_last = gpl_last = texprep_last = None
     with open(path, encoding='utf-8', errors='replace') as f:
         for line in f:
-            if 'pacing off: loading' in line:
+            if 'nvn.replay: loading start' in line or 'pacing off: loading' in line:
                 loading = True
-            elif 'nvn.replay: pacing on' in line:
+            elif 'nvn.replay: loading end' in line or 'nvn.replay: pacing on' in line:
                 loading = False
             if 'data from cache' in line:
                 m = re.search(r'\bt\d+ (nvn-[a-z]+)\]', line)

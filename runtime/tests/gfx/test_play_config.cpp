@@ -110,7 +110,7 @@ bool same_settings(const Settings& a, const Settings& b) {
           da.aspect == db.aspect && da.fov_offset == db.fov_offset && da.dynamic_resolution == db.dynamic_resolution &&
           da.anisotropy == db.anisotropy && da.lod_bias == db.lod_bias && da.bloom == db.bloom &&
           da.chromatic_aberration == db.chromatic_aberration && da.fast_gpu_memory == db.fast_gpu_memory &&
-          da.fewer_gpu_waits == db.fewer_gpu_waits))
+          da.fewer_gpu_waits == db.fewer_gpu_waits && da.gpu == db.gpu))
         return false;
     const nxrt::extras::Settings &ea = a.extras, &eb = b.extras;
     if (!(ea.hdr.mode == eb.hdr.mode && ea.hdr.format == eb.hdr.format && ea.hdr.peak_nits == eb.hdr.peak_nits &&
@@ -498,6 +498,19 @@ NXTEST(binding_keys_equals_and_semicolon) {
     REQUIRE_MSG(parse_settings(text, &s, &err), err);
     CHECK(act_at(s, eq_name, Ctx::Menu) == Act::Confirm);
     CHECK(act_at(s, semi_name, Ctx::Menu) == Act::Back);
+}
+
+NXTEST(binding_key_left_bracket) {
+    const nxrt::play::test::PlayTestGame play_game;
+    // "[" is a real SDL name; in a bindings section a line starting with it is a binding, not a section header.
+    const char* lb_name = SDL_GetScancodeName(SDL_SCANCODE_LEFTBRACKET);
+    const char* rb_name = SDL_GetScancodeName(SDL_SCANCODE_RIGHTBRACKET);
+    Settings s;
+    std::string err;
+    const std::string text = std::string("[bindings.menu]\n") + lb_name + " = confirm\n" + rb_name + " = back\n";
+    REQUIRE_MSG(parse_settings(text, &s, &err), err);
+    CHECK(act_at(s, lb_name, Ctx::Menu) == Act::Confirm);
+    CHECK(act_at(s, rb_name, Ctx::Menu) == Act::Back);
 }
 
 NXTEST(inline_comments_and_case) {
@@ -901,6 +914,7 @@ NXTEST(display_render_keys_defaults) {
     CHECK(d.chromatic_aberration);
     CHECK(d.fast_gpu_memory);
     CHECK(d.fewer_gpu_waits);
+    CHECK(d.gpu == "auto");
 }
 
 NXTEST(default_settings_text_has_display_keys) {
@@ -938,6 +952,20 @@ NXTEST(display_render_keys_parse) {
     CHECK(!s.display.chromatic_aberration);
     CHECK(!s.display.fast_gpu_memory);
     CHECK(!s.display.fewer_gpu_waits);
+}
+
+NXTEST(display_gpu_key_parse_and_round_trip) {
+    const nxrt::play::test::PlayTestGame play_game;
+    Settings s;
+    std::string err;
+    REQUIRE_MSG(parse_settings("[display]\ngpu = AMD Radeon 780M\n", &s, &err), err);
+    CHECK(s.display.gpu == "AMD Radeon 780M");
+    Settings back;
+    REQUIRE_MSG(parse_settings(format_settings(s).c_str(), &back, &err), err);
+    CHECK(back.display.gpu == "AMD Radeon 780M");
+    REQUIRE_MSG(parse_settings("[display]\ngpu = Auto\n", &s, &err), err);
+    CHECK(s.display.gpu == "auto");
+    CHECK(format_settings(s).find("\ngpu = auto\n") != std::string::npos);
 }
 
 NXTEST(display_render_keys_range_errors) {
@@ -1653,6 +1681,44 @@ NXTEST(pad_stick_keys_round_trip) {
     CHECK(r.pad.alt_orbit == 3.5);
     CHECK(same_settings(s, r));
     CHECK_EQ(format_settings(r), text);
+}
+
+NXTEST(pad_hd_haptics_on_by_default_and_round_trips) {
+    const nxrt::play::test::PlayTestGame play_game;
+    Settings s = default_settings();
+    CHECK(s.pad.hd_haptics);
+    CHECK(format_settings(s).find("\nhd_haptics = 1\n") != std::string::npos);
+    s.pad.hd_haptics = false;
+    const std::string text = format_settings(s);
+    Settings r;
+    std::string err;
+    REQUIRE_MSG(parse_settings(text, &r, &err), err);
+    CHECK(!r.pad.hd_haptics);
+    CHECK_EQ(format_settings(r), text);
+    CHECK(!parse_settings("[pad]\nhd_haptics = maybe\n", &r, &err));
+}
+
+NXTEST(pad_dualsense_full_volume_on_by_default_and_round_trips) {
+    const nxrt::play::test::PlayTestGame play_game;
+    Settings s = default_settings();
+    CHECK(s.pad.dualsense_full_volume);
+    CHECK(format_settings(s).find("\ndualsense_full_volume = 1\n") != std::string::npos);
+    s.pad.dualsense_full_volume = false;
+    const std::string text = format_settings(s);
+    Settings r;
+    std::string err;
+    REQUIRE_MSG(parse_settings(text, &r, &err), err);
+    CHECK(!r.pad.dualsense_full_volume);
+    CHECK_EQ(format_settings(r), text);
+}
+
+// "dualsense" was a haptic mode that did what auto does; a settings file that names it still loads.
+NXTEST(pad_haptic_dualsense_reads_as_auto) {
+    const nxrt::play::test::PlayTestGame play_game;
+    Settings r = default_settings();
+    std::string err;
+    REQUIRE_MSG(parse_settings("[pad]\nhaptic = dualsense\n", &r, &err), err);
+    CHECK(format_settings(r).find("\nhaptic = auto\n") != std::string::npos);
 }
 
 NXTEST(pad_stick_keys_written_in_order) {

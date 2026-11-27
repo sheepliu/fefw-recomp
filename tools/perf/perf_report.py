@@ -21,12 +21,21 @@ import sys
 
 TS = re.compile(r'^\[\s*([0-9.]+) ')
 
-SCENE = re.compile(r"hitch: scene '([^']*)': (\d+) frames in ([0-9.]+) s: mean ([0-9.]+) fps, 1% low ([0-9.]+) fps, worst ([0-9.]+) ms, "
+SCENE_BEGIN = re.compile(r"hitch: scene '([^']*)' begins at frame (\d+)")
+SCENE = re.compile(r"hitch: scene '([^']*)': (\d+) frames in ([0-9.]+) s(?: \(tail of a longer scene\))?: mean ([0-9.]+) fps, 1% low ([0-9.]+) fps, worst ([0-9.]+) ms, "
                    r"(\d+) over 25 ms, (\d+) over 50 ms, (\d+) over 2x the median \(([0-9.]+) ms\); render thread ms/frame: replay ([0-9.]+), "
                    r"present ([0-9.]+) \(limiter ([0-9.]+)\), idle ([0-9.]+)")
-WINDOW = re.compile(r"hitch: (\d+) frames in ([0-9.]+) s: mean ([0-9.]+) fps, 1% low ([0-9.]+) fps, worst ([0-9.]+) ms, (\d+) over 2x the median")
+SCRIPT_SCENE_START = re.compile(r"script: SCENE start (.+)$")
+SCRIPT_SCENE_END = re.compile(r"script: SCENE end (.+)$")
+SLOW_FRAME = re.compile(r"hitch: frame \d+ took ([0-9.]+) ms \(t=([0-9.]+) s\)")
+WINDOW = re.compile(r"hitch: (\d+) frames in ([0-9.]+) s: mean ([0-9.]+) fps, 1% low ([0-9.]+) fps, worst ([0-9.]+) ms, (\d+) over 2x the median(?: \(([0-9.]+) ms\))?")
 RSTATS = re.compile(r"nvn\.rstats: (\d+) frames: replay ([0-9.]+) ms/frame = draw setup ([0-9.]+) .*?\| (\d+) draws/frame.*?per draw us:.*? sets ([0-9.]+)")
-GPU = re.compile(r"nvn\.gpustats: \d+ frames: GPU ms/frame avg ([0-9.]+) p50 ([0-9.]+) p90 ([0-9.]+) p99 ([0-9.]+)")
+GPU = re.compile(r"nvn\.gpustats: (\d+) frames: GPU ms/frame avg ([0-9.]+) p50 ([0-9.]+) p90 ([0-9.]+) p99 ([0-9.]+)")
+MOVIE = re.compile(
+    r"movie: stats: packets (\d+), pictures (\d+), frames acquired (\d+), released (\d+)"
+    r"(?:, empty \d+ \(starved (\d+)\), skipped (\d+))?"
+    r"; decode ([0-9.]+) ms per packet \(slowest ([0-9.]+)\) over (\d+)"
+)
 
 SETUP = [
     ('build', re.compile(r'host symbols: 0 from the linker map \(no map'), lambda m: 'no linker map (a packaged build?)'),
@@ -49,34 +58,80 @@ CONFIG = re.compile(r'config: \[(\w+)\] (\w+) = (.*) \((env|ini)\)$')
 
 
 def parse(path):
-    r = {'path': path, 'setup': {}, 'scenes': {}, 'windows': [], 'rstats': [], 'gpu': [], 'warn': [], 'overrides': {}, 'end': 0.0}
+    r = {'path': path, 'setup': {}, 'scenes': {}, 'script_scenes': {}, 'windows': [], 'slow': [], 'rstats': [], 'gpu': [], 'movie': [], 'warn': [], 'overrides': {}, 'end': 0.0}
+    scene_starts = {}
+    script_starts = {}
     with open(path, encoding='utf-8', errors='replace') as f:
         for line in f:
             m = TS.match(line)
             t = float(m.group(1)) if m else r['end']
             r['end'] = max(r['end'], t)
+            if 'script: SCENE ' in line:
+                ms = SCRIPT_SCENE_START.search(line)
+                if ms:
+                    script_starts[ms.group(1).strip()] = t
+                    continue
+                me = SCRIPT_SCENE_END.search(line)
+                if me:
+                    name = me.group(1).strip()
+                    if name in script_starts:
+                        r['script_scenes'].setdefault(name, []).append((script_starts.pop(name), t))
+                    continue
+            if 'hitch: frame ' in line:
+                mf = SLOW_FRAME.search(line)
+                if mf:
+                    r['slow'].append((float(mf.group(2)), float(mf.group(1))))
+                    continue
             if 'hitch: scene' in line:
+                mb = SCENE_BEGIN.search(line)
+                if mb:
+                    scene_starts[mb.group(1)] = t
+                    continue
                 m = SCENE.search(line)
                 if m:
                     g = m.groups()
+                    secs = float(g[2])
+                    t0 = scene_starts.pop(g[0], max(0.0, t - secs))
                     r['scenes'].setdefault(g[0], []).append({
-                        'frames': int(g[1]), 'secs': float(g[2]), 'fps': float(g[3]), 'low1': float(g[4]), 'worst': float(g[5]),
+                        't0': t0, 't1': t,
+                        'frames': int(g[1]), 'secs': secs, 'fps': float(g[3]), 'low1': float(g[4]), 'worst': float(g[5]),
                         'over25': int(g[6]), 'over50': int(g[7]), 'over2x': int(g[8]), 'median_ms': float(g[9]),
                         'replay_ms': float(g[10]), 'present_ms': float(g[11]), 'limiter_ms': float(g[12]), 'idle_ms': float(g[13])})
                 continue
             m = WINDOW.search(line)
             if m:
-                r['windows'].append({'t': t, 'frames': int(m.group(1)), 'secs': float(m.group(2)), 'fps': float(m.group(3)),
-                                     'low1': float(m.group(4)), 'worst': float(m.group(5)), 'over2x': int(m.group(6))})
+                w = {'t': t, 'frames': int(m.group(1)), 'secs': float(m.group(2)), 'fps': float(m.group(3)),
+                     'low1': float(m.group(4)), 'worst': float(m.group(5)), 'over2x': int(m.group(6))}
+                if m.group(7) is not None:
+                    w['median_ms'] = float(m.group(7))
+                r['windows'].append(w)
                 continue
             m = RSTATS.search(line)
             if m:
-                r['rstats'].append({'t': t, 'replay_ms': float(m.group(2)), 'setup_ms': float(m.group(3)), 'draws': int(m.group(4)),
-                                    'sets_us': float(m.group(5))})
+                prev_t = r['rstats'][-1]['t'] if r['rstats'] else None
+                r['rstats'].append({'t': t, 'prev_t': prev_t, 'frames': int(m.group(1)), 'replay_ms': float(m.group(2)),
+                                    'setup_ms': float(m.group(3)), 'draws': int(m.group(4)), 'sets_us': float(m.group(5))})
                 continue
             m = GPU.search(line)
             if m:
-                r['gpu'].append({'t': t, 'avg': float(m.group(1)), 'p50': float(m.group(2)), 'p99': float(m.group(4))})
+                prev_t = r['gpu'][-1]['t'] if r['gpu'] else None
+                r['gpu'].append({'t': t, 'prev_t': prev_t, 'frames': int(m.group(1)), 'avg': float(m.group(2)),
+                                 'p50': float(m.group(3)), 'p99': float(m.group(5))})
+                continue
+            m = MOVIE.search(line)
+            if m:
+                prev = r['movie'][-1] if r['movie'] else None
+                acq = int(m.group(3))
+                starved = int(m.group(5)) if m.group(5) is not None else None
+                dt = (t - prev['t']) if prev and 0.0 < t - prev['t'] <= 10.0 and acq >= prev['acq'] else None
+                dacq = (acq - prev['acq']) if dt is not None else None
+                dstarved = (starved - prev['starved']) if (dt is not None and starved is not None and prev['starved'] is not None and starved >= prev['starved']) else None
+                r['movie'].append({
+                    't': t, 'prev_t': prev['t'] if dt is not None else None,
+                    'acq': acq, 'dt': dt, 'dacq': dacq,
+                    'starved': starved, 'dstarved': dstarved,
+                    'decode_ms': float(m.group(7)), 'slowest_ms': float(m.group(8)), 'over': int(m.group(9)),
+                })
                 continue
             m = CONFIG.search(line)
             if m:
@@ -91,6 +146,8 @@ def parse(path):
                     r['warn'].append(msg)
     if 'float add' not in r['setup']:
         r['warn'].append('no "float adds to buffers" line: a build from before PR #89 (or the log was cut short)')
+    if not r['scenes'] and r['script_scenes']:
+        r['warn'].append('scenes approximated from 10 s hitch windows (build before v0.2.7 without hitch_scene)')
     return r
 
 
@@ -133,14 +190,127 @@ METRICS = [   # key, label, better (+1 higher, -1 lower), format
     ('draws', 'draws/frame', 0, '{:.0f}'),
     ('gpu_ms', 'GPU ms/frame', -1, '{:.2f}'),
     ('gpu_p99', 'GPU ms/frame p99', -1, '{:.2f}'),
+    ('movie_fps', 'video fps', 1, '{:.1f}'),
+    ('movie_decode_ms', 'video decode ms/pkt', -1, '{:.2f}'),
+    ('movie_decode_max', 'video slowest decode ms', -1, '{:.1f}'),
+    ('movie_starved', 'video starved frames', -1, '{:.0f}'),
     ('windows', 'steady 10 s windows', 0, '{:.0f}'),
 ]
+
+
+def _in_spans(entry, spans, fallback_fps):
+    """True when at least half of an rstats/gpustats sample's time span overlaps one of `spans`."""
+    t1 = entry['t']
+    fps = fallback_fps if fallback_fps > 1.0 else 60.0
+    est_dur = entry['frames'] / fps
+    prev = entry.get('prev_t')
+    if prev is not None and 0.0 < t1 - prev <= max(2.0 * est_dur, 1.0):
+        t0 = prev
+    else:
+        t0 = max(prev if prev is not None else 0.0, t1 - est_dur)
+    dur = t1 - t0
+    if dur <= 0.0:
+        return any(a <= t1 <= b + 0.5 for a, b in spans)
+    for a, b in spans:
+        ov = min(t1, b) - max(t0, a)
+        if ov >= 0.5 * dur:
+            return True
+    return False
+
+
+def _win_in_spans(w, spans, min_frac=0.5):
+    t1 = w['t']
+    t0 = max(0.0, t1 - w['secs'])
+    dur = t1 - t0
+    if dur <= 0.0:
+        return any(a <= t1 <= b for a, b in spans)
+    for a, b in spans:
+        ov = min(t1, b) - max(t0, a)
+        if ov >= min_frac * dur:
+            return True
+    return False
+
+
+def _movie_in_spans(entry, spans):
+    t1 = entry['t']
+    t0 = entry['prev_t'] if entry['prev_t'] is not None else max(0.0, t1 - 5.0)
+    dur = t1 - t0
+    if dur <= 0.0:
+        return any(a <= t1 <= b + 0.5 for a, b in spans)
+    for a, b in spans:
+        if min(t1, b) - max(t0, a) >= 0.5 * dur:
+            return True
+    return False
+
+
+def _attach_nvn_stats(m, r, spans, fps, include_replay_ms=False):
+    rs = [s for s in r['rstats'] if _in_spans(s, spans, fps)]
+    if rs:
+        if include_replay_ms:
+            m['replay_ms'] = statistics.mean(s['replay_ms'] for s in rs)
+        m['draws'] = statistics.mean(s['draws'] for s in rs)
+        nz = [s for s in rs if s['draws']]
+        if nz:
+            m['replay_per_1k'] = statistics.mean(1000.0 * s['replay_ms'] / s['draws'] for s in nz)
+        m['sets_us'] = statistics.mean(s['sets_us'] for s in rs)
+    gp = [g for g in r['gpu'] if _in_spans(g, spans, fps)]
+    if gp:
+        m['gpu_ms'] = statistics.mean(g['avg'] for g in gp)
+        m['gpu_p99'] = statistics.mean(g['p99'] for g in gp)
+    mv = [v for v in r['movie'] if _movie_in_spans(v, spans)]
+    if mv:
+        tot_over = sum(v['over'] for v in mv if v['over'] > 0)
+        if tot_over > 0:
+            m['movie_decode_ms'] = sum(v['decode_ms'] * v['over'] for v in mv if v['over'] > 0) / tot_over
+        else:
+            m['movie_decode_ms'] = statistics.mean(v['decode_ms'] for v in mv)
+        m['movie_decode_max'] = max(v['slowest_ms'] for v in mv)
+        dts = [(v['dacq'], v['dt']) for v in mv if v['dt'] is not None and v['dacq'] is not None]
+        if dts:
+            tot_dt = sum(dt for _, dt in dts)
+            if tot_dt > 0:
+                m['movie_fps'] = sum(da for da, _ in dts) / tot_dt
+        st = [v['dstarved'] for v in mv if v['dstarved'] is not None]
+        if st:
+            m['movie_starved'] = sum(st)
 
 
 def measures(r):
     """{scene name: metrics}; without scenes one entry, '(steady windows)'."""
     if r['scenes']:
-        return {name: {k: statistics.mean(x[k] for x in xs) for k in xs[0]} for name, xs in r['scenes'].items()}
+        out = {}
+        for name, xs in r['scenes'].items():
+            m = {k: statistics.mean(x[k] for x in xs) for k in xs[0] if k not in ('t0', 't1')}
+            spans = [(x['t0'], x['t1']) for x in xs]
+            _attach_nvn_stats(m, r, spans, m.get('fps', 60.0), include_replay_ms=False)
+            out[name] = m
+        return out
+    if r['script_scenes']:
+        out = {}
+        for name, spans in r['script_scenes'].items():
+            m = {}
+            win = []
+            for frac in (0.8, 0.5, 0.25):
+                win = [w for w in r['windows'] if _win_in_spans(w, spans, frac)]
+                if win:
+                    break
+            if win:
+                frames = sum(w['frames'] for w in win)
+                secs = sum(w['secs'] for w in win)
+                m['fps'] = frames / secs if secs else 0.0
+                m['low1'] = statistics.median(w['low1'] for w in win)
+                m['worst'] = max(w['worst'] for w in win)
+                meds = [w['median_ms'] for w in win if 'median_ms' in w]
+                if meds:
+                    m['median_ms'] = statistics.median(meds)
+            slow = [ms for st, ms in r['slow'] if any(a <= st <= b for a, b in spans)]
+            if slow:
+                m['worst'] = max(m.get('worst', 0.0), max(slow))
+            _attach_nvn_stats(m, r, spans, m.get('fps', 60.0), include_replay_ms=False)
+            if m:
+                out[name] = m
+        if out:
+            return out
     return {'(steady windows)': steady(r)}
 
 

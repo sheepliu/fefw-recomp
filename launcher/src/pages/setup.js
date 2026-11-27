@@ -91,6 +91,7 @@ export async function render(el, ctx) {
   const [cfg, ov] = await Promise.all([api('get_config'), api('get_overview')]);
   let path = cfg.dump_dir || '';
   let saved = path;
+  let sendReports = !!cfg.send_reports;
   let report = null;
   let status = null;
   let log = [];
@@ -171,6 +172,17 @@ export async function render(el, ctx) {
         ${ok && saved === path ? stepsHtml(status) : ''}
 
         <div class="card">
+          <h2>${icon('activity')}${esc(t('setup.reportsTitle'))}</h2>
+          <div class="stack">
+            <label class="switch">
+              <input type="checkbox" id="send-reports" ${sendReports ? 'checked' : ''} />
+              ${esc(t('setup.reportsToggle'))}
+            </label>
+            <p class="faint">${esc(t('setup.reportsHint'))}</p>
+          </div>
+        </div>
+
+        <div class="card">
           <h2>${icon('terminal')}${esc(t('setup.log'))}</h2>
           <div class="logbox" id="log"></div>
         </div>
@@ -218,6 +230,16 @@ export async function render(el, ctx) {
         toast(errText(e), 'error');
       }
     });
+    el.querySelector('#send-reports')?.addEventListener('change', async (ev) => {
+      const next = !!ev.target.checked;
+      try {
+        await api('set_send_reports', { enabled: next });
+        sendReports = next;
+      } catch (e) {
+        ev.target.checked = sendReports;
+        toast(errText(e), 'error');
+      }
+    });
     bindSteps();
   }
 
@@ -250,5 +272,6 @@ export async function render(el, ctx) {
       draw();
     }
   });
+  ctx.onLanguage(draw);
   draw();
 }

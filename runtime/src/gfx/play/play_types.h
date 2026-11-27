@@ -153,11 +153,13 @@ struct PadSettings {
     double gyro_scale = 1.0;
     bool rumble = true;
     double rumble_scale = 1.0;
-    // How the game's HD Rumble value reaches the pad (haptic.h): 0 auto (DualSense haptics on a wire, HD Rumble packets for a
-    // Switch Pro Controller, the standard rumble for everything else), 1 off, 2 the standard rumble only, 3 DualSense haptics.
+    // How the game's HD Rumble value reaches the pad (haptic.h): 0 auto (DualSense haptics, HD Rumble packets for a Switch
+    // Pro Controller, all four motors of an Xbox pad, the standard rumble for everything else), 1 off, 2 the standard rumble only.
     // haptic_strength is 0..100 percent, or -1 to keep using rumble_scale above.
     int haptic = 0;
     int haptic_strength = -1;
+    bool hd_haptics = true;        // a DualSense also gets taps on its speaker
+    bool dualsense_full_volume = true;   // a wired DualSense's volume goes to full while playing (haptic.h)
     double alt_orbit = 2.0;       // rad/s at full right-stick deflection, 0 = off (0..6). The alternate body's camera only (mpr: morph ball).
 };
 struct TimingSettings {
@@ -198,6 +200,7 @@ struct DisplaySettings {
     bool shader_prewarm = true;    // build the pipelines recorded by earlier runs ahead of the draws ([nvn] prewarm); at the next start, [nvn] prewarm in the ini wins
     std::string astc_quality = "high";   // ASTC texture quality on this GPU: fast, high or uncompressed (RGBA8, lots of video memory); becomes [gfx] astc_quality at the next start unless the ini or the environment set it
     std::string astc_bc = "auto";        // ASTC storage: auto, off (BC7) or bc1 (opaque textures as BC1, half the video memory); becomes [gfx] astc_bc at the next start unless the ini or the environment set it
+    std::string gpu = "auto";            // graphics card: auto (the discrete GPU with the most video memory), discrete, integrated, or part of a GPU name; becomes [gfx] gpu at the next start unless the ini or the environment set it
     // The display the window lives on, 1-based in the system's order; 0 = automatic (wherever the window opens). Applied live (the window moves).
     int monitor = 0;
 };
@@ -351,6 +354,7 @@ const char* key_alt_sens();
 //   [timing]   tap_ms hold_ms double_ms pulse_ms
 //   [display]  window_mode vsync fps_limit (number, 0 = unlimited, auto = refresh rate; fps_cap is read too) width height keep_aspect render_scale render_width render_height aspect fov_offset
 //              dynamic_resolution anisotropy lod_bias bloom chromatic_aberration fast_gpu_memory fewer_gpu_waits shader_prewarm astc_quality (fast high uncompressed) astc_bc (auto off bc1)
+//              gpu (auto, discrete, integrated or part of a GPU name)
 //              monitor (auto or the display's number, 1 = the first)
 //   [hdr]      mode (off auto on) format (auto hdr10 scrgb) peak_nits (0 = auto, else 200..10000) paper_white_nits (0 = auto, else
 //              80..500) highlight_boost (0..2)

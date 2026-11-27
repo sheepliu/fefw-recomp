@@ -59,6 +59,7 @@ export function statusText(s) {
   if (m === 'Starting fefw.exe...') return t('play.starting');
   if (m === 'fefw.exe exited normally.') return t('play.exitedOk');
   if (m === 'fefw.exe was ended by the system.') return t('play.killedBySystem');
+  if (m === 'The game stopped: it ran out of memory. Close other programs and try again; on Windows, keep the page file on (system managed).') return t('play.outOfMemory');
   let x = /^fefw\.exe started \(process (\d+)\)$/.exec(m);
   if (x) return t('play.started', { pid: x[1] });
   x = /^Could not start fefw\.exe: (.+)$/.exec(m);

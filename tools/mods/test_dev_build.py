@@ -19,6 +19,8 @@ def plain_main():
     data[0x40:0x60] = bytes.fromhex(BUILD_ID)
     struct.pack_into("<I", data, 0x0C, 0x08)
     struct.pack_into("<III", data, 0x10, 0x100, 0, 0x400)
+    for header in (0x20, 0x30):
+        struct.pack_into("<III", data, header, 0x500, 0x400, 0)
     struct.pack_into("<I", data, 0x60, 0x400)
     data[0xA0:0xC0] = hashlib.sha256(data[0x100:]).digest()
     return bytes(data)

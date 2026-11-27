@@ -10,6 +10,11 @@ locales/
   de.json         <- example: German
 ```
 
+Release packages include every `.json` file in the repository's
+`launcher/locales/` folder, so a translation committed there ships with the
+next release. The launcher also keeps a shipped pack up to date on players'
+machines, unless they edited it (see `locales/README.md`).
+
 ## Making a translation
 
 1. Copy `template.json` to `<code>.json` (`de.json`, `fr.json`, ...).
@@ -19,10 +24,12 @@ locales/
    mismatch would show a language that cannot be loaded.
 3. Fill in the strings you want to translate. The key on the left is a stable
    identifier, not text - do not change it. Entries left empty or missing fall
-   back to English, so a partial translation is always safe to ship.
+   back to English, so a partial translation is always safe to use.
 4. Keep the file UTF-8 (with or without BOM).
-5. Start the launcher and pick the language in Settings. It appears in the
-   list automatically.
+5. Start the launcher. The language appears in the list behind the language
+   button at the foot of the sidebar. A pack named after a system language
+   (`de.json`, `pt-BR.json`) is also used on such a system until the player
+   picks another one.
 
 ```json
 {
@@ -43,7 +50,8 @@ locales/
 - Nothing in the file is ever executed: a pack cannot add code, change a
   command or reach the filesystem.
 - An empty or missing key falls back to English, so a partial translation is
-  always safe to ship.
+  always safe to use. A pack committed to this repository has to be complete,
+  though: CI runs `npm run check-translations` in `launcher/`.
 - Every translated string is escaped before it reaches the page, so a pack
   cannot inject markup either.
 - A file that does not parse, declares no strings, or declares a `code` that

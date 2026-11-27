@@ -1,0 +1,12 @@
+name = "fefw-reports"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+[[r2_buckets]]
+binding = "REPORTS_BUCKET"
+bucket_name = "fefw-reports"
+
+[[d1_databases]]
+binding = "REPORTS_DB"
+database_name = "fefw-reports-index"
+database_id = "92191410-2ecc-4096-aa2d-c54602b1adcd"

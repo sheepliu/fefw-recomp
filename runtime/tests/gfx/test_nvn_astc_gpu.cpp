@@ -320,6 +320,70 @@ uint64_t gpu_transcodes() {
 }  // namespace
 
 // ---- 1: an RGBA8 image holds the CPU decoder's bytes --------------------------------------------------------------------------
+// AstcRateWindow: what the hand-back to the CPU and the cost estimates go by (no device).
+NXTEST(rate_window_judges_slow_gpus_by_their_usual_pass) {
+    using nxrt::nvn::be::gpu::AstcRateWindow;
+    const uint64_t sec = 1000000000ull, hold = 5 * sec;
+    const double limit = 10.0;                                   // ms per M texel
+    auto rate = [](double ms_per_mtexel) { return 1e6 / ms_per_mtexel; };
+    {   // a slow GPU (e.g. GTX 970): about 40 ms per M texel, with a fast pass now and then. The best pass says "fast"; the window does not.
+        AstcRateWindow w;
+        bool off = false;
+        uint64_t t = sec;
+        for (int i = 0; i < 40 && !off; ++i, t += sec / 10) {    // a first burst of 4 s
+            w.add(rate(i % 13 == 5 ? 2.0 : 40.0));
+            off = w.slow_for(limit, t, hold);
+        }
+        CHECK(!off);                                             // slow, but not for 5 s yet
+        CHECK(w.full());
+        CHECK(w.quarter_ms() > 30.0);
+        CHECK(1e6 / w.ranked(0) < 2.5);                          // its best pass is a fast one
+        CHECK(1e6 / w.median() > 30.0);                          // the estimates use the median
+        t += 30 * sec;                                           // nothing for half a minute, then the next load
+        int passes = 0;
+        for (; passes < 64 && !off; ++passes, t += sec / 100) {
+            w.add(rate(passes % 13 == 5 ? 2.0 : 45.0));
+            off = w.slow_for(limit, t, hold);
+        }
+        CHECK(off);
+        CHECK(passes <= 32);                                     // within the first window of that load
+    }
+    {   // a fast GPU whose first passes time slowly (a 3090 Ti's first load: 10.6 ms per M texel at best, 0.8 afterwards)
+        AstcRateWindow w;
+        bool off = false;
+        uint64_t t = sec;
+        for (int i = 0; i < 200; ++i, t += sec / 10) {
+            w.add(rate(i < 24 ? 12.0 : 0.8));
+            off = off || w.slow_for(limit, t, hold);
+        }
+        CHECK(!off);
+        CHECK(w.quarter_ms() < 1.0);
+    }
+    {   // a fast GPU with a whole window of slow passes in one load: slow for a moment, not for 5 s
+        AstcRateWindow w;
+        bool off = false;
+        uint64_t t = sec;
+        for (int i = 0; i < 40; ++i, t += sec / 100) {           // 0.4 s of slow passes
+            w.add(rate(12.0));
+            off = off || w.slow_for(limit, t, hold);
+        }
+        CHECK(w.slow_since_ns != 0);
+        for (int i = 0; i < 40; ++i, t += sec) {                 // then its usual rate, a pass a second
+            w.add(rate(0.8));
+            off = off || w.slow_for(limit, t, hold);
+        }
+        CHECK(!off);
+        CHECK(w.slow_since_ns == 0);
+    }
+    {   // not full: no verdict, and an empty window has no rates
+        AstcRateWindow w;
+        CHECK(w.median() == 0.0);
+        for (int i = 0; i < 31; ++i) w.add(rate(100.0));
+        CHECK(!w.slow_for(limit, 100 * sec, hold));
+        CHECK(w.quarter_ms() == 0.0);
+    }
+}
+
 NXTEST(decode_to_rgba8_is_bit_exact) {
     if (!astctest::transcoder_or_skip()) return;
     Rig r;

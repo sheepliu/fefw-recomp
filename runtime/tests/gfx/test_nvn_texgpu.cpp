@@ -1368,6 +1368,338 @@ NXTEST(compact_standin_upload_and_replacement) {
     teardown(r);
 }
 
+// ---- a rewrite that would pick another image format (issue #146) ---------------------------------------------------------------
+// The image's format is fixed by the storage's content when it is made (BC7, or BC1 for opaque content with [gfx] astc_bc; the format of a disk
+// cache entry). A background job for a later rewrite must make its data in that format: data in another one cannot be uploaded, so the stand-in
+// stayed on screen and the job was queued again at every use, for good.
+namespace {
+// Constant-colour ASTC blocks (void extent). opaque: alpha 1 in every block.
+void fill_astc_void_extent(Tex& x, uint32_t seed, bool opaque) {
+    std::mt19937 rng(seed);
+    for (const tegra::LevelLayout& lv : x.L.layout.levels)
+        for (uint32_t y = 0; y < lv.blocks_y; ++y)
+            for (uint32_t bx = 0; bx < lv.blocks_x; ++bx) {
+                uint8_t* blk = x.lin.data() + lv.linear_offset + y * lv.linear_row_stride + bx * 16;
+                blk[0] = 0xFC;
+                blk[1] = 0xFD;
+                std::memset(blk + 2, 0xFF, 6);
+                uint16_t c[4];
+                for (uint16_t& v : c) v = static_cast<uint16_t>(rng());
+                c[3] = opaque ? 0xFFFF : 0x8000;
+                std::memcpy(blk + 8, c, 8);
+            }
+    tile_into_storage(x);
+}
+
+// The CPU wrote t: its uses after that, with the background jobs given time to finish between them, end with the real data of the new content in
+// the image (whose format stayed) and no further jobs.
+void check_rewrite_settles(Device& dev, Tex& x, VkFormat image_format) {
+    namespace tp = nxrt::nvn::be::texprep;
+    Texture* t = x.t.get();
+    gpu::mark_texture_cpu_dirty(t);
+    VkFormat vk = VK_FORMAT_UNDEFINED;
+    auto use = [&] {
+        gpu::run_frame_sync([&](Frame& f) {
+            gpu::tex_ensure_current(t, f);
+            vk = gpu::tex_vk_format(t);
+        });
+        tp::wait_idle_for_test();
+    };
+    use();   // the stand-in; its job is queued
+    use();   // the job's result goes in
+    const tp::Stats s0 = tp::stats();
+    for (int i = 0; i < 4; ++i) use();
+    const tp::Stats s1 = tp::stats();
+    CHECK_EQ(vk, image_format);
+    CHECK(!tp::standin_on_screen(t));
+    CHECK_EQ(s1.scheduled - s0.scheduled, 0ull);
+    be::TexCaps full;
+    full.image_format = image_format;
+    be::PreparedTexture want;
+    CHECK_MSG(be::prepare_texture(*t, full, want), want.error);
+    std::vector<uint8_t> got;
+    CHECK_MSG(read_back_tight(dev, t, want.level, x.L.layers, got), "readback failed");
+    const long diff = first_diff(got, want.data);
+    CHECK_MSG(diff < 0, "the image differs from the full transcode at byte " + std::to_string(diff));
+}
+}  // namespace
+
+// The second content has an RGBA8 cache entry; the image was made as BC7.
+NXTEST(texprep_rewrite_keeps_image_format_cache_entry) {
+    if (!astctest::transcoder_or_skip()) return;
+    config_set("gfx", "astc_gpu", "off");
+    struct Restore { ~Restore() { config_set("gfx", "astc_gpu", "auto"); no_cache(); } } restore;
+    Rig r;
+    if (!bring_up(r)) {
+        CHECK(false);
+        return;
+    }
+    if (!r.dev->features().bc || r.dev->features().astc_ldr) {
+        nxtest::skip("needs BC and no native ASTC (the stand-in path)");
+        teardown(r);
+        return;
+    }
+    const fs::path dir = new_cache_dir("rewrite");
+    {
+        Tex x;
+        CHECK(make_tex(x, info(NVN_TEXTURE_TARGET_2D, 256, 256, 1, 1, NVN_FORMAT_RGBA_ASTC_4x4)));
+        // the second content's entry: made by a transcode, then replaced by an RGBA8 one under the same key
+        fill_astc_void_extent(x, 31, false);
+        be::PreparedTexture prep;
+        CHECK_MSG(be::prepare_texture(*x.t, be::TexCaps(), prep), prep.error);
+        fs::path file;
+        uint64_t key = 0;
+        CHECK_MSG(single_entry(dir, file, key), "expected one cache file after the transcode");
+        const std::vector<be::PreparedLevel> table = tight_table(x.L, true);
+        std::vector<uint8_t> rgba = rgba8_pattern(x.L);
+        write_entry(file, key, VK_FORMAT_R8G8B8A8_UNORM, table, x.L.layers, rgba);
+        // the first content has no entry: the image is made as BC7
+        fill_astc_void_extent(x, 30, false);
+        gpu::run_frame_sync([&](Frame& f) { gpu::tex_ensure_current(x.t.get(), f); });
+        nxrt::nvn::be::texprep::wait_idle_for_test();
+        gpu::run_frame_sync([&](Frame& f) { gpu::tex_ensure_current(x.t.get(), f); });
+        fill_astc_void_extent(x, 31, false);
+        check_rewrite_settles(*r.dev, x, VK_FORMAT_BC7_UNORM_BLOCK);
+    }
+    teardown(r);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// [gfx] astc_bc = bc1: the first content has alpha (BC7 image), the second is opaque (a job would choose BC1). The setting is read once per
+// process, so this skips unless nothing resolved it before (run it by name).
+NXTEST(texprep_rewrite_keeps_image_format_bc1) {
+    if (!astctest::transcoder_or_skip()) return;
+    config_set("gfx", "astc_gpu", "off");
+    config_set("gfx", "astc_bc", "bc1");
+    struct Restore { ~Restore() { config_set("gfx", "astc_gpu", "auto"); config_set("gfx", "astc_bc", "auto"); } } restore;
+    Rig r;
+    if (!bring_up(r)) {
+        CHECK(false);
+        return;
+    }
+    if (!r.dev->features().bc || r.dev->features().astc_ldr || !be::astc_bc1_active()) {
+        nxtest::skip("needs BC, no native ASTC and [gfx] astc_bc = bc1 in effect");
+        teardown(r);
+        return;
+    }
+    no_cache();
+    {
+        Tex x;
+        CHECK(make_tex(x, info(NVN_TEXTURE_TARGET_2D, 256, 256, 1, 1, NVN_FORMAT_RGBA_ASTC_4x4)));
+        fill_astc_void_extent(x, 40, false);
+        gpu::texture_bound(x.t.get());   // as in the game: the first bind sets up what the jobs may make (BC1 among it)
+        nxrt::nvn::be::texprep::wait_idle_for_test();
+        gpu::run_frame_sync([&](Frame& f) { gpu::tex_ensure_current(x.t.get(), f); });
+        nxrt::nvn::be::texprep::wait_idle_for_test();
+        gpu::run_frame_sync([&](Frame& f) { gpu::tex_ensure_current(x.t.get(), f); });
+        fill_astc_void_extent(x, 41, true);
+        check_rewrite_settles(*r.dev, x, VK_FORMAT_BC7_UNORM_BLOCK);
+    }
+    teardown(r);
+}
+
+// The residency restore (tex_promote) makes the image again, in the format the storage's content asks for then: not in the old one a finished
+// job made its data in, and jobs follow the new one. The first image is RGBA8 (the content's cache entry), the new one BC7.
+NXTEST(texprep_rewrite_keeps_image_format_remade) {
+    if (!astctest::transcoder_or_skip()) return;
+    config_set("gfx", "astc_gpu", "off");
+    struct Restore { ~Restore() { config_set("gfx", "astc_gpu", "auto"); no_cache(); } } restore;
+    Rig r;
+    if (!bring_up(r)) {
+        CHECK(false);
+        return;
+    }
+    if (!r.dev->features().bc || r.dev->features().astc_ldr) {
+        nxtest::skip("needs BC and no native ASTC (the stand-in path)");
+        teardown(r);
+        return;
+    }
+    const fs::path dir = new_cache_dir("remade");
+    {
+        Tex x;
+        CHECK(make_tex(x, info(NVN_TEXTURE_TARGET_2D, 256, 256, 1, 1, NVN_FORMAT_RGBA_ASTC_4x4)));
+        fill_astc_void_extent(x, 50, false);
+        be::PreparedTexture prep;
+        CHECK_MSG(be::prepare_texture(*x.t, be::TexCaps(), prep), prep.error);
+        fs::path file;
+        uint64_t key = 0;
+        CHECK_MSG(single_entry(dir, file, key), "expected one cache file after the transcode");
+        std::vector<uint8_t> rgba = rgba8_pattern(x.L);
+        write_entry(file, key, VK_FORMAT_R8G8B8A8_UNORM, tight_table(x.L, true), x.L.layers, rgba);
+        gpu::texture_bound(x.t.get());   // as in the game: the job finds the entry before the image is made
+        nxrt::nvn::be::texprep::wait_idle_for_test();
+        VkFormat vk = VK_FORMAT_UNDEFINED;
+        gpu::run_frame_sync([&](Frame& f) {
+            gpu::tex_ensure_current(x.t.get(), f);
+            vk = gpu::tex_vk_format(x.t.get());
+        });
+        CHECK_EQ(vk, VK_FORMAT_R8G8B8A8_UNORM);
+        nxrt::nvn::be::texprep::wait_idle_for_test();
+        fill_astc_void_extent(x, 51, false);   // no entry for this content
+        gpu::mark_texture_cpu_dirty(x.t.get());
+        gpu::texture_bound(x.t.get());
+        nxrt::nvn::be::texprep::wait_idle_for_test();   // its job's RGBA8 result is waiting when the image is made again
+        bool remade = false;
+        gpu::run_frame_sync([&](Frame& f) {
+            remade = gpu::tex_promote_for_test(x.t.get(), f);
+            vk = gpu::tex_vk_format(x.t.get());
+        });
+        CHECK(remade);
+        CHECK_EQ(vk, VK_FORMAT_BC7_UNORM_BLOCK);
+        nxrt::nvn::be::texprep::wait_idle_for_test();
+        fill_astc_void_extent(x, 52, false);
+        check_rewrite_settles(*r.dev, x, VK_FORMAT_BC7_UNORM_BLOCK);
+    }
+    teardown(r);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// A BC5 image whose storage is rewritten with uncached ASTC content (#177): the image is remade in a format chosen from the new content
+// (here BC7) and uploaded with the new data instead of being cleared to zero.
+NXTEST(bc5_rewrite_with_uncached_content_remakes_image) {
+    if (!astctest::transcoder_or_skip()) return;
+    config_set("gfx", "astc_gpu", "off");
+    struct Restore { ~Restore() { config_set("gfx", "astc_gpu", "auto"); no_cache(); } } restore;
+    Rig r;
+    if (!bring_up(r)) {
+        CHECK(false);
+        return;
+    }
+    if (!r.dev->features().bc || r.dev->features().astc_ldr) {
+        nxtest::skip("needs BC and no native ASTC (the stand-in path)");
+        teardown(r);
+        return;
+    }
+    const fs::path dir = new_cache_dir("bc5_rewrite");
+    {
+        Tex x;
+        CHECK(make_tex(x, info(NVN_TEXTURE_TARGET_2D, 256, 256, 1, 1, NVN_FORMAT_RGBA_ASTC_4x4)));
+        fill_astc_void_extent(x, 55, false);
+        be::PreparedTexture prep;
+        CHECK_MSG(be::prepare_texture(*x.t, be::TexCaps(), prep), prep.error);
+        fs::path file;
+        uint64_t key = 0;
+        CHECK_MSG(single_entry(dir, file, key), "expected one cache file after the transcode");
+        const std::vector<be::PreparedLevel> table = tight_table(x.L, false);
+        std::vector<uint8_t> bc5(static_cast<size_t>(table.back().offset + table.back().size), 0);
+        fill_random(bc5, 902);
+        write_entry(file, key, VK_FORMAT_BC5_UNORM_BLOCK, table, x.L.layers, bc5);
+        gpu::texture_bound(x.t.get());
+        nxrt::nvn::be::texprep::wait_idle_for_test();
+        VkFormat vk = VK_FORMAT_UNDEFINED;
+        gpu::run_frame_sync([&](Frame& f) {
+            gpu::tex_ensure_current(x.t.get(), f);
+            vk = gpu::tex_vk_format(x.t.get());
+        });
+        CHECK_EQ(vk, VK_FORMAT_BC5_UNORM_BLOCK);
+        nxrt::nvn::be::texprep::wait_idle_for_test();
+        // Rewrite the storage with uncached content (also bind it first so a background job sees the old BC5 image_format).
+        fill_astc_void_extent(x, 56, false);
+        gpu::mark_texture_cpu_dirty(x.t.get());
+        gpu::texture_bound(x.t.get());
+        nxrt::nvn::be::texprep::wait_idle_for_test();
+        check_rewrite_settles(*r.dev, x, VK_FORMAT_BC7_UNORM_BLOCK);
+    }
+    teardown(r);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// A BC1 image takes later content with alpha too, as BC1. That data must not become a cache entry: a BC1 entry says the content is opaque, and
+// a texture with the same content would be given a BC1 image without an alpha scan. Run by name (as the test above this one).
+NXTEST(texprep_bc1_image_caches_opaque_content_only) {
+    if (!astctest::transcoder_or_skip()) return;
+    config_set("gfx", "astc_gpu", "off");
+    config_set("gfx", "astc_bc", "bc1");
+    struct Restore {
+        ~Restore() { config_set("gfx", "astc_gpu", "auto"); config_set("gfx", "astc_bc", "auto"); no_cache(); }
+    } restore;
+    Rig r;
+    if (!bring_up(r)) {
+        CHECK(false);
+        return;
+    }
+    if (!r.dev->features().bc || r.dev->features().astc_ldr || !be::astc_bc1_active()) {
+        nxtest::skip("needs BC, no native ASTC and [gfx] astc_bc = bc1 in effect");
+        teardown(r);
+        return;
+    }
+    const fs::path dir = new_cache_dir("bc1alpha");
+    {
+        Tex x;
+        CHECK(make_tex(x, info(NVN_TEXTURE_TARGET_2D, 256, 256, 1, 1, NVN_FORMAT_RGBA_ASTC_4x4)));
+        fill_astc_void_extent(x, 60, true);
+        gpu::texture_bound(x.t.get());
+        nxrt::nvn::be::texprep::wait_idle_for_test();
+        gpu::run_frame_sync([&](Frame& f) { gpu::tex_ensure_current(x.t.get(), f); });
+        nxrt::nvn::be::texprep::wait_idle_for_test();
+        gpu::run_frame_sync([&](Frame& f) { gpu::tex_ensure_current(x.t.get(), f); });
+        CHECK_EQ(be::cache_entry_format(*x.t, true), VK_FORMAT_BC1_RGB_UNORM_BLOCK);   // opaque content: cached
+        fill_astc_void_extent(x, 61, false);
+        check_rewrite_settles(*r.dev, x, VK_FORMAT_BC1_RGB_UNORM_BLOCK);
+        CHECK_EQ(be::cache_entry_format(*x.t, true), VK_FORMAT_UNDEFINED);             // alpha: BC7 for a texture made from it
+    }
+    teardown(r);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// [nvn] tex_prep_verify compares a job's result with a preparation of its own, also when no cache entry holds the result (here RGBA8 data for
+// an RGBA8 image). The setting is read once per process, so this skips unless nothing started the background preparation before (run it by name).
+NXTEST(texprep_verifies_uncached_result) {
+    if (!astctest::transcoder_or_skip()) return;
+    config_set("gfx", "astc_gpu", "off");
+    config_set("nvn", "tex_prep_verify", "true");
+    struct Restore {
+        ~Restore() { config_set("gfx", "astc_gpu", "auto"); config_set("nvn", "tex_prep_verify", "false"); no_cache(); }
+    } restore;
+    Rig r;
+    if (!bring_up(r)) {
+        CHECK(false);
+        return;
+    }
+    if (!r.dev->features().bc || r.dev->features().astc_ldr) {
+        nxtest::skip("needs BC and no native ASTC (the stand-in path)");
+        teardown(r);
+        return;
+    }
+    const fs::path dir = new_cache_dir("verify");
+    {
+        namespace tp = nxrt::nvn::be::texprep;
+        Tex x;
+        CHECK(make_tex(x, info(NVN_TEXTURE_TARGET_2D, 256, 256, 1, 1, NVN_FORMAT_RGBA_ASTC_4x4)));
+        fill_astc_void_extent(x, 70, false);
+        be::PreparedTexture prep;
+        CHECK_MSG(be::prepare_texture(*x.t, be::TexCaps(), prep), prep.error);
+        fs::path file;
+        uint64_t key = 0;
+        CHECK_MSG(single_entry(dir, file, key), "expected one cache file after the transcode");
+        std::vector<uint8_t> rgba = rgba8_pattern(x.L);
+        write_entry(file, key, VK_FORMAT_R8G8B8A8_UNORM, tight_table(x.L, true), x.L.layers, rgba);
+        gpu::texture_bound(x.t.get());
+        tp::wait_idle_for_test();
+        gpu::run_frame_sync([&](Frame& f) { gpu::tex_ensure_current(x.t.get(), f); });   // an RGBA8 image
+        const tp::Stats before = tp::stats();
+        fill_astc_void_extent(x, 71, false);   // no entry for this content
+        gpu::mark_texture_cpu_dirty(x.t.get());
+        gpu::texture_bound(x.t.get());
+        tp::wait_idle_for_test();
+        gpu::run_frame_sync([&](Frame& f) { gpu::tex_ensure_current(x.t.get(), f); });
+        const tp::Stats after = tp::stats();
+        if (after.verified == before.verified) {
+            nxtest::skip("needs [nvn] tex_prep_verify in effect");
+        } else {
+            CHECK_EQ(after.mismatches - before.mismatches, 0ull);
+            CHECK_EQ(after.hits - before.hits, 1ull);
+        }
+    }
+    teardown(r);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
 // ---- sparse texture helpers used by the background preparation (nvn_texture_registry.cpp) ----------------------------------------------
 // gather copies the mapped tiles (unmapped bytes are zero), direct hands out a pointer when the range is one piece of one physical pool, and
 // the hash follows both the bytes and where they sit.

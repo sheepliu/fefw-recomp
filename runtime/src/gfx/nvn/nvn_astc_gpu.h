@@ -36,6 +36,65 @@ struct PreparedTexture;
 namespace gpu {
 struct Frame;
 
+// The rates (texels per ms of GPU time) of the last timed transcode passes: what the cost estimates and the hand-back to the CPU go by.
+// One pass says little either way. The first passes of a session, in a load's frames, time ten times slower than a fast GPU is; and a
+// slow GPU has the odd fast pass (e.g. a GTX 970 averaged 36 to 45 ms per M texel over a session with at least one pass under 2.5, so
+// "the best pass" kept it on the GPU path until a heavy load cost it the device). So:
+//   * estimates use the window's median when it is slower than the smoothed rate (one fast pass moves the smoothed rate by a fifth of
+//     itself and made hundreds of textures look free);
+//   * the GPU is slow when even the fastest quarter of the window is slower than the limit, and it is handed off when that has held at
+//     every pass for hold_ns and for a whole new window of passes: a second burst at least that much later, or one burst that long.
+//     (Time alone is not enough: after a slow load a fast GPU may get a pass a second, and eight of those turn the verdict.)
+// No Vulkan in it (tests/gfx/test_nvn_astc_gpu.cpp).
+struct AstcRateWindow {
+    static constexpr uint32_t kSize = 32;
+    double r[kSize] = {};
+    uint32_t n = 0, at = 0;
+    uint64_t slow_since_ns = 0;
+    uint32_t slow_passes = 0;          // passes added since then
+
+    void add(double rate) {
+        r[at] = rate;
+        at = (at + 1) % kSize;
+        if (n < kSize) ++n;
+    }
+    bool full() const { return n == kSize; }
+    // the rate of the pass that `rank` passes of the window were faster than (0: the fastest); 0 for an empty window
+    double ranked(uint32_t rank) const {
+        if (!n) return 0.0;
+        double v[kSize];
+        for (uint32_t i = 0; i < n; ++i) v[i] = r[i];
+        for (uint32_t i = 0; i < n; ++i)              // 32 values: a plain insertion sort, fastest first
+            for (uint32_t j = i; j > 0 && v[j] > v[j - 1]; --j) {
+                const double x = v[j];
+                v[j] = v[j - 1];
+                v[j - 1] = x;
+            }
+        return v[rank < n ? rank : n - 1];
+    }
+    double median() const { return ranked(n / 2); }
+    // ms per M texel of the slowest pass of the fastest quarter; 0 until the window is full
+    double quarter_ms() const {
+        const double q = full() ? ranked(kSize / 4 - 1) : 0.0;
+        return q > 0.0 ? 1e6 / q : 0.0;
+    }
+    // After add(): true when the fastest quarter has been slower than limit_ms per M texel at every pass for hold_ns and kSize passes.
+    bool slow_for(double limit_ms, uint64_t now_ns, uint64_t hold_ns) {
+        if (!full() || !(quarter_ms() > limit_ms)) {
+            slow_since_ns = 0;
+            slow_passes = 0;
+            return false;
+        }
+        if (!slow_since_ns) {
+            slow_since_ns = now_ns ? now_ns : 1;
+            slow_passes = 0;
+            return false;
+        }
+        ++slow_passes;
+        return now_ns - slow_since_ns >= hold_ns && slow_passes >= kSize;
+    }
+};
+
 // Any thread. True when the GPU path is on for this device. The first caller with wait builds the pipelines and runs the self-test (0.1 s
 // with the driver's shader cache, 1.4 to 2.3 s at a first start; background jobs call it so); without wait the answer is false until that
 // has happened (the render thread).

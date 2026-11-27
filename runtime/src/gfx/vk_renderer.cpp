@@ -11,12 +11,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
 #endif
 
+#include "nxrt/boot_timeline.h"
 #include "nxrt/config.h"
 #include "nxrt/diag.h"
 #include "nxrt/ftrace.h"
@@ -24,6 +27,7 @@
 #include "nxrt/log.h"
 #include "nxrt/lowlat.h"
 #include "nxrt/platform.h"
+#include "nxrt/runtime.h"
 #include "extras/framegen.h"
 #include "extras/framegen_ffx.h"
 #include "extras/hdr_capture.h"
@@ -44,6 +48,89 @@ constexpr uint32_t kStallRecreate = 3;
 // cannot test (#100 windowed only on a Radeon 8060S, #92 / #65 on the Steam Deck) then say which GPU, driver, window mode and size.
 std::mutex g_lost_ctx_mu;
 std::string g_lost_ctx;
+// When a frame's fence was last seen signalled (steady clock, ns; 0: none yet). The device-lost report says how long before the loss that
+// was: Windows resets a GPU that does not finish its work within 2 s (TDR).
+std::atomic<int64_t> g_last_frame_done_ns{0};
+int64_t steady_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+std::string gpu_timeout_hint() {
+    const int64_t done = g_last_frame_done_ns.load(std::memory_order_relaxed);
+    if (!done) return "";
+    const double s = static_cast<double>(steady_ns() - done) * 1e-9;
+    char b[640];
+    if (s >= 1.5)
+        std::snprintf(b, sizeof b,
+                      "  The GPU last finished a frame %.1f s before this. Windows resets a GPU that has not finished its work within 2 s (TDR): the GPU\n"
+                      "  was most likely still busy rather than faulted. On an older or slower GPU, a lower render resolution and [gfx] astc_gpu = off in\n"
+                      "  fefw.ini take work off it.\n",
+                      s);
+    else
+        std::snprintf(b, sizeof b, "  The GPU last finished a frame %.1f s before this.\n", s);
+    return b;
+}
+
+std::atomic<const Device*> g_lost_dev{nullptr};   // the renderer's device, for the fault query in the report
+std::atomic<std::string (*)()> g_lost_extra{nullptr};   // extra section appended to the device-lost report (nvn_checkpoints.cpp)
+
+const char* fault_type_name(VkDeviceFaultAddressTypeEXT t) {
+    switch (t) {
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT: return "none";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT: return "invalid read";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT: return "invalid write";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT: return "invalid execute";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT: return "instruction pointer (unknown)";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT: return "instruction pointer (invalid)";
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT: return "instruction pointer (fault)";
+        default: return "unknown";
+    }
+}
+
+// VK_EXT_device_fault: what the driver says about the fault. An invalid read or write with an address points at memory a shader or a copy
+// reached outside its buffers; none at all, with a vendor code, at a hang or timeout.
+std::string device_fault_report() {
+    const Device* d = g_lost_dev.load();
+    if (!d) return "";
+    if (!d->features().device_fault || !vkGetDeviceFaultInfoEXT) return "  Device fault info: not offered by this driver (VK_EXT_device_fault).\n";
+    VkDeviceFaultCountsEXT counts = {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    VkResult r = vkGetDeviceFaultInfoEXT(d->device(), &counts, nullptr);
+    char b[512];
+    if (r != VK_SUCCESS) {
+        std::snprintf(b, sizeof b, "  Device fault info: the query failed (%d).\n", static_cast<int>(r));
+        return b;
+    }
+    std::vector<VkDeviceFaultAddressInfoEXT> addrs(std::min<uint32_t>(counts.addressInfoCount, 64));
+    std::vector<VkDeviceFaultVendorInfoEXT> vendor(std::min<uint32_t>(counts.vendorInfoCount, 64));
+    counts.addressInfoCount = static_cast<uint32_t>(addrs.size());
+    counts.vendorInfoCount = static_cast<uint32_t>(vendor.size());
+    counts.vendorBinarySize = 0;
+    VkDeviceFaultInfoEXT info = {VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+    info.pAddressInfos = addrs.empty() ? nullptr : addrs.data();
+    info.pVendorInfos = vendor.empty() ? nullptr : vendor.data();
+    r = vkGetDeviceFaultInfoEXT(d->device(), &counts, &info);
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) {
+        std::snprintf(b, sizeof b, "  Device fault info: the query failed (%d).\n", static_cast<int>(r));
+        return b;
+    }
+    std::string out;
+    std::snprintf(b, sizeof b, "  Device fault info: \"%.*s\", %u address record(s), %u vendor record(s)\n", static_cast<int>(sizeof info.description),
+                  info.description, counts.addressInfoCount, counts.vendorInfoCount);
+    out += b;
+    for (uint32_t i = 0; i < counts.addressInfoCount && i < addrs.size(); ++i) {
+        const VkDeviceFaultAddressInfoEXT& a = addrs[i];
+        const uint64_t prec = a.addressPrecision ? a.addressPrecision : 1;
+        const uint64_t lo = a.reportedAddress & ~(prec - 1);
+        std::snprintf(b, sizeof b, "    address: %s at 0x%llx (range 0x%llx..0x%llx)\n", fault_type_name(a.addressType),
+                      static_cast<unsigned long long>(a.reportedAddress), static_cast<unsigned long long>(lo), static_cast<unsigned long long>(lo + prec));
+        out += b;
+    }
+    for (uint32_t i = 0; i < counts.vendorInfoCount && i < vendor.size(); ++i) {
+        const VkDeviceFaultVendorInfoEXT& v = vendor[i];
+        std::snprintf(b, sizeof b, "    vendor: \"%.*s\", code 0x%llx, data 0x%llx\n", static_cast<int>(sizeof v.description), v.description,
+                      static_cast<unsigned long long>(v.vendorFaultCode), static_cast<unsigned long long>(v.vendorFaultData));
+        out += b;
+    }
+    return out;
+}
 
 const char* window_mode_name() {
     switch (platform::fullscreen_mode()) {
@@ -60,23 +147,16 @@ const char* window_mode_name() {
     if (once.exchange(true)) {
         for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));   // another thread is writing the report and ending the process
     }
-    char b[512];
-    std::snprintf(b, sizeof b,
-                  "GPU DEVICE LOST (reason: VK_ERROR_DEVICE_LOST)\n  %s returned %d after %llu presented frames: the graphics driver reset or removed the device\n"
-                  "  (a driver crash or timeout, an out-of-video-memory condition, or a GPU hang). The game was stopped.\n",
-                  where, static_cast<int>(r), static_cast<unsigned long long>(frames));
-    std::string text = b;
+    std::string ctx;
+    if (*app_build()) ctx += std::string("  build: ") + app_build() + "\n";
     {
         std::lock_guard<std::mutex> lk(g_lost_ctx_mu);
-        if (!g_lost_ctx.empty()) text += g_lost_ctx;
+        ctx += g_lost_ctx;
     }
-    text += frames == 0
-                ? "  What to try: the first frame never finished on the GPU. Update the graphics driver; if it happens in one window mode only "
-                  "(windowed, say), use another (F1 > Display) and tell us which works; [gfx] gpu in fefw.ini picks another GPU.\n"
-                : "  What to try: update the graphics driver; on a GPU that shares system memory (laptop, handheld) lower the render scale "
-                  "or the texture quality. Please attach this file and fefw.log to an issue.\n";
-    text += "\n";
-    text += diag_thread_dump();
+    ctx += gpu_timeout_hint();
+    ctx += device_fault_report();
+    if (auto fn = g_lost_extra.load()) ctx += fn();
+    const std::string text = diag_device_lost_dump(where, static_cast<int>(r), frames, ctx);
     for (size_t pos = 0; pos < text.size();) {
         size_t eol = text.find('\n', pos);
         if (eol == std::string::npos) eol = text.size();
@@ -613,6 +693,7 @@ struct Renderer::Impl {
         }
         dirty = false;
         st.swapchain_creates++;
+        boot_mark("swapchain");
         NXLOG_I(kTag, "swapchain %ux%u, %u images, format %d, color space %d (%s), present mode %s%s", ext.width, ext.height, count, static_cast<int>(format),
                 static_cast<int>(color_space), extras::output_kind_name(kind), present_mode_name(active), active != requested ? " (requested mode not available)" : "");
         {
@@ -724,11 +805,14 @@ struct Renderer::Impl {
     }
 };
 
+void set_device_lost_extra(std::string (*fn)()) { g_lost_extra.store(fn); }
+
 std::unique_ptr<Renderer> Renderer::create(Device& dev, const RendererDesc& desc_in, std::string* error) {
     std::unique_ptr<Renderer> r(new Renderer());
     r->impl_ = new Impl();
     Impl& s = *r->impl_;
     s.dev = &dev;
+    g_lost_dev.store(&dev);
     s.desc = desc_in;
     s.desc.frames_in_flight = static_cast<uint32_t>(std::clamp<int64_t>(config_get_int("gfx", "frames_in_flight", desc_in.frames_in_flight), 1, 3));
     PresentMode pm = desc_in.present_mode;
@@ -760,6 +844,8 @@ std::unique_ptr<Renderer> Renderer::create(Device& dev, const RendererDesc& desc
 
 Renderer::~Renderer() {
     if (impl_) {
+        const Device* mine = impl_->dev;
+        g_lost_dev.compare_exchange_strong(mine, nullptr);
         impl_->destroy_all();
         delete impl_;
     }
@@ -800,12 +886,14 @@ bool Renderer::begin_frame(FrameInfo* out) {
     }
     {
         const VkResult fr = vkWaitForFences(s.vk(), 1, &slot.fence, VK_TRUE, kFrameWaitNs);
+        if (fr != VK_SUCCESS) diag_vk_note(static_cast<int>(fr), "vkWaitForFences (frame slot)", __FILE__, __LINE__);
         if (fr == VK_TIMEOUT) {
             s.stalled("the previous frame on this slot (GPU)");
             return false;
         }
         if (fr == VK_ERROR_DEVICE_LOST) device_lost("vkWaitForFences (frame slot)", fr, s.st.frames);
         if (fr != VK_SUCCESS) NXLOG_E(kTag, "vkWaitForFences failed (%d)", static_cast<int>(fr));
+        else g_last_frame_done_ns.store(steady_ns(), std::memory_order_relaxed);
     }
     s.read_timestamps(slot);
 
@@ -814,6 +902,7 @@ bool Renderer::begin_frame(FrameInfo* out) {
         idx = static_cast<uint32_t>(s.frame_number % s.targets.size());
     } else {
         VkResult r = vkAcquireNextImageKHR(s.vk(), s.swapchain, kFrameWaitNs, slot.acquire, VK_NULL_HANDLE, &idx);
+        if (r != VK_SUCCESS) diag_vk_note(static_cast<int>(r), "vkAcquireNextImageKHR", __FILE__, __LINE__);
         if (r == VK_TIMEOUT || r == VK_NOT_READY) {
             s.stalled("a swapchain image");
             return false;
@@ -951,6 +1040,7 @@ void Renderer::end_frame(SubmitPrefix* prefix) {
         std::lock_guard<std::mutex> lk(s.dev->queue_mutex());
         VkResult r = vkQueueSubmit2(s.dev->queue(), 1, &si, slot.fence);
         if (r != VK_SUCCESS) {
+            diag_vk_note(static_cast<int>(r), "vkQueueSubmit2 (present)", __FILE__, __LINE__);
             NXLOG_E(kTag, "vkQueueSubmit2 failed (%d)", static_cast<int>(r));
             if (r == VK_ERROR_DEVICE_LOST) device_lost("vkQueueSubmit2 (present)", r, s.st.frames);
             // The fence was reset in begin_frame and the present below waits for render_done: an empty submission stands in (it waits
@@ -963,6 +1053,7 @@ void Renderer::end_frame(SubmitPrefix* prefix) {
                 stand.pSignalSemaphoreInfos = &signal;
             }
             const VkResult r2 = vkQueueSubmit2(s.dev->queue(), 1, &stand, slot.fence);
+            if (r2 != VK_SUCCESS) diag_vk_note(static_cast<int>(r2), "vkQueueSubmit2 (present stand-in)", __FILE__, __LINE__);
             if (r2 == VK_ERROR_DEVICE_LOST) device_lost("vkQueueSubmit2 (present stand-in)", r2, s.st.frames);
             if (r2 != VK_SUCCESS) {
                 NXLOG_E(kTag, "the stand-in submission failed too (%d): the frame is not presented, the slot's sync objects are made again",
@@ -990,6 +1081,7 @@ void Renderer::end_frame(SubmitPrefix* prefix) {
                 pi.pNext = &pid;
             }
             r = vkQueuePresentKHR(s.dev->queue(), &pi);
+            if (r != VK_SUCCESS) diag_vk_note(static_cast<int>(r), "vkQueuePresentKHR", __FILE__, __LINE__);
             if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
                 // A present that failed is not a frame on the display: counting every call as a present made a black window
                 // report 60 fps of presents while nothing reached the screen (presents_failed keeps the other results).
@@ -1037,7 +1129,8 @@ void Renderer::end_frame(SubmitPrefix* prefix) {
     s.cur_slot = (s.cur_slot + 1) % static_cast<uint32_t>(s.slots.size());
 
     if (cap) {
-        vkWaitForFences(s.vk(), 1, &slot.fence, VK_TRUE, UINT64_MAX);
+        const VkResult cr = vkWaitForFences(s.vk(), 1, &slot.fence, VK_TRUE, UINT64_MAX);
+        if (cr != VK_SUCCESS) diag_vk_note(static_cast<int>(cr), "vkWaitForFences (screenshot)", __FILE__, __LINE__);
         std::vector<uint8_t> raw(static_cast<size_t>(w) * h * bpp);
         s.dev->invalidate_buffer(cap);
         std::memcpy(raw.data(), cap.mapped, raw.size());

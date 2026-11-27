@@ -12,6 +12,7 @@
 
 #include "nxrt/abi.h"
 #include "nxrt/dispatch.h"
+#include "nxrt/gauge.h"
 #include "nxrt/kernel.h"
 #include "test_framework.h"
 NXTEST_GROUP(kernel_busy_mutex)
@@ -138,4 +139,38 @@ NXTEST(wfe_spin_loop_does_not_starve_the_thread_it_waits_for) {
     releaser.join();
     spinner.join();
     CHECK_MSG(got, "the spinner was not released within 10 s: the WFE hint did not give the processor away");
+}
+
+NXTEST(contended_busy_mutex_and_wfe_record_guest_sync_phase) {
+    nxrt::kernel::install_busy_mutex_hle();
+    nxrt::kernel::install_spin_hint();
+    Fake f;
+    f.word()->store(1);
+    std::atomic<bool> releaser_done{false};
+    std::thread releaser([&] {
+        Sleep(25);
+        f.word()->store(0, std::memory_order_release);
+        releaser_done = true;
+    });
+    double uncontended_delta = 0, contended_delta = 0, wfe_delta = 0;
+    std::thread presenter([&] {
+        nxrt::hitch_note_game_present();
+        Fake free_f;
+        const double t0 = nxrt::hitch_phase_total_ms(nxrt::kHpGameGuestSync);
+        call_lock(free_f);                                    // uncontended fast path does not touch the timer
+        const double t1 = nxrt::hitch_phase_total_ms(nxrt::kHpGameGuestSync);
+        uncontended_delta = t1 - t0;
+        call_lock(f);                                         // contended: waits ~25 ms until releaser clears the word
+        const double t2 = nxrt::hitch_phase_total_ms(nxrt::kHpGameGuestSync);
+        contended_delta = t2 - t1;
+        for (int i = 0; i < 64; ++i) nx_spin_hint(1);
+        const double t3 = nxrt::hitch_phase_total_ms(nxrt::kHpGameGuestSync);
+        wfe_delta = t3 - t2;
+    });
+    releaser.join();
+    presenter.join();
+    CHECK(releaser_done.load());
+    CHECK_EQ(uncontended_delta, 0.0);
+    CHECK(contended_delta >= 10.0);
+    CHECK(wfe_delta > 0.0);
 }

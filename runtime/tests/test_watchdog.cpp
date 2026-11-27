@@ -123,8 +123,10 @@ struct Worker {
 
 }  // namespace
 
-// Starts the watchdog with a 1 s threshold, a 50 ms poll and no ticks: it fires once and stays quiet.
+// Starts the watchdog with a 1 s threshold, a 50 ms poll and no ticks: it fires once and stays quiet. With no tick yet the start-up
+// threshold ([diag] watchdog_boot_seconds, 60 s by default) applies, so it is set to 1 s here too.
 NXTEST(fires_once_on_freeze) {
+    nxrt::config_set("diag", "watchdog_boot_seconds", "1");
     const std::string rep = temp_file("fires");
     std::remove(rep.c_str());
     const uint32_t base = nxrt::watchdog_fire_count();
@@ -147,6 +149,7 @@ NXTEST(fires_once_on_freeze) {
     CHECK_EQ(cap.calls.load(), 1);
     CHECK_EQ(nxrt::watchdog_fire_count() - base, 1u);
     nxrt::watchdog_stop();
+    nxrt::config_clear();
 
     std::string text;
     {

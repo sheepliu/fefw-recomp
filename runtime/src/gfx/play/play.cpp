@@ -53,6 +53,7 @@
 #include "nxrt/runtime.h"
 #include "nxrt/timestep.h"
 #include "nxrt/tt.h"
+#include "nxrt/update_check.h"
 #include "menu_mouse.h"
 #include "play_engine.h"
 #include "play_game.h"
@@ -478,6 +479,7 @@ void vib_sink(uint32_t slot, int hand, const hid::VibrationValue& v, void*) {
 [[noreturn]] void exit_process(int code, const char* verdict, const std::string& message) {
     G& st = g();
     NXLOG_I(kTag, "ending the process (%s): %s", verdict, message.c_str());
+    NXLOG_I("runtime", "session: %s", nxrt::session_stamp().c_str());
     if (st.dirty) {
         std::string err;
         std::lock_guard<std::mutex> lk(st.mu);
@@ -485,6 +487,7 @@ void vib_sink(uint32_t slot, int hand, const hid::VibrationValue& v, void*) {
         st.dirty = false;
     }
     nvn::backend_flush_caches();                    // the pipeline cache; this path does not shut the back end down
+    haptic::release_for_exit();                     // a DualSense would keep its speaker route and volume
     nxrt::log_flush();
     if (tt::enabled() && !tt::finished()) tt::end_run(code, verdict, message);     // writes result.json, then terminates
     TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
@@ -498,9 +501,13 @@ namespace {
 void set_window_mode(const std::string& mode) {
     G& st = g();
     if (!st.window) return;
-    const platform::FullscreenMode want = mode == "borderless" ? platform::FullscreenMode::Borderless
+    platform::FullscreenMode want = mode == "borderless" ? platform::FullscreenMode::Borderless
                                          : mode == "exclusive" ? platform::FullscreenMode::Exclusive
                                                                : platform::FullscreenMode::Windowed;
+    if (platform::allowed_mode(want) != want) {
+        NXLOG_W(kTag, "windowed mode is not used on this GPU ([gfx] borderless_only): borderless instead");
+        want = platform::allowed_mode(want);
+    }
     if (platform::fullscreen_mode() == want) return;
     if (!platform::set_fullscreen(want)) {
         NXLOG_W(kTag, "window mode '%s' was refused", mode.c_str());
@@ -832,7 +839,8 @@ int update_hook(::Ctx*, uint64_t, void*) {
             apply_fps_counter(s.fps);
             st.want_present.store(static_cast<int>(present_mode_for(s.display)));
             apply_audio(s.audio);
-            haptic::configure(static_cast<haptic::Mode>(s.pad.haptic), s.pad.haptic_strength, s.pad.rumble_scale, s.pad.rumble);
+            haptic::configure(static_cast<haptic::Mode>(s.pad.haptic), s.pad.haptic_strength, s.pad.rumble_scale, s.pad.rumble, s.pad.hd_haptics,
+                              s.pad.dualsense_full_volume);
             if (st.window && s.display.monitor != old_monitor && s.display.monitor > 0) {
                 if (platform::move_to_display(s.display.monitor)) st.limiter.reset_schedule();
                 apply_frame_cap(s);                        // another display can mean another refresh rate
@@ -1174,6 +1182,13 @@ public:
         return s;
     }
     std::string settings_path() const override { return g().path; }
+    std::vector<std::string> gpu_names() const override {
+        std::vector<std::string> names;
+        if (!g().device) return names;
+        for (const gfx::GpuInfo& gi : g().device->gpus())
+            if (gi.can_present && std::find(names.begin(), names.end(), gi.name) == names.end()) names.push_back(gi.name);
+        return names;
+    }
     void begin_capture() override {
         G& st = g();
         std::lock_guard<std::mutex> lk(st.cap_mu);
@@ -1344,6 +1359,8 @@ bool load() {
     if (!config_has("gfx", "astc_quality")) config_set("gfx", "astc_quality", st.settings.display.astc_quality.c_str());
     // ASTC storage (BC1 for opaque textures on small GPUs): the same, as [gfx] astc_bc (read once, at the first ASTC image).
     if (!config_has("gfx", "astc_bc")) config_set("gfx", "astc_bc", st.settings.display.astc_bc.c_str());
+    // Graphics card: the file's choice becomes [gfx] gpu unless the ini or the environment set it (read once, when the Vulkan device is created, after this).
+    if (!config_has("gfx", "gpu") && st.settings.display.gpu != "auto") config_set("gfx", "gpu", st.settings.display.gpu.c_str());
     // Audio: a volume or device set in the ini or the environment wins over the file; the page then shows what is in force.
     if (config_has("audio", "volume")) st.settings.audio.volume = audio::master_volume();
     else audio::set_master_volume(static_cast<float>(st.settings.audio.volume));
@@ -1404,7 +1421,8 @@ bool start(const StartOptions& opt) {
     st.source = std::shared_ptr<hid::InputSource>(st.source_owner.get(), [](hid::InputSource*) {});   // owned by G
     hid::set_input_source(st.source);
     hid::set_vibration_sink(&vib_sink, nullptr);
-    haptic::configure(static_cast<haptic::Mode>(st.settings.pad.haptic), st.settings.pad.haptic_strength, st.settings.pad.rumble_scale, st.settings.pad.rumble);
+    haptic::configure(static_cast<haptic::Mode>(st.settings.pad.haptic), st.settings.pad.haptic_strength, st.settings.pad.rumble_scale, st.settings.pad.rumble,
+                      st.settings.pad.hd_haptics, st.settings.pad.dualsense_full_volume);
     tt::set_mouse_sink(&test_mouse_sink);
     tt::set_key_sink(&key_sink);
     if (st.renderer) tt::set_screenshot_provider(&screenshot_provider, nullptr);
@@ -1442,6 +1460,7 @@ bool start(const StartOptions& opt) {
                 }
                 st.overlay->install_on_renderer();
                 apply_fps_counter(st.settings.fps);
+                if (st.window) update::start();   // a newer release? (the overlay says so; not in headless test runs)
             }
         }
     }
@@ -1456,7 +1475,9 @@ bool start(const StartOptions& opt) {
     if (st.window || st.overlay) svc_set_busy_hook(&busy_pump);
     kernel::set_blocked_hook(GetCurrentThreadId(), &keyboard_service);
     if (st.window && st.settings.display.monitor > 0) platform::move_to_display(st.settings.display.monitor);
-    if (st.window && st.settings.display.window_mode != "windowed") set_window_mode(st.settings.display.window_mode);
+    // The window starts windowed: also call this for "windowed" where that is not allowed. The saved setting is left as it is.
+    const bool no_windowed = platform::allowed_mode(platform::FullscreenMode::Windowed) != platform::FullscreenMode::Windowed;
+    if (st.window && (st.settings.display.window_mode != "windowed" || no_windowed)) set_window_mode(st.settings.display.window_mode);
 
     const GamePlay* gp = game_play();
     {   // display options: the internal resolution comes from the window as it is now (after the window mode change above)

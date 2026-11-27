@@ -1,47 +1,37 @@
-# fefw-recomp
-
-<a href="https://recomplauncher.com/game/fefw-recomp"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+# <img src="launcher/src-tauri/steam-art/icon.png" alt="" height="48" align="absmiddle"> fefw-recomp
 
 A native Windows PC port of **Fire Emblem: Fortune's Weave** (Nintendo Switch 2), made by static recompilation. The game's code is
 translated to C++ and compiled into a regular Windows program, which runs on a small runtime that stands in for the console's system
-software and draws with Vulkan. It is not an emulator.
+software and draws with Vulkan. It is not an emulator. It also runs on Linux and handhelds through Proton.
+
+<p>
+<a href="https://recomplauncher.com/game/fefw-recomp"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+<a href="https://github.com/metrist38/fefw-recomp/releases/latest"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/badges/windows-light.svg"><img alt="Download for Windows" src="docs/badges/windows-dark.svg" height="48"></picture></a>
+<a href="https://github.com/metrist38/fefw-recomp/releases/latest/download/fefw-recomp-install.desktop"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/badges/handheld-light.svg"><img alt="Download for handhelds" src="docs/badges/handheld-dark.svg" height="48"></picture></a>
+</p>
+
+**How to install:** [Windows](#windows) · [Steam Deck and other handhelds](#steam-deck-and-other-handhelds) · [desktop Linux](#linux)
 
 > [!IMPORTANT]
 > **No game files are included or downloadable here.** This project contains only its own tools and runtime. To play, you need your
-> own legally dumped copy of the game; everything that reads the game happens on your PC. See [LEGAL.md](LEGAL.md).
+> own legally dumped copy of the game ([requirements](#requirements)); everything that reads the game happens on your PC. See
+> [LEGAL.md](LEGAL.md).
 >
 > Not affiliated with or endorsed by Nintendo or Intelligent Systems.
 
-## Features
+## The launcher
 
-- Runs natively on Windows, with no emulator in between
-- 60 or 120 FPS modes, any output resolution, render scale and a temporal upscaler
-- Ultrawide (21:9, 32:9 or any wider shape): a wider view with the menus and HUD kept at 16:9 in the centre
-- DLSS, FSR 3 and XeSS upscaling, and DLSS or FSR 3 frame generation (the vendors' files are downloaded on request)
-- HDR output, with the menus and HUD brightness set apart from the 3D scene
-- Windowed, borderless or fullscreen
-- Keyboard, mouse or any controller, with matching button prompts
-- HD Rumble on DualSense and Pro Controller (cable or Bluetooth), and all four motors on Xbox controllers
-- The game in all its languages, and your own dumped DLC
-- RomFS mods, exefs code patches and DLL code mods
-- An in-game settings overlay (**F1**)
-- A launcher that sets everything up from your dump, with nothing else to install
-- Linux and Steam Deck through Proton, with LSFG-VK frame generation
+<p>
+<img src="docs/screenshots/launcher-play.png" alt="The launcher's Play page, with the game ready to start" width="32%">
+<img src="docs/screenshots/launcher-setup.png" alt="The Setup page while the game is being built" width="32%">
+<img src="docs/screenshots/launcher-settings.png" alt="The graphics settings: preset, upscaling and frame generation" width="32%">
+</p>
 
-## Requirements
+## Install
 
-- Windows 10 or 11, 64-bit
-- A 64-bit CPU with SSE4.2 and POPCNT: an Intel Core i3 / i5 / i7 (2008) or newer, or an AMD FX (2011) / Ryzen or newer. Setup builds the game for your processor: CPUs with FMA3 (Intel Haswell 2013, AMD Piledriver 2012 and newer) get the faster build, older ones such as Sandy Bridge, Ivy Bridge and Xeon E5 v1 / v2 a compatible build that plays the same, a little slower. Older processors (Core 2, AMD Phenom) are not supported; Setup and `fefw.exe` say so instead of crashing
-- A GPU with Vulkan 1.3 and an up-to-date driver
-- 16 GB of RAM and about 30 GB of free disk space
-- Your own decrypted dump of the game at update **131072**, in one of these forms:
-  - a folder with `exefs\` and `romfs\`
-  - a dump folder with `base\` and `updates\<version>\`
-  - a [`.nup`](https://github.com/a55uka/nup) package
+### Windows
 
-## Getting started
-
-1. Download `fefw-recomp-<version>-win64.zip` from the [Releases](../../releases) page and extract it to its own folder.
+1. Download `fefw-recomp-<version>-win64.zip` from the [latest release](../../releases/latest) and extract it to its own folder.
 2. Run `fefw-launcher.exe`.
 3. On **Setup**, choose your dump folder (or **.nup** file) and press **Set up**. The launcher checks your files, builds the game on
    your PC and prepares the shaders. The first setup takes a while; you can **Pause** it and continue later.
@@ -49,21 +39,124 @@ software and draws with Vulkan. It is not an emulator.
 
 Your saves are in the `save\` folder next to the launcher.
 
-### Linux and Steam Deck
+On a screen smaller than 2560x1440, such as a handheld's, the first **Set up** lowers the output resolution to 1080p or 720p to
+suit it. **Settings > Display > Output resolution** changes it.
 
-Download `fefw-recomp-<version>-linux-x64.tar.gz` instead, extract it and run `fefw-launcher.AppImage`; the steps are the same. The
-game runs through Proton: Play needs Steam with a Proton installed, [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher) (`umu-run`) or Wine, or
-press **Add to Steam** on the Play page and start it from Steam (also in the Steam Deck's Game Mode). After an update, run Set up in
-the launcher (Desktop Mode on a Deck) before playing from Steam.
+### Steam Deck and other handhelds
+
+The quickest way on a handheld with Steam's Game Mode, such as a Steam Deck or one running Bazzite or CachyOS Handheld:
+
+1. Switch to **Desktop Mode** and download `fefw-recomp-install.desktop` from the [latest release](../../releases/latest). If your
+   browser saves it ending in `.download`, remove that ending.
+2. Open the file (choose to run it if asked). It installs the game (or uses the install you already have), offers
+   [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) if it is missing, installs this project's Decky plugin and adds
+   the game to your Steam library with artwork, asking before each step.
+3. In the launcher it opens, choose your dump and press **Set up**. You still need your own dump, and about 30 GB of free space.
+4. Switch back to Game Mode and open the game in your library. On the game's Steam page, the **FEFW Recomp** Decky plugin replaces
+   Steam's default tabs with **Setup**, **Settings** and **About**, and turns the Play button into **Set up** (or **Cancel** with
+   progress) when the game needs building or is updating. The same controls are also in the Quick Access Menu.
+
+<p>
+<img src="docs/screenshots/decky-setup.png" alt="The game's SteamOS page while building, showing Cancel, progress, and the Setup, Settings and About tabs" width="48%">
+<img src="docs/screenshots/decky-settings.png" alt="The Settings tab on the game's SteamOS page, grouped by Preset, Resolution and Frame rate" width="48%">
+</p>
+
+Installing the plugin needs administrator rights. If your account has no password, the installer can use a temporary one and remove
+it right afterwards. Run the installer again to finish a step you skipped, or to update the plugin.
+[installer/README.md](installer/README.md) has the details.
+
+The plugin is early. This has been tried on CachyOS Handheld, not yet on SteamOS or Bazzite; reports are welcome. On Bazzite, install
+Decky Loader first with `ujust setup-decky`.
+
+### Linux
+
+On desktop Linux, or to set a handheld up by hand: download `fefw-recomp-<version>-linux-x64.tar.gz` from the
+[latest release](../../releases/latest), extract it and run `fefw-launcher.AppImage`; the steps are the same as on Windows. The game
+runs through Proton: Play needs Steam with a Proton installed, [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher)
+(`umu-run`) or Wine, or press **Add to Steam** on the Play page and start it from Steam (also in the Steam Deck's Game Mode).
 
 FSR 3 frame generation does not work through Proton, so the Linux launcher offers [LSFG-VK](https://lsfg-vk.dev) instead (it needs
-Lossless Scaling on Steam). **Settings > Frame rate** can install the layer, and shows its multiplier, flow scale and performance
-mode once it is found.
+Lossless Scaling on Steam). **Settings > Graphics** can install the layer, and shows its multiplier, flow scale and performance mode
+once it is found.
+
+### Updating
+
+The game says at start when a newer release is out (**F1 > Game** turns that check off). On the launcher's **About** page, update to
+it: your saves, settings and built game stay. You can also extract the new package over the old folder.
+
+If the launcher then asks, run **Set up** again before playing. This matters when you start the game from Steam: on a handheld, do it
+in Desktop Mode, or with the plugin's **Build the game**.
+
+## Requirements
+
+- Windows 10 or 11, 64-bit, or Linux with Proton or Wine
+- A 64-bit CPU with SSE4.2 and POPCNT: an Intel Core i3 / i5 / i7 (2008) or newer, or an AMD FX (2011) / Ryzen or newer
+- A GPU with Vulkan 1.3 and an up-to-date driver
+- 16 GB of RAM and about 30 GB of free disk space
+- Your own decrypted dump of the game at update **131072**, in one of these forms:
+  - a folder with `exefs\` and `romfs\`
+  - a dump folder with `base\` and `updates\<version>\`
+  - a [`.nup`](https://github.com/a55uka/nup) package
+
+<details>
+<summary>Older processors</summary>
+
+Setup builds the game for your processor: CPUs with FMA3 (Intel Haswell 2013, AMD Piledriver 2012 and newer) get the faster build,
+older ones such as Sandy Bridge, Ivy Bridge and Xeon E5 v1 / v2 a compatible build that plays the same, a little slower. Older
+processors (Core 2, AMD Phenom) are not supported; Setup and `fefw.exe` say so instead of crashing.
+
+</details>
+
+## Features
+
+**Picture**
+
+- 60 or 120 FPS modes, any output resolution and render scale
+- Ultrawide (21:9, 32:9 or any wider shape): a wider view with the menus and HUD kept at 16:9 in the centre
+- A built-in temporal upscaler, DLSS, FSR 3 and XeSS upscaling, and DLSS or FSR 3 frame generation
+- HDR output, with the menus and HUD brightness set apart from the 3D scene
+- Windowed, borderless or fullscreen
+
+**Controls**
+
+- Keyboard, mouse or any controller, with matching button prompts
+- HD Rumble on DualSense and Pro Controller (cable or Bluetooth), and all four motors on Xbox controllers
+
+**Game and setup**
+
+- A launcher that sets everything up from your dump, with nothing else to install
+- The game in all its languages, and your own dumped DLC
+- RomFS mods, exefs code patches and DLL code mods
+- An in-game settings overlay (**F1**)
+
+**Linux and handhelds**
+
+- Runs through Proton, with LSFG-VK frame generation
+- On Steam Deck-style handhelds: a [one-file installer](#steam-deck-and-other-handhelds) and a Decky plugin to play, update and
+  change settings from Game Mode
+
+## Playing
 
 ### Settings
 
 The launcher's **Settings** page covers resolution, frame rate, upscaling, window mode, sound and controls. Press **F1** in game for
 the overlay. Every option is described in [runtime/docs/CONFIG.md](runtime/docs/CONFIG.md).
+
+### Upscaling and frame generation
+
+The built-in upscaler needs nothing extra. For DLSS, FSR 3 or XeSS, download the vendor's files in the launcher under
+**Settings > Graphics > Upscaler files**. [docs/UPSCALERS.md](docs/UPSCALERS.md) covers what each one needs and adding the files by
+hand.
+
+### Controls
+
+Any controller works, and so do the keyboard and mouse, with no setup. **F1** opens the settings, **F2** shows the frame rate and
+**Alt+Enter** switches full screen. [docs/CONTROLS.md](docs/CONTROLS.md) lists the keys and mouse controls and how to change them.
+
+### DLC and mods
+
+Your own dumped DLC and RomFS, exefs and DLL mods are supported. A DLL mod runs with the same rights as the game: only install mods
+you trust. See [docs/MODS.md](docs/MODS.md).
 
 ### Mods
 
@@ -73,182 +166,23 @@ patch also requires a rebuild. The original game dump is not modified. The curre
 patches only; supported runtime packages appear in the in-game F1 Mods tab after restarting the game. Runtime packages
 require a matching game runtime implementation; a manifest alone does not execute arbitrary code. See
 [tools/mods/README.md](tools/mods/README.md) for the manifest format, validation limits and checkout build layout.
+
+### Launcher and menu language
+
+The launcher and the F1 menu come in English and Simplified Chinese and start in your system's language. To change it, use the
+language button at the foot of the launcher's sidebar; the choice covers both.
+
+**Translations are welcome.** The launcher and the F1 menu each take their own file: start from
+[template.json](launcher/locales/template.json) for the launcher ([how](launcher/src/locales/README.md)) and from
+[zh.ini](locales/zh.ini) for the menu ([how](locales/README.md)). Send them as a pull request or attach them to an
+[issue](../../issues). A partial translation is fine, as anything missing shows in English. The F1 menu may not yet display scripts
+such as Korean or Japanese properly; if yours looks wrong, say so.
+
 ### Game language
 
-**Settings > Language** (or **F1 > Game**) picks the language of the game's text and voices: Japanese, English (US or UK), French,
-German, Italian, Spanish, Korean and Chinese (Simplified or Traditional). *Automatic*, the default, follows your Windows display
-language and uses English when the game has no translation for it. The change applies the next time the game starts.
-
-### DLSS (NVIDIA RTX only)
-
-NVIDIA's files cannot be shipped here, so DLSS stays off until you add them. In **Settings > Picture**, under
-**DLSS (Streamline) folder**, press **Download the NVIDIA files** (or **Download with frame generation**). The launcher shows NVIDIA's
-licence terms, asks you to accept them, then fetches only the files it needs from NVIDIA's own Streamline 2.14.16 release (about 32 MB,
-not the whole 276 MB package) and checks each one.
-
-Then choose **DLSS** (or **Automatic**, which picks DLSS when the files and an RTX GPU are there) as the Upscaler in **Settings**, and
-restart the game. `fefw.log` says `Streamline ... started` and `DLSS (Streamline)` when it works. The folder can be somewhere else:
-set it under **Settings > Picture > DLSS (Streamline) folder**.
-
-<details>
-<summary>Adding the files by hand</summary>
-
-Take them from NVIDIA's [Streamline SDK](https://github.com/NVIDIAGameWorks/Streamline) (v2.x, the `bin/x64` folder of the release, not
-the development one) and put these four files in a folder named `upscalers\streamline` next to `fefw-launcher.exe`:
-
-```
-sl.interposer.dll   sl.common.dll   sl.dlss.dll   nvngx_dlss.dll
-```
-
-For DLSS frame generation (RTX 40 or newer, with Windows' hardware-accelerated GPU scheduling on) add five more files from the same
-folder: `sl.dlss_g.dll`, `sl.reflex.dll`, `sl.pcl.dll`, `nvngx_dlssg.dll` and `NvLowLatencyVk.dll`.
-
-</details>
-
-<details>
-<summary>Frame generation on an RTX 30 or older GPU</summary>
-
-NVIDIA's own files refuse frame generation on these. Some community mods replace some of these files to run it on
-older GPUs. We don't ship or support them. If you use one, put its files in the same `upscalers\streamline` folder, replacing the
-originals as the mod says, and set `frame_gen_any_gpu = 1` under `[dlss]` in `fefw.ini` in the run folder (or the environment
-variable `NXRT_DLSS_FRAME_GEN_ANY_GPU=1`). The game then no longer turns frame generation off just because Streamline says the GPU
-is too old, and the mod's own answer decides. `fefw.log` shows the outcome on its `framegen` and `dlss` lines.
-
-</details>
-
-### FSR 3 (any GPU)
-
-FSR 3 needs AMD's signed FidelityFX files. In **Settings > Picture**, under **FSR 3 (AMD) folder**, press **Download the AMD files**
-(the launcher shows AMD's licence first).
-
-<details>
-<summary>Adding the files by hand</summary>
-
-Download them from AMD's [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) repository. Put them in
-`upscalers\fsr` next to `fefw-launcher.exe` (create the folder):
-
-```
-amd_fidelityfx_upscaler_vk.dll   amd_fidelityfx_loader_vk.dll   FSR 3 upscaling (Kits/FidelityFX/signedbin of tag v2.4.0)
-amd_fidelityfx_vk.dll                                            FSR 3 frame generation (PrebuiltSignedDLL of tag v1.1.4)
-```
-
-</details>
-
-Choose **AMD FSR 3 upscaling** as the Upscaler and/or **AMD FSR 3 frame generation** under **Settings > Frame rate**, then restart
-the game. Frame generation adds one generated frame between two real ones; the HUD and text are taken from the real frames, so they
-stay sharp. It works best with VSync off on a 120 Hz or faster display: with VSync on the game renders at most half the refresh
-rate, and on a display slower than twice the game's frame rate generation pauses. **Settings > Picture > FSR 3 (AMD) folder** shows
-whether the files are found, and can point to another folder. If a file is missing, `fefw.log` names it and the game carries on with TAAU (or without frame generation).
-
-### XeSS (any GPU, best on Intel Arc)
-
-XeSS needs Intel's `libxess.dll`. In **Settings > Picture**, under **XeSS (Intel) folder**, press **Download the Intel file** (the
-launcher shows Intel's licence first). It also needs the
-[Microsoft Visual C++ 2015-2022 Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe). Then choose **Intel XeSS** as the
-Upscaler in **Settings** and restart the game. If the file or the runtime is missing, `fefw.log` says so and the game uses TAAU.
-
-<details>
-<summary>Adding the file by hand</summary>
-
-Download `libxess.dll` from `bin/` of the [XeSS SDK 3.0.2](https://github.com/intel/xess/releases/tag/v3.0.2) release and put it in
-`upscalers\xess` next to `fefw-launcher.exe` (create the folder).
-
-</details>
-
-### Keyboard and controller
-
-Any controller works, and so does the keyboard, with no setup. The button prompts in the game follow the one you used last: press a
-key and they show keys, touch the controller and they show its buttons. The keyboard drives the Switch buttons the game knows:
-
-| Keys | Switch | |
-|---|---|---|
-| W A S D | Left stick | Move |
-| Arrow keys, I J K L | Right stick | Camera |
-| Enter, Space | A | Confirm |
-| Esc, Backspace | B | Back |
-| R | X | |
-| F | Y | |
-| Q / E | L / R | E: dash in town |
-| Z / C | ZL / ZR | C: map in town |
-| Tab | + | Menu |
-| M | - | |
-| 1 2 3 4, or numpad 8 2 4 6 | D-pad up, down, left, right | |
-| V / B | Left / right stick click | |
-
-The movement keys push the stick all the way. **F1** (settings), **F2** (frame rate counter) and **Alt+Enter** (full screen) are
-the runtime's own keys. **F1 > Controls** lists the keys as they are now. To leave the game cleanly, use **Quit game** at the
-bottom of the F1 menu (click it twice) or close the window (**Alt+F4**): both save the settings and end the game normally.
-
-To change a key, close the game and edit `[bindings.all]` in `controls.ini` in the run folder (the game creates it on its first
-start). Each line is `key = action`:
-
-```
-[bindings.all]
-W = move_forward
-Return = btn_a
-G = btn_x
-X = none
-```
-
-Left side: a key name (`Return`, `Space`, `Left Shift`, `Up`, `Keypad 8` ...). Right side: `move_*`, `look_*`, `dpad_*`, `btn_a`,
-`btn_b`, `btn_x`, `btn_y`, `btn_l`, `btn_r`, `btn_zl`, `btn_zr`, `btn_plus`, `btn_minus`, `btn_lstick`, `btn_rstick`, or `none` to
-switch a key off. An older `controls.ini` gets the keys above added at the next start (only keys you have not bound yourself; the
-old file is kept as `controls.ini.bak`). To go back to the default keys, delete the `[bindings.*]` sections. Controller options (stick dead zones,
-button mapping, prompts) are under **Settings** and **F1 > Controls**.
-
-### Mouse
-
-The game has its own mouse controls, made for the Switch 2's Joy-Con 2 used as a mouse, and the PC mouse drives them. Move the mouse
-or click and the game switches to its mouse controls (its prompts show mouse buttons); press a key or touch the controller and it
-switches straight back. Whichever you used last is in control.
-
-- **Bases, dungeons:** the mouse turns the camera, left click talks, opens and attacks, right click cancels or opens the menu, the
-  wheel zooms the camera while standing still. Walk with WASD or the stick.
-- **Battle maps:** the mouse moves the map cursor (faster when you move it faster), left click selects and confirms, right click
-  cancels.
-- **Menus:** moving the mouse up or down moves the selection, left click confirms, right click goes back.
-
-While the game is in its mouse controls the Windows pointer is hidden and kept in the window (it comes back where the game's pointer
-was). A key, the controller, **Alt+Tab** or **F1** frees it. The game's own **System > Mouse Controls** page shows every button, and
-its **System > Settings** set the speeds: the rows marked (Mouse) on the General, Battle and Bases/Dungeons tabs (camera
-sensitivity, map cursor speed, menu cursor speed), and **Method for Switching to Mouse**, which should stay automatic. Leave the
-game's angle calibration alone (a desk mouse needs none; **Reset Calibration** undoes it). **F1 > Controls > Mouse** has the PC side:
-mouse controls automatic, always or off, and the mouse speed before the game's own (`[mouse] jc2_speed` in `controls.ini`).
-
-On battle maps, hold **Y** (keyboard **F**) to move the cursor faster with the stick or keys.
-
-### DLC
-
-DLC is used when you dump it from your own copy, like the game. Put each add-on in `dlc\<title id>\romfs` of your dump folder (next
-to `exefs\` and `romfs\`, or next to `base\` and `updates\`). A `.nup` with add-ons is unpacked that way on its own. The **Play**
-page lists the DLC it found.
-
-### RomFS mods
-
-RomFS mods go in the `mods\` folder next to the launcher (**Play** > **Open mods folder**), in the layout emulators use:
-`mods\<mod name>\romfs\...`. Files in a mod replace the game's files at the same path. If two mods change the same file, the mod
-whose name sorts last wins, so you can name them `01-...` and `02-...`. Rename a mod to start with `-` or `_` to turn it off.
-
-Code mods (exefs patches) go in `mods\<mod name>\exefs\`: an `.ips` / IPS32 file named after main's build ID
-(`DB93B0125F4850601D61C3EDDE012F8EB2ECFE77.ips`) or a `.pchtxt` with that `@nsobid`. Because the game code is compiled ahead of
-time, they are applied when the game is built, not when it starts: after adding, changing or removing one, press **Set up** again
-(the Play page says the build is out of date). Patches for the other modules (sdk, subsdk*) are not used, and a patch that touches
-an instruction this port hooks makes Set up stop and name it.
-
-Code mods made for this port can also be DLLs in the mod's `exefs\` folder (`mods\<mod name>\exefs\<mod>.dll`), so one mod folder can
-carry an emulator's patches and this port's DLL side by side. They load when the game starts and can hook the game at the sites it was
-built with, call the game's functions, give the game functions of their own to call (what a new menu entry needs) and edit the game's
-data files as they are loaded. A mod that needs hook sites of its own lists them in `exefs\<any name>.sites` next to its DLL; Set up
-lifts the game with them, so press **Set up** again after adding or removing such a mod. A DLL runs with the same rights as the game:
-only install mods you trust. `[fs] dll_mods = false` in `fefw.ini` turns them off. Writing one:
-[runtime/include/nxrt/mod_api.h](runtime/include/nxrt/mod_api.h).
-
-Existing Mod Host packages are managed through the launcher's **Mods** page and the F1 **Mods** tab. Manifest-based runtime
-packages and native DLL mods use separate interfaces.
-
-### Updating to a new release
-
-Extract the new zip to a new folder, copy your `save\` folder (and `mods\`, if you use mods) into it, and run **Set up** again.
+**Settings > Sound and language** (or **F1 > Game**) picks the language of the game's text and voices: Japanese, English (US or UK),
+French, German, Italian, Spanish, Korean and Chinese (Simplified or Traditional). *Automatic*, the default, follows your Windows
+display language and uses English when the game has no translation for it. The change applies the next time the game starts.
 
 ## Troubleshooting
 
@@ -276,6 +210,8 @@ This project stands on the work of others. Thank you.
   (fixes, performance and frame pacing changes), [stephenjayakar/fefw-recomp](https://github.com/stephenjayakar/fefw-recomp) (Stephen
   Jayakar: the recompiler, stutter and PGO performance work) and [Kompas9/fefw-recomp](https://github.com/Kompas9/fefw-recomp) (Paulius:
   the alpha test shader variant, shader preparation at Set up, the tutorial pager's D-pad prompts and quieter logs).
+- [XiONDiGiTaL/EmblemWeave](https://github.com/XiONDiGiTaL/EmblemWeave): the settings panels for code mods, by
+  [Mi-Kel](https://github.com/Mi-Kel), taken here by way of ObeliskChamber.
 - Everyone who has sent changes to this repository, among them moistman7, Paulius, Stellarznith, Abubakar-ux, ranbinrang-rgb, itaskaev2
   and Ruben Ripalda.
 - [nxrecomp](https://github.com/drakolordx7/nxrecomp) by drakolordx7: the recompiler this is built on.

@@ -132,6 +132,7 @@ void lifetime_texture_freed(const Texture* t);
 void pool_register(MemoryPool* p);
 void pool_unregister(MemoryPool* p);
 PoolHit pool_lookup(uint64_t gpu_address);          // pool is null when the address is in no pool
+uint64_t pool_gen();                                // monotonic generation bumped on pool register/unregister
 inline uint8_t* host_ptr(uint64_t gpu_address) { return reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(gpu_address)); }
 
 // The data of an NVNbuffer (0x30 bytes in the game's memory).
@@ -179,13 +180,20 @@ struct Texture : Obj {
     std::atomic<uint8_t> prep_flags{0};     // bit 0: the render thread uploaded it at least once
     std::atomic<uint32_t> prep_sched{0};    // 0x80000000 | prep_gen when a background job was requested for that generation
     std::atomic<uint32_t> prep_prov{0};     // 0x80000000 | prep_gen when the image holds a quick stand-in for that generation (texprep::provisional_uploaded)
+    std::atomic<uint32_t> image_format{0};  // VkFormat of the GPU image once it is made (0: none yet): a background job makes its data in it
     TexGpu* gpu = nullptr;                  // render thread only
+    bool released = false;                  // render thread only: the game finalized it and its release has run (tex_release)
     // Sparse textures kept as a Vulkan sparse-residency image (too big to back fully): the storage ranges [first, second) written or remapped
     // since the last upload, so only those 64 KiB tiles are uploaded again. sparse_all: everything (until the first upload).
     std::mutex sparse_mu;
     std::vector<std::pair<uint64_t, uint64_t>> sparse_dirty;
     bool sparse_all = true;
 };
+
+inline uint64_t next_pool_uid() {
+    static std::atomic<uint64_t> n{1};
+    return n.fetch_add(1, std::memory_order_relaxed);
+}
 
 struct TexturePool : Obj {
     static constexpr Kind kKind = Kind::TexturePool;
@@ -196,6 +204,7 @@ struct TexturePool : Obj {
         bool has_view = false;
         bool used = false;
     };
+    const uint64_t uid = next_pool_uid();   // unique per-lifetime id so address reuse cannot alias render-thread caches
     MemoryPool* mem = nullptr;
     int64_t offset = 0;
     int count = 0;
@@ -203,6 +212,7 @@ struct TexturePool : Obj {
     // Registrations so far and the ids of the latest ones, oldest first (changes.back() is registration `version`): the pool descriptor
     // arrays (nvn_pipeline.cpp) write only the ids changed since they were last current. Under `lock`.
     uint64_t version = 0;
+    std::atomic<uint64_t> seq{0};           // odd while a registration writes `entries`, even when stable (render-thread cache)
     std::vector<uint32_t> changes;
     std::shared_mutex lock;
 };
@@ -210,12 +220,14 @@ struct TexturePool : Obj {
 struct SamplerPool : Obj {
     static constexpr Kind kKind = Kind::SamplerPool;
     SamplerPool() : Obj(kKind) {}
+    const uint64_t uid = next_pool_uid();   // as TexturePool's
     MemoryPool* mem = nullptr;
     int64_t offset = 0;
     int count = 0;
     std::vector<SamplerInfo> entries;
     std::vector<uint8_t> used;
     uint64_t version = 0;                   // as TexturePool's
+    std::atomic<uint64_t> seq{0};           // as TexturePool's
     std::vector<uint32_t> changes;
     std::shared_mutex lock;
 };
@@ -280,6 +292,11 @@ std::vector<Ref<Texture>> texture_registry_all();
 uint32_t texture_clock_ms();
 // Per-load census lines ([diag] load_census; nvn_objects.cpp, nvn_gpu_pool.cpp, nvn_gpu_texture.cpp): what is alive by kind and size.
 void log_pool_census(const char* why);
+// Where the RAM is: the process, the game's heap (sampled), the part of it under the game's GPU pools and texture storage, and our own host
+// buffers (texture preparation, the staging ring), plus outside-heap working set on a background thread.
+void log_ram_census(const char* why);   // nvn_gpu_texture.cpp
+// Every live non-virtual pool with storage, under the registry lock: kind 0 gpu only (CPU no access), 1 cpu cached, 2 cpu uncached, 3 shader code.
+void for_each_pool_range(void (*fn)(uint64_t lo, uint64_t size, int kind, void* user), void* user);
 
 // NVNtextureHandle = (sampler id << 20) | texture id
 constexpr uint64_t make_texture_handle(uint32_t tex_id, uint32_t sampler_id) { return (static_cast<uint64_t>(sampler_id) << 20) | (tex_id & 0xfffffu); }

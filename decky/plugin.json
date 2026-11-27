@@ -1,0 +1,11 @@
+{
+  "name": "FEFW Recomp",
+  "author": "fefw-recomp",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["utility"],
+    "description": "Update and rebuild the Fire Emblem: Fortune's Weave recomp from Game Mode.",
+    "image": ""
+  }
+}

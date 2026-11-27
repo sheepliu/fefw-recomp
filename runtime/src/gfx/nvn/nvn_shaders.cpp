@@ -12,6 +12,7 @@
 #include "nvn_shaders.h"
 #include "nvn_spirv_patch.h"
 #include "nvn_residency.h"
+#include "nxrt/boot_timeline.h"
 
 #include <windows.h>
 
@@ -396,7 +397,9 @@ bool reflect_spirv(const uint32_t* words, size_t count, ShaderReflection& out, s
     };
     std::vector<Chain> chains;   // access chains (block members of built-in blocks: builtins_used_*)
     std::unordered_map<uint32_t, uint32_t> ptr_root;   // result id of an access chain or copy -> the pointer it is made from
+    std::unordered_map<uint32_t, std::vector<uint32_t>> ptr_multi;  // OpSelect / OpPhi over pointers -> all source ids
     std::vector<uint32_t> written_ptrs;                // pointers some store, atomic or call may write through
+    std::vector<uint32_t> atomic_ptrs;                 // pointers targeted by any OpAtomic* instruction
     std::unordered_set<uint32_t> referenced;  // ids some instruction takes as an operand (approximation, see below)
     uint32_t entry_id = 0;
     bool have_entry = false;
@@ -470,23 +473,50 @@ bool reflect_spirv(const uint32_t* words, size_t count, ShaderReflection& out, s
             if (n >= 4) chains.push_back({w[2], std::vector<uint32_t>(w + 3, w + n)});
             if (n >= 3) ptr_root[w[1]] = w[2];
             break;
-        case 67: case 68:   // OpPtrAccessChain, OpInBoundsPtrAccessChain
+        case 60:            // OpImageTexelPointer: result type, result id, image, coordinate, sample
+        case 67: case 70:   // OpPtrAccessChain, OpInBoundsPtrAccessChain
             if (n >= 3) ptr_root[w[1]] = w[2];
             break;
         case 83:            // OpCopyObject
+        case 124:           // OpBitcast
             if (n >= 3) ptr_root[w[1]] = w[2];
             break;
+        case 169:           // OpSelect: result type, result id, cond, obj1, obj2
+            if (n >= 5) {
+                auto it = types.find(w[0]);
+                if (it != types.end() && it->second.op == OpTypePointer) ptr_multi[w[1]] = {w[3], w[4]};
+            }
+            break;
+        case 245:           // OpPhi: result type, result id, (var, block)...
+            if (n >= 4) {
+                auto it = types.find(w[0]);
+                if (it != types.end() && it->second.op == OpTypePointer) {
+                    auto& dst = ptr_multi[w[1]];
+                    for (size_t k = 2; k + 1 < n; k += 2) dst.push_back(w[k]);
+                }
+            }
+            break;
         case 62:            // OpStore pointer object
+        case 63:            // OpCopyMemory target source ...
+        case 64:            // OpCopyMemorySized target source size ...
             if (n >= 1) written_ptrs.push_back(w[0]);
+            break;
+        case 227:           // OpAtomicLoad result_type result_id pointer ...
+            if (n >= 3) atomic_ptrs.push_back(w[2]);
             break;
         case 228:           // OpAtomicStore pointer ...
-            if (n >= 1) written_ptrs.push_back(w[0]);
+        case 319:           // OpAtomicFlagClear pointer ...
+            if (n >= 1) { written_ptrs.push_back(w[0]); atomic_ptrs.push_back(w[0]); }
             break;
         case 229: case 230: case 231: case 232: case 233: case 234: case 235: case 236: case 237: case 238: case 239: case 240: case 241: case 242:
-            if (n >= 3) written_ptrs.push_back(w[2]);   // OpAtomicExchange .. OpAtomicXor: result type, result id, pointer
+        case 318:           // OpAtomicFlagTestAndSet: result type, result id, pointer
+        case 5614:          // OpAtomicFMinEXT: result type, result id, pointer
+        case 5615:          // OpAtomicFMaxEXT: result type, result id, pointer
+        case 6035:          // OpAtomicFAddEXT: result type, result id, pointer
+            if (n >= 3) { written_ptrs.push_back(w[2]); atomic_ptrs.push_back(w[2]); }
             break;
-        case 57:            // OpFunctionCall: a pointer argument may be written by the callee
-            for (size_t k = 3; k < n; k++) written_ptrs.push_back(w[k]);
+        case 57:            // OpFunctionCall: a pointer argument may be written (or atomically accessed) by the callee
+            for (size_t k = 3; k < n; k++) { written_ptrs.push_back(w[k]); atomic_ptrs.push_back(w[k]); }
             break;
         }
         i += wc;
@@ -526,15 +556,27 @@ bool reflect_spirv(const uint32_t* words, size_t count, ShaderReflection& out, s
         }
     };
 
-    std::unordered_set<uint32_t> written_vars;
-    for (uint32_t p : written_ptrs) {
-        for (int hop = 0; hop < 64; ++hop) {   // follow access chains and copies down to the variable
-            auto it = ptr_root.find(p);
-            if (it == ptr_root.end()) break;
-            p = it->second;
+    auto collect_roots = [&](const std::vector<uint32_t>& ptrs) {
+        std::unordered_set<uint32_t> roots, visited;
+        std::vector<uint32_t> stack = ptrs;
+        while (!stack.empty()) {
+            uint32_t p = stack.back();
+            stack.pop_back();
+            for (int hop = 0; hop < 64; ++hop) {
+                if (!visited.insert(p).second) break;
+                if (auto mit = ptr_multi.find(p); mit != ptr_multi.end()) {
+                    for (uint32_t src : mit->second) stack.push_back(src);
+                    break;
+                }
+                auto it = ptr_root.find(p);
+                if (it == ptr_root.end()) { roots.insert(p); break; }
+                p = it->second;
+            }
         }
-        written_vars.insert(p);
-    }
+        return roots;
+    };
+    std::unordered_set<uint32_t> written_vars = collect_roots(written_ptrs);
+    std::unordered_set<uint32_t> atomic_vars = collect_roots(atomic_ptrs);
     for (const Var& v : vars) {
         const Type* ptr = type(v.ptr_type);
         if (!ptr || ptr->op != OpTypePointer || ptr->w.size() < 2) continue;
@@ -568,6 +610,7 @@ bool reflect_spirv(const uint32_t* words, size_t count, ShaderReflection& out, s
         b.declared_binding = b.binding;
         b.used = referenced.count(v.id) != 0;
         b.written = written_vars.count(v.id) != 0;
+        b.atomic = atomic_vars.count(v.id) != 0;
         if (auto it = names.find(v.id); it != names.end()) b.name = it->second;
         uint32_t inner = pointee;
         for (const Type* t = type(inner); t && (t->op == OpTypeArray || t->op == OpTypeRuntimeArray); t = type(inner)) {
@@ -1189,6 +1232,7 @@ void ShaderCache::pack_prefetch() {
     }
     CloseHandle(f);
     const uint64_t ms = std::max<uint64_t>(1, now_ms() - t0);
+    boot_mark("shader pack read");
     NXLOG_I("nvn", "shader pack: read %llu MiB in %.1f s (%.0f MB/s)%s", static_cast<unsigned long long>(off >> 20), ms / 1000.0,
             static_cast<double>(off) / 1000.0 / static_cast<double>(ms), pack_mem_ ? ", kept in memory" : "");
 }

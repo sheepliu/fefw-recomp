@@ -26,11 +26,14 @@
 
 #include <imgui.h>
 #include <imgui_impl_vulkan.h>
+#include <imgui_internal.h>
 
 #include "nxrt/config.h"
 #include "nxrt/input_source.h"
 #include "nxrt/log.h"
 #include "nxrt/menu_i18n.h"
+#include "nxrt/update_check.h"
+#include "nxrt/mod_panels.h"
 #include "nxrt/nvn.h"
 #include "nxrt/nvn_backend.h"
 #include "nxrt/platform.h"
@@ -169,6 +172,68 @@ constexpr uint64_t kKbDirBits[4] = {
     hid::btn(hid::kBtnLeft) | hid::btn(hid::kBtnStickLLeft), hid::btn(hid::kBtnRight) | hid::btn(hid::kBtnStickLRight)};
 constexpr double kKbRepeatDelay = 0.40, kKbRepeatEvery = 0.07;   // seconds: a held direction or B repeats
 
+// ---- the code mods' widgets (mod API version 4, NxModUi): thin wrappers over ImGui, called from a panel ----------------------------
+// From EmblemWeave (its #71, by Mi-Kel) by way of ObeliskChamber, so a panel looks and works the same in all three.
+const char* ui_label(const char* s) { return s && *s ? s : "##unnamed"; }
+void ui_text(const char* t) { ImGui::TextUnformatted(t ? t : ""); }
+void ui_text_disabled(const char* t) { ImGui::TextDisabled("%s", t ? t : ""); }
+void ui_text_colored(uint32_t rgba, const char* t) {
+    const ImVec4 c(static_cast<float>((rgba >> 24) & 0xFF) / 255.f, static_cast<float>((rgba >> 16) & 0xFF) / 255.f,
+                   static_cast<float>((rgba >> 8) & 0xFF) / 255.f, static_cast<float>(rgba & 0xFF) / 255.f);
+    ImGui::TextColored(c, "%s", t ? t : "");
+}
+int ui_checkbox(const char* label, int* v) {
+    if (!v) return 0;
+    bool b = *v != 0;
+    if (!ImGui::Checkbox(ui_label(label), &b)) return 0;
+    *v = b ? 1 : 0;
+    return 1;
+}
+// AlwaysClamp: a value typed into a slider (Ctrl+click) stays within min..max too, so a mod may use it as an index
+int ui_slider_float(const char* label, float* v, float lo, float hi, const char* fmt) {
+    return v && ImGui::SliderFloat(ui_label(label), v, lo, hi, fmt ? fmt : "%.2f", ImGuiSliderFlags_AlwaysClamp) ? 1 : 0;
+}
+int ui_slider_int(const char* label, int* v, int lo, int hi, const char* fmt) {
+    return v && ImGui::SliderInt(ui_label(label), v, lo, hi, fmt ? fmt : "%d", ImGuiSliderFlags_AlwaysClamp) ? 1 : 0;
+}
+int ui_button(const char* label) { return ImGui::Button(ui_label(label)) ? 1 : 0; }
+void ui_same_line() { ImGui::SameLine(); }
+void ui_separator(const char* label) {
+    if (label && *label) ImGui::SeparatorText(label);
+    else ImGui::Separator();
+}
+// A begin_disabled or tree_node a panel did not close again is closed after it (draw_mod_panels), so a slip in one mod cannot break
+// the window or the menu: these count what is open.
+int g_ui_disabled = 0, g_ui_trees = 0;
+void ui_begin_disabled(int d) {
+    ImGui::BeginDisabled(d != 0);
+    ++g_ui_disabled;
+}
+void ui_end_disabled() {
+    if (g_ui_disabled <= 0) return;
+    ImGui::EndDisabled();
+    --g_ui_disabled;
+}
+int ui_tree_node(const char* label, int default_open) {
+    if (default_open) ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+    if (!ImGui::TreeNode(ui_label(label))) return 0;
+    ++g_ui_trees;
+    return 1;
+}
+void ui_tree_pop() {
+    if (g_ui_trees <= 0) return;
+    ImGui::TreePop();
+    --g_ui_trees;
+}
+void ui_tooltip(const char* t) {
+    if (t && *t) ImGui::SetItemTooltip("%s", t);
+}
+const NxModUi kModUi = {sizeof(NxModUi), &ui_text,           &ui_text_disabled, &ui_text_colored, &ui_checkbox,
+                        &ui_slider_float, &ui_slider_int,    &ui_button,        &ui_same_line,    &ui_separator,
+                        &ui_begin_disabled, &ui_end_disabled, &ui_tree_node,    &ui_tree_pop,     &ui_tooltip};
+
+bool g_panels_drawn = false;   // a panel was drawn in the ImGui frame being built (api->panel_visible)
+
 // Drops pressed keys and mouse buttons so nothing stays latched in ImGui (the caller holds the context's mutex).
 void clear_imgui_input(ImGuiContext* ctx) {
     ImGuiContext* prev = ImGui::GetCurrentContext();
@@ -179,6 +244,34 @@ void clear_imgui_input(ImGuiContext* ctx) {
     ImGui::SetCurrentContext(prev);
 }
 }  // namespace
+
+bool has_mod_panels() { return services::modapi::has_panels(); }
+
+// Every code mod's panel (mod API add_panel) as a section that folds open, into the current ImGui window: the menu's Mods tab.
+void draw_mod_panels() {
+    const std::vector<services::modapi::PanelInfo> list = services::modapi::panels();
+    if (list.empty()) return;
+    g_panels_drawn = true;
+    for (size_t i = 0; i < list.size(); ++i) {
+        const services::modapi::PanelInfo& p = list[i];
+        ImGui::PushID(static_cast<int>(i));
+        const bool shown = ImGui::CollapsingHeader(p.title.c_str(), ImGuiTreeNodeFlags_DefaultOpen);
+        if (!p.mod.empty()) ImGui::SetItemTooltip("%s", p.mod.c_str());
+        if (shown) {
+            g_ui_disabled = g_ui_trees = 0;
+            ImGui::Indent();
+            ImGui::PushID("##contents");   // the header pushes no ID: a widget labelled like the panel's title must not clash with it
+            p.fn(&kModUi, p.user);
+            while (g_ui_trees > 0) ui_tree_pop();
+            while (g_ui_disabled > 0) ui_end_disabled();
+            // a same_line() with no widget after it would put the next panel's header on this panel's last line
+            if (ImGui::GetCurrentWindow()->DC.IsSameLine) ImGui::NewLine();
+            ImGui::PopID();
+            ImGui::Unindent();
+        }
+        ImGui::PopID();
+    }
+}
 
 namespace {
 std::atomic<int> g_shader_backlog{0};
@@ -242,6 +335,7 @@ struct Overlay::Impl {
     int counter_n = 0;
 
     void build_ui();
+    void build_ui_inner();
     void update_scale(const VkExtent2D& extent);
     void refresh_counter_text(double now_s);
     void draw_counter(const FrameInfo& f, double now_s);
@@ -251,12 +345,18 @@ struct Overlay::Impl {
     double note_since_s = -1.0, note_empty_s = -1.0;
     int note_peak = 0;
     bool note_visible(double now_s);
-    // code mods' note (services::modapi::notice(): a mod whose hook sites this build lacks), shown for kModsNoteSeconds from the
-    // first frame it is seen, re-read once a second
+    // code mods' note (services::modapi::notice(): a mod whose hook sites this build lacks, or that uses unknown site kinds),
+    // shown for kModsNoteSeconds from the first frame it is seen, re-read once a second
     std::string mods_text;
     double mods_since_s = -1.0, mods_read_s = -1e9;
     bool mods_note_visible(double now_s);
-    void draw_mods_note(const FrameInfo& f);
+    float draw_mods_note(const FrameInfo& f);   // returns the y just under the note
+    // the note about a newer release (update::available()): up for kUpdateNoteSeconds of drawn frames while neither the menu nor the
+    // keyboard is open, so a loading stall does not use it up; the version is re-read once a second
+    std::string update_text;
+    double update_shown_s = 0, update_read_s = -1e9;
+    bool update_note_visible(double now_s, double dt_s);
+    void draw_update_note(const FrameInfo& f, float below);
     void draw_note(const FrameInfo& f);
 
     // The on-screen keyboard (services_api.h swkbdui). kb_mu guards the question and its text: key events edit it on the game's main thread,
@@ -286,6 +386,12 @@ struct Overlay::Impl {
 };
 
 void Overlay::Impl::build_ui() {
+    g_panels_drawn = false;   // set by draw_mod_panels: whether a mod's panel is on screen this frame (api->panel_visible)
+    build_ui_inner();
+    services::modapi::set_panel_visible(g_panels_drawn);
+}
+
+void Overlay::Impl::build_ui_inner() {
     if (menu) {
         menu();
         return;
@@ -468,12 +574,12 @@ std::unique_ptr<Overlay> Overlay::create(const Context& ctx, std::string* error)
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;      // set_menu_pad feeds it
     ImGui::StyleColorsDark();
-    // UI font: a CJK-capable face for [gfx] ui_language packs, else the scalable built-in default. ImGui 1.92's
+    // UI font: a CJK-capable face when the menu loads a translation (menu_language), else the scalable built-in default. ImGui 1.92's
     // dynamic glyphs load only what the UI shows, so a system CJK font costs nothing until it is drawn.
     {
         std::string font = config_get_str("gfx", "ui_font", "");
-        std::string lang = config_get_str("gfx", "ui_language", "auto");
-        const bool wants_cjk = !(lang.empty() || lang == "auto" || lang == "en" || lang == "en-US") || !font.empty();
+        const std::string lang = menu_language();
+        const bool wants_cjk = !lang.empty() || !font.empty();
         std::string chosen;
         if (wants_cjk) {
             const auto exists = [](const std::string& p) {
@@ -497,14 +603,16 @@ std::unique_ptr<Overlay> Overlay::create(const Context& ctx, std::string* error)
             }
             if (chosen.empty()) {
                 static const char* const kSystem[] = {
-                    "C:\\Windows\\Fonts\\msyh.ttc", "C:\\Windows\\Fonts\\simhei.ttf", "C:\\Windows\\Fonts\\Deng.ttf",
+                    "C:\\Windows\\Fonts\\msyh.ttc",
+                    "C:\\Windows\\Fonts\\msyh.ttf",   // Wine/Proton use the standalone font
+                    "C:\\Windows\\Fonts\\simhei.ttf", "C:\\Windows\\Fonts\\Deng.ttf",
                 };
                 for (const char* c : kSystem)
                     if (exists(c)) { chosen = c; break; }
             }
         }
         if (!chosen.empty() && io.Fonts->AddFontFromFileTTF(chosen.c_str(), 0.0f))
-            NXLOG_I(kTag, "UI font: %s ([gfx] ui_language %s)", chosen.c_str(), lang.c_str());
+            NXLOG_I(kTag, "UI font: %s (menu language %s)", chosen.c_str(), lang.empty() ? "en" : lang.c_str());
         else {
             if (wants_cjk) NXLOG_W(kTag, "no CJK font found ([gfx] ui_font '%s'): using the built-in default", font.c_str());
             io.Fonts->AddFontDefaultVector();   // the scalable default font: stays sharp at every UI scale (update_scale)
@@ -521,6 +629,7 @@ std::unique_ptr<Overlay> Overlay::create(const Context& ctx, std::string* error)
             }
         }
     }
+    menu_i18n_init();   // before anything is drawn: the keyboard can open before the F1 menu ever has
     ImGui::GetStyle().FontSizeBase = 16.0f;
     s.base_style = ImGui::GetStyle();
     const VkExtent2D e = ctx.renderer->extent();
@@ -580,6 +689,8 @@ void Overlay::set_visible(bool v) {
         if (s.restore_relative && platform::has_window()) platform::set_relative_mouse(true);
         s.restore_relative = false;
         std::lock_guard<std::mutex> lk(s.mu);
+        // after the lock: a UI build already running would otherwise set it again once it ends, and nothing would clear it
+        services::modapi::set_panel_visible(false);
         ImGuiContext* prev = ImGui::GetCurrentContext();
         ImGui::SetCurrentContext(s.imgui);
         ImGuiIO& io = ImGui::GetIO();   // drop pressed keys and buttons so nothing stays latched
@@ -877,9 +988,9 @@ void Overlay::Impl::draw_keyboard(double now_s) {
             // where a Switch pad has them
             const bool lab = kb_by_label.load(std::memory_order_relaxed);
             ImGui::PushTextWrapPos(0.f);
-            ImGui::TextDisabled("Pad: %s type, %s delete, %s space, %s shift, L/R move, + OK, - cancel", lab ? "A" : "A (right)", lab ? "B" : "B (bottom)",
-                                lab ? "Y" : "Y (left)", lab ? "X" : "X (top)");
-            ImGui::TextDisabled("Keyboard: type, Enter OK, Esc cancel, Ctrl+V paste");
+            ImGui::TextDisabled(tr("Pad: %s type, %s delete, %s space, %s shift, L/R move, + OK, - cancel"), lab ? "A" : tr("A (right)"),
+                                lab ? "B" : tr("B (bottom)"), lab ? "Y" : tr("Y (left)"), lab ? "X" : tr("X (top)"));
+            ImGui::TextDisabled("%s", tr("Keyboard: type, Enter OK, Esc cancel, Ctrl+V paste"));
             ImGui::PopTextWrapPos();
         }
     }
@@ -1156,7 +1267,7 @@ bool Overlay::Impl::mods_note_visible(double now_s) {
     return now_s - mods_since_s < kModsNoteSeconds;
 }
 
-void Overlay::Impl::draw_mods_note(const FrameInfo& f) {
+float Overlay::Impl::draw_mods_note(const FrameInfo& f) {
     ImFont* font = ImGui::GetFont();
     const float size = std::clamp(std::round(static_cast<float>(f.extent.height) / 50.f), 13.f, 32.f);
     const float pad = size * 0.5f;
@@ -1166,6 +1277,43 @@ void Overlay::Impl::draw_mods_note(const FrameInfo& f) {
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + sz.x + 2.f * pad, y0 + sz.y + 2.f * pad), IM_COL32(0, 0, 0, 170), size * 0.3f);
     dl->AddText(font, size, ImVec2(x0 + pad, y0 + pad), IM_COL32(255, 200, 80, 255), mods_text.c_str());
+    return y0 + sz.y + 3.f * pad;
+}
+
+constexpr double kUpdateNoteSeconds = 15.0;
+bool Overlay::Impl::update_note_visible(double now_s, double dt_s) {
+    if (update_shown_s >= kUpdateNoteSeconds) return false;
+    if (now_s - update_read_s >= 1.0) {
+        update_read_s = now_s;
+        const std::string v = update::available();
+        update_text.clear();
+        if (!v.empty()) {
+            // sized to fit: a player's own table or a long tag must not cut the text, which could split a character
+            const char* format = tr("Version %s is available. Open the launcher to update.");
+            if (const int n = std::snprintf(nullptr, 0, format, v.c_str()); n > 0) {
+                update_text.resize(static_cast<size_t>(n));
+                std::snprintf(update_text.data(), update_text.size() + 1, format, v.c_str());
+            }
+        }
+    }
+    if (update_text.empty()) return false;
+    update_shown_s += std::clamp(dt_s, 0.0, 0.1);
+    return true;
+}
+
+// At the top centre. below: where the mods note ends when that is up, else 0
+void Overlay::Impl::draw_update_note(const FrameInfo& f, float below) {
+    ImFont* font = ImGui::GetFont();
+    const float size = std::clamp(std::round(static_cast<float>(f.extent.height) / 50.f), 13.f, 32.f);
+    const float pad = size * 0.5f;
+    const float y = std::max(size, below);
+    const float W = static_cast<float>(f.extent.width);
+    const float wrap = std::max(1.f, W - 4.f * pad);
+    const ImVec2 sz = font->CalcTextSizeA(size, FLT_MAX, wrap, update_text.c_str());
+    const float x0 = (W - sz.x) * 0.5f - pad;
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    dl->AddRectFilled(ImVec2(x0, y), ImVec2(x0 + sz.x + 2.f * pad, y + sz.y + 2.f * pad), IM_COL32(0, 0, 0, 170), size * 0.3f);
+    dl->AddText(font, size, ImVec2(x0 + pad, y + pad), IM_COL32(140, 220, 140, 255), update_text.c_str(), nullptr, wrap);
 }
 
 void Overlay::Impl::draw_note(const FrameInfo& f) {
@@ -1194,7 +1342,9 @@ void Overlay::draw(const FrameInfo& f) {
     const bool mods_on = s.mods_note_visible(now_s) && !s.ctx.renderer->capture_pending();
     const bool ptr_on = s.ptr_show.load(std::memory_order_relaxed) && (s.ptr_in_shots.load(std::memory_order_relaxed) || !s.ctx.renderer->capture_pending());
     const bool kb_on = s.kb_poll();
-    if (!s.visible && !counter_on && !note_on && !mods_on && !ptr_on && !kb_on) {
+    const bool update_on = !s.visible && !kb_on && !s.ctx.renderer->capture_pending() &&
+                           s.update_note_visible(now_s, std::chrono::duration<double>(now - s.last_frame).count());
+    if (!s.visible && !counter_on && !note_on && !mods_on && !update_on && !ptr_on && !kb_on) {
         s.last_frame = now;
         s.counter_was_on = false;
         return;
@@ -1217,13 +1367,17 @@ void Overlay::draw(const FrameInfo& f) {
     }
     // a screenshot leaves the counter out unless asked for; with the menu hidden there is then nothing to draw
     const bool show_counter = counter_on && (s.counter_in_shots.load(std::memory_order_relaxed) || !s.ctx.renderer->capture_pending());
-    if (!s.visible && !show_counter && !note_on && !mods_on && !ptr_on && !kb_on) {
+    if (!s.visible && !show_counter && !note_on && !mods_on && !update_on && !ptr_on && !kb_on) {
         s.last_frame = now;
         return;
     }
     const bool hdr_frame = s.hdr && f.hdr_output;
-    if (s.hdr && !f.hdr_output) return;      // the display left HDR mode: the RGBA8 overlay pipeline does not match the SDR swapchain, so no overlay until the next start
-    if (hdr_frame && !s.composite.ensure_target(f.extent)) return;
+    // the display left HDR mode (the RGBA8 overlay pipeline does not match the SDR swapchain, so no overlay until the next start), or
+    // the HDR target cannot be made: nothing is drawn, so no mod panel is on screen
+    if ((s.hdr && !f.hdr_output) || (hdr_frame && !s.composite.ensure_target(f.extent))) {
+        services::modapi::set_panel_visible(false);
+        return;
+    }
     std::lock_guard<std::mutex> lk(s.mu);
     ImGuiContext* prev = ImGui::GetCurrentContext();
     ImGui::SetCurrentContext(s.imgui);
@@ -1236,10 +1390,14 @@ void Overlay::draw(const FrameInfo& f) {
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
     if (s.visible && !kb_on) s.build_ui();    // the keyboard is modal: the menu comes back once it is answered
-    if (kb_on) s.draw_keyboard(now_s);
+    if (kb_on) {
+        services::modapi::set_panel_visible(false);   // the keyboard stands in front of the menu
+        s.draw_keyboard(now_s);
+    }
     if (show_counter) s.draw_counter(f, now_s);
     if (note_on) s.draw_note(f);
-    if (mods_on) s.draw_mods_note(f);
+    const float under_mods = mods_on ? s.draw_mods_note(f) : 0.f;
+    if (update_on) s.draw_update_note(f, under_mods);
     if (ptr_on) {   // a plain arrow, white with a dark outline, sized with the frame height
         const float k = std::max(1.f, static_cast<float>(f.extent.height) / 720.f);
         const float x = s.ptr_x.load(std::memory_order_relaxed), y = s.ptr_y.load(std::memory_order_relaxed);

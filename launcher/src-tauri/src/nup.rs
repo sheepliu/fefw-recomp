@@ -160,6 +160,28 @@ impl Extractor<'_> {
             .sum()
     }
 
+    fn dir_uncompressed(&self, d: u32, depth: u32) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        let Some(dir) = self.nup.dirs.get(d as usize) else { return false };
+        let dc = self.nup.dirs.len() as u32;
+        for slot in dir.first_child..dir.first_child.saturating_add(dir.child_count) {
+            let Some(&id) = self.nup.children.get(slot as usize) else { return false };
+            if id < dc {
+                if !self.dir_uncompressed(id, depth + 1) {
+                    return false;
+                }
+            } else {
+                let Some(f) = self.nup.files.get((id - dc) as usize) else { return false };
+                if f.codec != 0 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn dir(&mut self, d: u32, out: &Path, depth: u32) -> Result<(), String> {
         if depth > 64 {
             return Err("The .nup folder tree is too deep.".into());
@@ -217,12 +239,62 @@ fn uuid_hex(u: &[u8; 16]) -> String {
 
 /// Unpacks `nup_path` into `out`. A finished unpack of the same package is reused. `progress(done, total, current file)`
 /// is called per file; `cancel` is polled between files. Returns `out`.
+/// When the chosen game package's RomFS is stored uncompressed (codec 0), only `exefs/` and add-ons (`dlc/`) are unpacked
+/// and `<dest>/romfs.nup` is written pointing at `nup_path` so the runtime and shader extractor read RomFS straight from the `.nup`.
 pub fn extract(nup_path: &Path, out: &Path, progress: &mut dyn FnMut(u64, u64, &str), cancel: &dyn Fn() -> bool) -> Result<PathBuf, String> {
-    let mut file = File::open(nup_path).map_err(|e| format!("cannot open {}: {}", nup_path.display(), e))?;
+    let abs_nup = std::path::absolute(nup_path).unwrap_or_else(|_| nup_path.to_path_buf());
+    let abs_nup_fwd = crate::dump::fwd(&abs_nup);
+    let mut file = File::open(&abs_nup).map_err(|e| format!("cannot open {}: {}", abs_nup.display(), e))?;
     let nup = parse(&mut file)?;
-    // ":dlc" marks unpacks that include the add-ons: a package with add-ons unpacked before they were extracted is unpacked again.
+
+    // (package, destination) pairs for the base, the updates and the add-ons (the runtime serves dlc/ as [aoc] dir).
+    let mut jobs: Vec<(usize, &Package, PathBuf)> = Vec::new();
+    for (idx, p) in nup.packages.iter().enumerate() {
+        match p.kind {
+            KIND_BASE => jobs.push((idx, p, out.join("base"))),
+            KIND_UPDATE => jobs.push((idx, p, out.join("updates").join(p.version.to_string()))),
+            KIND_ADDON => jobs.push((idx, p, out.join("dlc").join(format!("{:016X}", p.title_id)))),
+            _ => {}
+        }
+    }
+    if !jobs.iter().any(|(_, p, _)| p.kind != KIND_ADDON) {
+        return Err("This .nup has no base game or update in it.".into());
+    }
+
+    // Matches runtime/src/core/nup.cpp: highest update with a RomFS, else base game with a RomFS.
+    let chosen_idx = nup
+        .packages
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.kind == KIND_UPDATE && p.romfs_dir != NO_DIR && (p.romfs_dir as usize) < nup.dirs.len())
+        .max_by_key(|(_, p)| p.version)
+        .or_else(|| {
+            nup.packages.iter().enumerate().find(|(_, p)| p.kind == KIND_BASE && p.romfs_dir != NO_DIR && (p.romfs_dir as usize) < nup.dirs.len())
+        })
+        .map(|(i, _)| i);
+
+    let mut ex = Extractor { nup: &nup, src: BufReader::with_capacity(1 << 20, file), done: 0, total: 0, progress, cancel };
+    // Only use direct .nup RomFS mode when:
+    // 1. There is a single non-addon package with a RomFS (so multi-version .nups keep full extraction and dump::scan()'s fallback
+    //    to older supported versions still works).
+    // 2. Both the chosen package's RomFS and ExeFS (if present) are stored uncompressed (codec 0), since runtime/src/loader/nup.cpp
+    //    validates both subtrees and rejects any compressed entry.
+    let romfs_pkg_count =
+        nup.packages.iter().filter(|p| p.kind != KIND_ADDON && p.romfs_dir != NO_DIR && (p.romfs_dir as usize) < nup.dirs.len()).count();
+    let direct_romfs = romfs_pkg_count == 1
+        && chosen_idx.is_some_and(|i| {
+            let p = &nup.packages[i];
+            let exefs_ok = p.exefs_dir == NO_DIR || ex.dir_uncompressed(p.exefs_dir, 0);
+            exefs_ok && ex.dir_uncompressed(p.romfs_dir, 0)
+        });
+
+    // ":dlc" marks unpacks that include add-ons; ":direct:<path>" marks direct-.nup RomFS unpacks bound to that package path.
     let has_addons = nup.packages.iter().any(|p| p.kind == KIND_ADDON);
-    let stamp = format!("{}:{}{}", uuid_hex(&nup.uuid), nup.file_size, if has_addons { ":dlc" } else { "" });
+    let stamp = if direct_romfs {
+        format!("{}:{}{}:direct:{}", uuid_hex(&nup.uuid), nup.file_size, if has_addons { ":dlc" } else { "" }, abs_nup_fwd)
+    } else {
+        format!("{}:{}{}", uuid_hex(&nup.uuid), nup.file_size, if has_addons { ":dlc" } else { "" })
+    };
     if fs::read_to_string(out.join(MARKER)).map(|s| s.trim() == stamp).unwrap_or(false) {
         return Ok(out.to_path_buf());
     }
@@ -231,37 +303,37 @@ pub fn extract(nup_path: &Path, out: &Path, progress: &mut dyn FnMut(u64, u64, &
     }
     fs::create_dir_all(out).map_err(|e| format!("cannot create {}: {}", out.display(), e))?;
 
-    // (package, destination) pairs for the base, the updates and the add-ons (the runtime serves dlc/ as [aoc] dir).
-    let mut jobs: Vec<(&Package, PathBuf)> = Vec::new();
-    for p in &nup.packages {
-        match p.kind {
-            KIND_BASE => jobs.push((p, out.join("base"))),
-            KIND_UPDATE => jobs.push((p, out.join("updates").join(p.version.to_string()))),
-            KIND_ADDON => jobs.push((p, out.join("dlc").join(format!("{:016X}", p.title_id)))),
-            _ => {}
+    for (idx, p, _) in &jobs {
+        if p.exefs_dir != NO_DIR && (p.exefs_dir as usize) < nup.dirs.len() {
+            ex.total += ex.dir_total(p.exefs_dir, 0);
+        }
+        let unpack_romfs = p.kind == KIND_ADDON || (!direct_romfs && (chosen_idx.is_none() || Some(*idx) == chosen_idx || p.kind != KIND_ADDON));
+        if unpack_romfs && p.romfs_dir != NO_DIR && (p.romfs_dir as usize) < nup.dirs.len() {
+            ex.total += ex.dir_total(p.romfs_dir, 0);
         }
     }
-    if !jobs.iter().any(|(p, _)| p.kind != KIND_ADDON) {
-        return Err("This .nup has no base game or update in it.".into());
-    }
-    let mut ex = Extractor { nup: &nup, src: BufReader::with_capacity(1 << 20, file), done: 0, total: 0, progress, cancel };
-    for (p, _) in &jobs {
-        for d in [p.exefs_dir, p.romfs_dir] {
-            if d != NO_DIR && (d as usize) < nup.dirs.len() {
-                ex.total += ex.dir_total(d, 0);
-            }
-        }
-    }
-    for (p, dest) in &jobs {
+    for (idx, p, dest) in &jobs {
         if p.root_dir as usize >= nup.dirs.len() {
             return Err("The .nup package tree is invalid.".into());
         }
-        for (d, name) in [(p.exefs_dir, "exefs"), (p.romfs_dir, "romfs")] {
-            if d != NO_DIR {
-                if d as usize >= nup.dirs.len() {
-                    return Err("The .nup package tree is invalid.".into());
+        if p.exefs_dir != NO_DIR {
+            if p.exefs_dir as usize >= nup.dirs.len() {
+                return Err("The .nup package tree is invalid.".into());
+            }
+            ex.dir(p.exefs_dir, &dest.join("exefs"), 0)?;
+        }
+        if p.romfs_dir != NO_DIR {
+            if p.romfs_dir as usize >= nup.dirs.len() {
+                return Err("The .nup package tree is invalid.".into());
+            }
+            if direct_romfs && p.kind != KIND_ADDON {
+                if Some(*idx) == chosen_idx {
+                    fs::create_dir_all(dest).map_err(|e| format!("cannot create {}: {}", dest.display(), e))?;
+                    fs::write(dest.join("romfs.nup"), format!("{abs_nup_fwd}\n"))
+                        .map_err(|e| format!("cannot write {}: {}", dest.join("romfs.nup").display(), e))?;
                 }
-                ex.dir(d, &dest.join(name), 0)?;
+            } else {
+                ex.dir(p.romfs_dir, &dest.join("romfs"), 0)?;
             }
         }
     }

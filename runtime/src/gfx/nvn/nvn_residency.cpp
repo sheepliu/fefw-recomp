@@ -221,6 +221,7 @@ void residency_begin_submit(Frame& f) {
         last = now;
         if (residency_on()) pool_feedback_tick(f);   // nvn_pipeline.cpp: readbacks done stamp their textures; every pool pair's marks copied and cleared
         tex_residency_tick(f);   // nvn_gpu_texture.cpp: failed images retried; demote idle ones under pressure
+        if (gpass_on()) gpass_stamp(f, "residency tick", 0);
     }
     // the first submission of each present (a frame has several): restore the demoted textures seen again, within the budget
     if (residency_on() && now != last_restore) {

@@ -41,6 +41,11 @@ set(FEFW_EXEFS_DEFAULT "game/dump/exefs" CACHE PATH "default [fs] exefs")
 set(FEFW_ROMFS_DEFAULT "game/dump/romfs" CACHE PATH "default [fs] romfs")
 set(FEFW_MAIN_DEFAULT "" CACHE FILEPATH "default [fs] main: main as an uncompressed NSO (empty: <exefs>/main)")
 configure_file(src/fefw_paths.h.in "${CMAKE_CURRENT_BINARY_DIR}/fefw_paths.h" @ONLY)
+# fefw_build_id.h: the release version and `git describe`, written at every build (cmake/build_id.cmake) for the log and the reports
+add_custom_target(fefw_build_id
+    COMMAND "${CMAKE_COMMAND}" "-DROOT=${FEFW_ROOT}" "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/fefw_build_id.h" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_id.cmake"
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/fefw_build_id.h"
+    COMMENT "Build id (version and git describe)")
 
 # clang-cl takes a clang argument through -clang:, the other drivers take it as it is. What tells the two apart is the frontend variant: on
 # a Windows host the clang++ driver also reports a simulated MSVC ABI (CMAKE_CXX_SIMULATE_ID is "MSVC" for it), so asking that handed
@@ -75,6 +80,21 @@ if(FEFW_RT_DLL)
     # fefw_rt.pdb. The release publishes it beside the package (not in it) to turn crash reports' fefw_rt.dll+0x... into functions and lines
     # (tools/symbolize.py). Set before the runtime's targets exist: CMP0141 (3.25) reads it when a target is made. Codegen is unchanged.
     set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT Embedded)
+    # A release package says so when a newer release is out (runtime include/nxrt/update_check.h): its version is the launcher's, and
+    # FEFW_UPDATE_REPO / FEFW_BUILD_ID mean what they do for the launcher (update.rs, docs/BUILDING.md). A build from source never checks.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${FEFW_ROOT}/launcher/src-tauri/tauri.conf.json")
+    file(READ "${FEFW_ROOT}/launcher/src-tauri/tauri.conf.json" _fefw_tauri)
+    string(JSON _fefw_version GET "${_fefw_tauri}" version)
+    set(NXRT_UPDATE_REPO "metrist38/fefw-recomp")
+    if(NOT "$ENV{FEFW_UPDATE_REPO}" STREQUAL "")
+        set(NXRT_UPDATE_REPO "$ENV{FEFW_UPDATE_REPO}")
+    endif()
+    set(NXRT_RELEASE_VERSION "${_fefw_version}")
+    set(NXRT_RELEASE_BY_TAG OFF)
+    if(NOT "$ENV{FEFW_BUILD_ID}" STREQUAL "")
+        set(NXRT_RELEASE_VERSION "$ENV{FEFW_BUILD_ID}")
+        set(NXRT_RELEASE_BY_TAG ON)
+    endif()
 endif()
 add_subdirectory("${FEFW_RUNTIME_DIR}" runtime)
 
@@ -85,6 +105,7 @@ if(FEFW_RT_DLL)
     add_library(fefw_rt SHARED src/fefw_main.cpp src/fefw_rt.def)
     target_include_directories(fefw_rt PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" src)
     target_compile_definitions(fefw_rt PRIVATE FEFW_RT_DLL=1)
+    add_dependencies(fefw_rt fefw_build_id)
     target_link_libraries(fefw_rt PRIVATE nxrt_game_fefw nxrt_gfx nxrt user32)
     # fefw_rt.pdb next to the DLL, with only its bare name recorded in the DLL (/PDBALTPATH: no build machine path, as before);
     # /DEBUG turns /OPT:REF and /OPT:ICF off unless they are named, so they are: unused code stays dropped and identical functions folded.
@@ -112,6 +133,7 @@ endforeach()
 add_executable(fefw src/fefw_main.cpp src/fefw_hle.cpp res/fefw.rc)
 set_source_files_properties(res/fefw.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/res/fefw.manifest;${CMAKE_CURRENT_SOURCE_DIR}/res/fefw.ico")
 target_include_directories(fefw PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+add_dependencies(fefw fefw_build_id)
 target_link_libraries(fefw PRIVATE ${FEFW_LIBS} nxrt_game_fefw nxrt_gfx nxrt)
 # As pkp.exe: a linker map next to the exe (host frames get names), a big main stack (lifted code nests deeply), low host allocations so
 # the guest ranges at 0x71_0000_0000 and up stay free. res/fefw.rc carries the manifest (UTF-8 code page).
@@ -129,6 +151,9 @@ if(FEFW_CPU_VARIANT STREQUAL "compat")
     target_compile_definitions(fefw PRIVATE FEFW_CPU_NEEDS=FEFW_CPU_NEEDS_COMPAT_BUILD)
 else()
     target_compile_definitions(fefw PRIVATE FEFW_CPU_NEEDS=FEFW_CPU_NEEDS_FMA_BUILD)
+    # fefw_hle.cpp's culling tests follow the lifted code's fused multiply-adds: the fma lifted libraries are compiled with -mfma
+    # (recomp/games/fefw/CMakeLists.txt), so this file is too; without it each of them would be a call into the CRT's fmaf.
+    set_source_files_properties(src/fefw_hle.cpp PROPERTIES COMPILE_OPTIONS "-mfma")
 endif()
 # The font and the site list are copied when the build is configured, not in a POST_BUILD step: CMake wraps that step in cmd.exe's
 # `cd /D "<build dir>"`, and an & in the checkout path splits the command (EmblemWeave issue 38).

@@ -6,13 +6,19 @@
 // 0x70C74, TimeZoneConversionFailed (903) = 0x70E74, TimeZoneNotFound (989) = 0x7BA74.
 // Tests whose name ends in `_needs_tz` depend on src/services/timezone.cpp (tz::to_calendar / tz::to_posix); on a branch where that
 // file is still the placeholder they fail for that reason only.
+#include <atomic>
 #include <chrono>
 #include <cstring>
+#include <thread>
 #include <vector>
 
+#include "../src/services/services_internal.h"
 #include "../src/services/timezone.h"
+#include "nxrt/abi.h"
 #include "nxrt/config.h"
+#include "nxrt/memory.h"
 #include "nxrt/services.h"
+#include "nxrt/svc.h"
 #include "svc_test_util.h"
 
 NXTEST_GROUP(svc_time)
@@ -34,6 +40,10 @@ constexpr uint8_t kSourceId[16] = {'n', 'x', 'r', 't', '-', 's', 't', 'e', 'a', 
 int64_t host_unix() {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
+int64_t raw_ticks_ns() {
+    const uint64_t t = kernel::system_tick(), hz = kernel::tick_hz();
+    return static_cast<int64_t>((t / hz) * 1000000000ull + (t % hz) * 1000000000ull / hz);
+}
 int64_t abs64(int64_t v) { return v < 0 ? -v : v; }
 
 // Ryujinx TimeSharedMemory.ReadObjectFromSharedMemory: live slot = off + 4 + pad + (index & 1) * size.
@@ -41,6 +51,26 @@ const uint8_t* live_slot(const uint8_t* base, uint32_t off, uint32_t pad, uint32
     uint32_t idx = 0;
     std::memcpy(&idx, base + off, 4);
     return base + off + 4 + pad + (idx & 1) * size;
+}
+
+// The numeric fields of a ContinuousAdjustmentTimePoint slot (the source uuid follows at +40).
+struct AdjustPoint {
+    int64_t clock_offset, diff_scale, shift_amount, base, limit;
+};
+AdjustPoint adjust_of(const uint8_t* slot) {
+    AdjustPoint p{};
+    static_assert(sizeof p == 40);
+    std::memcpy(&p, slot, sizeof p);
+    return p;
+}
+
+// Steady seconds as nn::time::detail::SharedMemoryClient computes them from that time point (read from the SDK's code): the scaled
+// elapsed time plus `base`, bounded on one side by `limit`, added to the raw tick in ns.
+int64_t sdk_steady_secs(const AdjustPoint& p, int64_t now_ns) {
+    const int64_t v = (((now_ns - p.clock_offset) * p.diff_scale) >> p.shift_amount) + p.base;
+    const bool floor = p.diff_scale < 0;
+    const int64_t corr = floor ? (v > p.limit ? v : p.limit) : (v < p.limit ? v : p.limit);
+    return (now_ns + corr) / 1000000000;
 }
 
 // The shared memory object behind GetSharedMemoryNativeHandle (cmd 20 on IStaticService).
@@ -51,6 +81,23 @@ const uint8_t* shm_of(nxsvc::Session& st, uint64_t* size = nullptr) {
     if (!obj) return nullptr;
     if (size) *size = obj->size;
     return reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(obj->host));
+}
+
+// The posix time the SDK's shared-memory reader gets from the clock context block at `off` (0x38 local, 0x80 network).
+int64_t shm_posix(const uint8_t* base, uint32_t off) {
+    int64_t offset = 0;
+    std::memcpy(&offset, live_slot(base, off, 4, 0x20), 8);
+    return offset + sdk_steady_secs(adjust_of(live_slot(base, 0xD0, 4, 0x38)), raw_ticks_ns());
+}
+
+// Waits up to 5 s (the service checks every second) for that time to read `ahead` seconds ahead of `from()`.
+template <class F>
+bool shm_reaches(const uint8_t* base, uint32_t off, F from, int64_t ahead) {
+    for (int i = 0; i < 250; ++i) {
+        if (abs64(shm_posix(base, off) - from() - ahead) <= 3) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
 }
 
 // Clears a zone override made by a test, so the next test starts from the default config.
@@ -237,17 +284,21 @@ NXTEST(svc_time_shared_memory_layout) {
     // Automatic correction flag: counter at 0xC8, one byte per slot at 0xCC / 0xCD, fresh state = 0.
     CHECK_EQ(*live_slot(base, 0xC8, 0, 1), 0u);
 
-    // ContinuousAdjustmentTimePoint, pad 4 at 0xD0, 0x38 per slot: {u64 clock_offset, i64 multiplier, i64 divisor_log2,
-    // SystemClockContext {i64 offset, {i64 time_point, uuid}}}: multiplier 1, divisor 0, context steady time point 0, source uuid.
+    // ContinuousAdjustmentTimePoint, pad 4 at 0xD0, 0x38 per slot: {u64 clock_offset, i64 diff_scale, i64 shift_amount,
+    // i64 base, i64 limit, uuid}: constant correction (diff_scale 0, shift 0, base == limit == epoch - tick0).
     const uint8_t* adj = live_slot(base, 0xD0, 4, 0x38);
-    int64_t mult = 0, div = -1, ctx_tp = -1;
-    std::memcpy(&mult, adj + 8, 8);
-    std::memcpy(&div, adj + 16, 8);
-    std::memcpy(&ctx_tp, adj + 32, 8);
-    CHECK_EQ(mult, 1);
-    CHECK_EQ(div, 0);
-    CHECK_EQ(ctx_tp, 0);
+    const AdjustPoint p = adjust_of(adj);
+    CHECK_EQ(p.diff_scale, 0);
+    CHECK_EQ(p.shift_amount, 0);
+    CHECK_EQ(p.base, p.limit);
+    CHECK_EQ(p.base, kSteadyEpochNs - p.clock_offset);
     CHECK(std::memcmp(adj + 40, kSourceId, 16) == 0);
+
+    // The posix time the SDK's shared-memory reader gets: local context offset + its steady seconds.
+    const uint8_t* local = live_slot(base, 0x38, 4, 0x20);
+    int64_t local_offset = 0;
+    std::memcpy(&local_offset, local, 8);
+    CHECK(abs64(local_offset + sdk_steady_secs(p, raw_ticks_ns()) - host_unix()) <= 3);
 }
 
 NXTEST(svc_time_shared_memory_follows_set_current_time) {
@@ -282,6 +333,136 @@ NXTEST(svc_time_shared_memory_keeps_posix_across_steady_offset) {
     int64_t internal = 0;
     std::memcpy(&internal, steady_ctx, 8);
     CHECK_EQ(internal, kSteadyEpochNs + 1000000000000ll);
+
+    const AdjustPoint p = adjust_of(live_slot(base, 0xD0, 4, 0x38));
+    CHECK_EQ(p.base, p.limit);
+    CHECK_EQ(p.base, kSteadyEpochNs + 1000000000000ll - p.clock_offset);
+    CHECK(abs64(offset + sdk_steady_secs(p, raw_ticks_ns()) - host_unix()) <= 3);
+}
+
+NXTEST(svc_time_shared_memory_follows_host_clock) {
+    nxsvc::Env env;
+    nxsvc::Session st = nxsvc::connect("time:a");
+    nxsvc::Session user = st.sub(st.call(0));
+    // Mapped read-only as the SDK maps it (MapSharedMemory 0x13), so the service has to write into the guest's view.
+    nxsvc::Reply handle = st.call(20);
+    REQUIRE(handle.ok() && handle.copy.size() == 1);
+    const uint64_t view = mem::kAliasBase + 0x40000;
+    ::Ctx map{};
+    map.x[0] = handle.copy[0];
+    map.x[1] = view;
+    map.x[2] = 0x1000;
+    map.x[3] = 1;
+    svc_dispatch(&map, 0x13);
+    REQUIRE(static_cast<uint32_t>(map.x[0]) == 0u);
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(view);
+    // A clock the guest set keeps its distance from the host clock.
+    const int64_t set_back = 1700000000 - host_unix();
+    REQUIRE(user.call(1, nxsvc::Args().i64(1700000000)).ok());
+    // Forward, as after a sleep that stopped the performance counter; then backward, as a clock correction. No guest call in between.
+    for (const int64_t jump : {int64_t{7200}, int64_t{-3600}}) {
+        nxrt::services::time_set_host_skew_for_test(jump * 1000000000);
+        CHECK(shm_reaches(base, 0x38, host_unix, set_back + jump));
+        CHECK(shm_reaches(base, 0x80, host_unix, jump));
+        CHECK(abs64(user.call(0).get<int64_t>(0) - shm_posix(base, 0x38)) <= 3);   // IPC GetCurrentTime agrees
+    }
+    nxrt::services::reset_all();
+    ::Ctx unmap{};
+    unmap.x[0] = handle.copy[0];
+    unmap.x[1] = view;
+    unmap.x[2] = 0x1000;
+    svc_dispatch(&unmap, 0x14);
+    CHECK_EQ(static_cast<uint32_t>(unmap.x[0]), 0u);
+}
+
+NXTEST(svc_time_shared_memory_ignores_small_clock_movement) {
+    nxsvc::Env env;
+    nxsvc::Session st = nxsvc::connect("time:u");
+    const uint8_t* base = shm_of(st);
+    REQUIRE(base != nullptr);
+    uint32_t before = 0, after = 0;
+    std::memcpy(&before, base + 0x38, 4);
+    nxrt::services::time_set_host_skew_for_test(100000000);          // 100 ms, under the 500 ms that rewrites the contexts
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));    // at least two checks
+    std::memcpy(&after, base + 0x38, 4);
+    CHECK_EQ(after, before);
+    nxrt::services::reset_all();
+}
+
+NXTEST(svc_time_shared_memory_offset_ignores_write_phase) {
+    nxsvc::Env env;
+    nxsvc::Session st = nxsvc::connect("time:a");
+    const uint8_t* base = shm_of(st);
+    REQUIRE(base != nullptr);
+    // Put the host clock's lead over the steady clock half way between two seconds.
+    const int64_t host_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    const int64_t lead = host_ns - (raw_ticks_ns() + adjust_of(live_slot(base, 0xD0, 4, 0x38)).base);
+    const int64_t skew = 500000000 - lead % 1000000000;
+    nxrt::services::time_set_host_skew_for_test(skew);
+    // Writes spread over a second (each flag change rewrites the shared memory) all publish that lead rounded down.
+    for (int i = 0; i < 10; ++i) {
+        REQUIRE(st.call(101, nxsvc::Args().u8(1)).ok());
+        int64_t offset = 0;
+        std::memcpy(&offset, live_slot(base, 0x80, 4, 0x20), 8);   // network clock: no offset of its own
+        CHECK_EQ(offset, (lead + skew) / 1000000000);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    nxrt::services::reset_all();
+}
+
+NXTEST(svc_time_shared_memory_writes_survive_remapping) {
+    nxsvc::Env env;
+    nxsvc::Session st = nxsvc::connect("time:a");
+    nxsvc::Reply handle = st.call(20);
+    REQUIRE(handle.ok() && handle.copy.size() == 1);
+    auto obj = kernel::handle_as<kernel::KSharedMemory>(handle.copy[0]);
+    REQUIRE(obj != nullptr);
+    const uint64_t view = mem::kAliasBase + 0x50000;
+    const auto shm_svc = [&](uint32_t num) {
+        ::Ctx c{};
+        c.x[0] = handle.copy[0];
+        c.x[1] = view;
+        c.x[2] = 0x1000;
+        c.x[3] = 1;
+        svc_dispatch(&c, num);
+        return static_cast<uint32_t>(c.x[0]);
+    };
+    // The guest maps and unmaps while another thread makes the service write: no write may hit a released view or be left behind.
+    // Yield between remap pairs so the guest thread does not starve the writer on the unfair host mutex across VirtualAlloc/VirtualFree.
+    std::atomic<bool> started{false}, stop{false};
+    std::atomic<int> remaps{0};
+    std::atomic<uint32_t> guest_err{0};
+    std::thread guest([&] {
+        started.store(true, std::memory_order_release);
+        do {
+            if (const uint32_t r = shm_svc(0x13); r != 0) {
+                guest_err.store(r, std::memory_order_relaxed);
+                break;
+            }
+            if (const uint32_t r = shm_svc(0x14); r != 0) {
+                guest_err.store(r, std::memory_order_relaxed);
+                break;
+            }
+            remaps.fetch_add(1, std::memory_order_relaxed);
+            std::this_thread::yield();
+        } while (!stop.load(std::memory_order_relaxed));
+    });
+    while (!started.load(std::memory_order_acquire)) std::this_thread::yield();
+    int lost = 0;
+    for (int i = 0; i < 2000; ++i) {
+        const uint8_t on = static_cast<uint8_t>(i & 1);
+        st.call(101, nxsvc::Args().u8(on));
+        kernel::with_shared_memory_host(*obj, [&](uint64_t host) {
+            if (*live_slot(reinterpret_cast<const uint8_t*>(host), 0xC8, 0, 1) != on) ++lost;
+        });
+    }
+    stop.store(true, std::memory_order_relaxed);
+    guest.join();
+    CHECK_EQ(guest_err.load(), 0u);
+    CHECK(remaps.load() > 0);
+    CHECK_EQ(lost, 0);
+    nxrt::services::reset_all();
 }
 
 NXTEST(svc_time_automatic_correction_flag) {

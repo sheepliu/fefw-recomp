@@ -36,7 +36,7 @@ export const langName = (code) => (langs.find((l) => l.code === code) || {}).nam
  * Falls back to English, then to the key itself, so a missing entry is visible but harmless.
  */
 export function t(key, vars) {
-  let s = table[key];
+  let s = table[key] || undefined; // an empty entry, as in template.json, is a missing one
   if (s === undefined) s = en.strings[key];
   if (s === undefined) return key;
   if (vars) s = s.replace(/\{(\w+)\}/g, (m, k) => (vars[k] === undefined ? m : String(vars[k])));
@@ -57,13 +57,16 @@ export async function setLang(code, redraw) {
   if (BUILTIN[current]) {
     table = BUILTIN[current].strings;
   } else {
-    table = {};
+    const wanted = current;
+    let strings = {};
     try {
-      const pack = await invoke('read_locale', { code: current });
-      table = (pack && pack.strings) || {};
+      const pack = await invoke('read_locale', { code: wanted });
+      strings = (pack && pack.strings) || {};
     } catch {
-      table = {};
+      // an unreadable pack shows English
     }
+    if (current !== wanted) return; // another language was picked while this pack was being read
+    table = strings;
   }
   document.documentElement.lang = current === 'zh' ? 'zh-CN' : current;
   document.documentElement.classList.toggle('cjk', wide(current));
@@ -71,19 +74,10 @@ export async function setLang(code, redraw) {
 }
 
 /**
- * Reads the saved language and every pack in locales/, then applies the saved one.
- * Called once at startup, before the first page is drawn. `saved` is the language
- * from the configuration when the caller already has it, which saves one round trip.
+ * Reads every pack in locales/, then applies the language to show: the picked one, else the one that suits the
+ * system (lang.rs decides). Called once at startup, before the first page is drawn.
  */
-export async function initLang(redraw, saved) {
-  let code = saved || 'en';
-  if (!saved) {
-    try {
-      code = (await invoke('get_config')).lang || 'en';
-    } catch {
-      code = 'en';
-    }
-  }
+export async function initLang(redraw) {
   try {
     const packs = await invoke('list_locales');
     for (const p of packs) {
@@ -93,6 +87,12 @@ export async function initLang(redraw, saved) {
     }
   } catch {
     // no locales/ folder: the built-in languages still work
+  }
+  let code = 'en';
+  try {
+    code = await invoke('ui_language');
+  } catch {
+    // keep English
   }
   await setLang(code, redraw);
 }

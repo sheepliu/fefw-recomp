@@ -261,7 +261,10 @@ pub fn exe_command(exe: &Path, game_dir: &Path, runner: &[String], extra_env: &[
     cmd
 }
 
-/// `launcher_dir`: the folder the package's upscalers/ is in (the AppImage's folder, not its mount).
+/// `launcher_dir`: the folder the package's upscalers/ is in (the AppImage's folder, not its mount). `lock`: the install's, held
+/// until the game's process has been started. `pad_volume`: Linux, raise a DualSense's volume while the game runs, keeping what
+/// to put back in this file.
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     app: &AppHandle,
     exe: &Path,
@@ -270,6 +273,9 @@ pub fn start(
     minimize: bool,
     runner_setting: &str,
     extra_env: Vec<(String, String)>,
+    lock: crate::lock::Lock,
+    report_opts: crate::report::Options,
+    pad_volume: Option<PathBuf>,
 ) -> Result<(), String> {
     if app.state::<PlayState>().0.lock().unwrap().state == "running" {
         return Err("The game is already running.".into());
@@ -298,7 +304,9 @@ pub fn start(
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no stray console
         }
         let started = SystemTime::now();
-        let mut child = match cmd.spawn() {
+        let spawned = cmd.spawn();
+        drop(lock); // an update or a rebuild now finds the process
+        let mut child = match spawned {
             Ok(c) => c,
             Err(e) => {
                 let what = if runner.is_empty() { String::new() } else { format!(" ({})", runner.join(" ")) };
@@ -315,10 +323,14 @@ pub fn start(
                 let _ = w.minimize();
             }
         }
+        let volume = pad_volume.map(crate::pad_volume::Session::start);
         let (code, wait_err) = match child.wait() {
             Ok(s) => (s.code(), None),
             Err(e) => (None, Some(e.to_string())),
         };
+        if let Some(v) = volume {
+            v.finish();
+        }
         let files = report_files(&dir, started);
         let crash_file = files.iter().any(|f| f.fresh && f.name != "fefw.log");
         let crashed = crash_file || (code != Some(0));
@@ -335,10 +347,19 @@ pub fn start(
         if other_fatal.is_none() && files.iter().any(|f| f.fresh && f.name == "fefw_crash.txt") {
             other_fatal = likely_cause(&std::fs::read_to_string(dir.join("fefw_crash.txt")).unwrap_or_default());
         }
+        // a run that ended badly because the system ran out of memory, which most such ends do not say themselves
+        if other_fatal.is_none()
+            && !cpu_fatal
+            && code != Some(0)
+            && files.iter().any(|f| f.fresh && f.name == "fefw.log")
+            && crate::memory::ran_out(&crate::memory::log_tail(&dir.join("fefw.log")))
+        {
+            other_fatal = Some(crate::memory::OUT_OF_MEMORY.to_string());
+        }
         let message = match (&wait_err, code) {
             (Some(e), _) => format!("Lost track of fefw.exe: {e}"),
             (None, Some(0)) => "fefw.exe exited normally.".to_string(),
-            (None, Some(_)) if other_fatal.is_some() => other_fatal.unwrap_or_default(),
+            (None, Some(_)) if other_fatal.is_some() => other_fatal.clone().unwrap_or_default(),
             (None, Some(4)) if cpu_fatal => match crate::cpu::build_variant() {
                 // fefw.exe was built for another processor (the folder moved, the processor changed): Set up builds the one for this
                 Some(_) => "fefw.exe stopped before the game started: it was built for a processor with features this one lacks (fefw_fatal.txt says which). Run Set up again: it builds the version of the game for this processor.".to_string(),
@@ -347,7 +368,13 @@ pub fn start(
             (None, Some(c)) => format!("fefw.exe exited with code {} (0x{:08X}).", c, c as u32),
             (None, None) => "fefw.exe was ended by the system.".to_string(),
         };
+        // Snapshot the finished run's log and crash files before Play becomes available again, so an immediate restart
+        // cannot truncate or rotate them before the background upload runs.
+        let prepared_report = crate::report::prepare(&report_opts, &dir, code, &files, other_fatal.as_deref());
         set_status(&app2, Status { state: "exited".into(), code, crashed, files, message });
+        if let Some(prepared) = prepared_report {
+            std::thread::spawn(move || crate::report::send(prepared));
+        }
         if minimize {
             if let Some(w) = app2.get_webview_window("main") {
                 let _ = w.unminimize();

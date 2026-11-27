@@ -2,6 +2,8 @@
 #
 #   oracle-lock  recomp/oracle/SHA256SUMS still matches the locked oracle files (recomp/oracle/LOCKED, scripts/oracle_sums.py)
 #   linux        launcher: cargo fmt, clippy, cargo test, the frontend build; Python: every .py under recomp/ and tools/ compiles
+#   translations every launcher language has every string; the F1 menu tables have the strings found in the menu's sources
+#   decky        the Decky plugin: type check, tests, build and pack (the zip is kept with the run)
 #   runtime      Windows, only when runtime/, recomp/include, tools/tiling or tools/textures change: nxrt_tests under
 #                CTest. The graphics groups (nxrt_gfx_tests) need a Vulkan GPU and the lift tests the
 #                recomp toolchain and Unicorn venv, so neither runs here.
@@ -34,10 +36,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # GitHub's Ubuntu mirror is at times very slow (minutes for these packages), so what apt downloads is kept for later runs: a
+      # new cache each week, started from the last one. apt fetches only what the cache lacks.
+      - name: Week (names the package cache)
+        id: week
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ~/apt-archives
+          key: apt-ubuntu-22.04-${{ steps.week.outputs.week }}
+          restore-keys: apt-ubuntu-22.04-
+
       - name: System packages (Tauri)
         run: |
+          mkdir -p ~/apt-archives/partial
+          apt=(sudo apt-get -o "Dir::Cache::archives=$HOME/apt-archives" -o APT::Keep-Downloaded-Packages=true)
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev build-essential
+          "${apt[@]}" install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev build-essential
+          "${apt[@]}" autoclean   # drops the versions that have been replaced
+          # apt wrote as root; the cache is saved by the runner's user
+          sudo rm -rf ~/apt-archives/partial ~/apt-archives/lock
+          sudo chown -R "$(id -u):$(id -g)" ~/apt-archives
 
       - uses: actions/setup-node@v4
         with:
@@ -74,6 +93,63 @@ jobs:
 
       - name: Python compiles
         run: python -m compileall -q recomp tools
+
+      - name: Lifter worker tests
+        run: python recomp/tests/lift_workers_test.py
+
+      - name: Report analysis tests
+        run: python tools/analyze_reports_test.py
+
+      - name: Build script object cache tests
+        run: python game-build/release/object_cache_test.py
+
+      - name: Build script mod sites tests
+        run: python game-build/release/mod_sites_test.py
+
+  translations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Launcher translations
+        working-directory: launcher
+        run: node scripts/check-translations.mjs
+      # also when the launcher's check failed: both lists in one run
+      - name: F1 menu translations
+        if: success() || failure()
+        run: python3 tools/check_menu_translations.py
+      - name: F1 menu check tests
+        if: success() || failure()
+        run: python3 tools/check_menu_translations_test.py
+
+  decky:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: decky
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11' # as old as the loader's own Python is likely to be
+      - run: npx --yes pnpm@9 install --frozen-lockfile
+      - run: npx --yes pnpm@9 run check
+      - run: npx --yes pnpm@9 test
+      - run: npx --yes pnpm@9 run build
+      - run: python3 package.py
+      - name: Installer tests
+        working-directory: installer
+        run: python3 -m unittest discover -s tests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: decky-plugin
+          path: decky/out/fefw-recomp-decky.zip
+          if-no-files-found: error
 
   changes:
     runs-on: ubuntu-latest

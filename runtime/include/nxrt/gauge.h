@@ -55,7 +55,8 @@ void soak_note_frame();
 // 0 = off): frames, mean fps, 1% low fps, worst frame ms and the frames over twice the median. A frame longer than `[diag] hitch_ms` (default 50;
 // 0 = off) is logged with what the registered context sources saw change during it; at most one such line per second (the worst of the second,
 // with the count of the others), then the phase times below (ms of the frame). Sources are read on the presenting thread once per frame:
-// they must be lock-free (an atomic load).
+// they must be lock-free (an atomic load). The same thread logs `session: <build>; gpu <name>` every `[diag] session_stamp_s` (default 60,
+// 0 = off; nxrt/runtime.h session_stamp), for reports that keep only the end of the log.
 void hitch_add_counter(const char* label, uint64_t (*fn)());   // cumulative count / bytes: the hitch line shows the growth during the frame
 void hitch_add_level(const char* label, int64_t (*fn)());      // a level (jobs in flight): shown when non-zero at the end of the frame
 void hitch_start();
@@ -85,6 +86,7 @@ enum HitchPhase : int {
     kHpGameSvc,             // the game's presenting thread: inside system calls (the rest of its time between presents is guest code)
     kHpGameIpc,             //   of it: IPC requests (service calls, file reads)
     kHpGameWait,            //   of it: waits (SleepThread, WaitSynchronization, ArbitrateLock, WaitProcessWideKeyAtomic, WaitForAddress)
+    kHpGameGuestSync,       // the game's presenting thread: user-mode guest sync / spin waits (nn::os::LockBusyMutex, WFE/YIELD)
     kHpRenderTexTake,       // render thread, of the uploads: texprep::take (finding a background result, waits for a running job included)
     kHpRenderTexPrep,       // render thread, of the uploads: prepare_texture run there (stand-ins, CPU untile, cache reads, transcodes)
     kHpRenderTexStaging,    // render thread, of the uploads: the upload buffer (allocation and the copy of the prepared data into it)

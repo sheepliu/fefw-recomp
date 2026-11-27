@@ -13,21 +13,20 @@ The package ships no game code. This script
      <game>/build/exefs: the same NSOs with main uncompressed (the console's main is ZBIC-compressed; tools/build/nso_unpack.py)
      and the mods' exefs patches applied; they move to <game>/exefs once step 4 has linked fefw.exe,
   2. lifts the six NSOs with the bundled lifter (recomp/nxrecomp) into <game>/build/lift,
-  3. compiles the generated C++ with the bundled Zig (zig c++, mingw target) into <game>/build/obj, in parallel,
+  3. compiles the generated C++ with the bundled Zig (zig c++, mingw target) into <game>/build/objcache, in parallel; an object
+     an earlier build made from the same inputs is reused,
   4. links fefw.exe = sdk/fefw_stub.cpp + the lifted objects + sdk/fefw_rt.lib (the runtime, fefw_rt.dll in the package),
-     then publishes both the EXE and the matching runtime main; the previous pair remains backed up until replaced,
-  5. deletes the generated sources and objects (unless --keep) and records the result in <game>/build/done.json.
+     produces a temporary executable. The old executable and matching runtime main stay available until the new pair is ready.
+  5. publishes the pair, records it in <game>/build/done.json, and retains reusable objects in <game>/build/objcache.
+     Temporary build files are removed unless --keep is set.
 
-The build stamp (state.json, done.json) is the dump (main build ID, module hashes), enabled ordered IPS set, processor variant,
-plus tool_stamp(): everything in this package that goes into fefw.exe (lifter sources, main.sites, compile flags, SDK files,
-and runtime library). A release that
-changes any of them makes an older stamp stale: Set up then lifts, compiles and links again from scratch (the old fefw.exe
-stays until the replacement and matching runtime main are ready). --check compares <game>/build/done.json with the tools,
-enabled patch set, executable and active runtime main (no source dump check) and prints one JSON line
-{"current": bool, "reason": text}; exit 0 current, 3 not.
+The build stamp covers the dump, enabled ExeFS patches, hook sites, CPU variant and build tools. Set up compiles units whose
+cache inputs changed. --check compares the finished record with the tools, enabled patches, executable and runtime main
+without rereading the source dump. It prints {"current": bool, "reason": text}; exit 0 current, 3 not.
 
-Resumable: a module's lift counts once its marker file is written, an object once it is renamed into place, so a stopped
-build continues where it stopped. A file named <game>/build/cancel stops it (the launcher's Pause).
+Resumable: a module's lift counts once its marker file is written, an object once it is renamed into place (its name carries
+its own hash, so one damaged since is compiled again), so a stopped build continues where it stopped. A file named
+<game>/build/cancel stops it (the launcher's Pause).
 Output for the launcher, one per line on stdout:  @progress <phase> <done> <total> <text>  /  @error <text>
 Exit codes: 0 done, 1 error, 2 cancelled.
 """
@@ -169,12 +168,12 @@ def tree_hash(root, rels):
 
 
 # The launcher's SHADER_TRANSLATOR_VERSION (launcher/src-tauri/src/setup.rs): keep the two equal.
-SHADER_TRANSLATOR_VERSION = 3
+SHADER_TRANSLATOR_VERSION = 4
 
 
 def tool_stamp(variant, patch_stamp=None, sites_stamp=None):
     """The part of the build stamp this package decides: a release that changes any of it rebuilds fefw.exe. The processor
-    variant is in it as well, so a fefw.exe built for the other one is rebuilt (the lift is kept: see main). The exefs patches of
+    variant is in it as well, so a fefw.exe built for the other one is rebuilt. The exefs patches of
     the installed mods (exefs_patch_stamp) and their hook sites (mod_sites_stamp) are in it only when there are any, so a build without
     them keeps its old stamp."""
     stamp = {'lifter': tree_hash(RECOMP, LIFTER), 'sites': tree_hash(RECOMP, [SITES]), 'sdk': tree_hash(SDK, SDK_FILES),
@@ -274,9 +273,10 @@ def host_features():
     """This processor's features as the bundled Zig detects them (`zig targets`: .native .cpu .features), or None when that
     cannot be read. Zig leaves AVX and FMA out when the operating system does not save the YMM registers, as the check in
     fefw_rt.dll does. FEFW_CPU_FORCE_MISSING (a test hook, as for the launcher and fefw_rt.dll) hides features."""
+    kw = {'creationflags': CREATE_NO_WINDOW} if WINDOWS else {}
     try:
         out = subprocess.run([ZIG, 'targets'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                             creationflags=CREATE_NO_WINDOW, timeout=120).stdout.decode('utf-8', 'replace')
+                             timeout=120, **kw).stdout.decode('utf-8', 'replace')
     except (OSError, subprocess.SubprocessError):
         return None
     i = out.find('.native')
@@ -331,11 +331,14 @@ def check(game, variant=None):
         info = modpack().main_info(Path(active))
         bid = info['game_build_id']
         patch_stamp = exefs_patch_stamp(selected_patches(game, info))
-        sites_stamp = mod_sites_stamp(collect_mod_sites(game, bid))
+        mod_sites = collect_mod_sites(game, bid)
+        sites_stamp = mod_sites_stamp(mod_sites)
     except (Fail, OSError, ValueError) as e:
         return False, str(e)
     want = tool_stamp(variant, patch_stamp, sites_stamp)
     changed = [k for k in sorted(set(want) | set(done['tools'])) if done['tools'].get(k) != want.get(k)]
+    if changed == ['mod_sites'] and mod_sites_lifted(game, bid, mod_sites):
+        changed = []                     # a mod with sites was removed or switched off: fefw.exe still has every site the rest need
     if changed == ['exefs_patches']:
         return False, 'the exefs patches in mods changed (Set up applies them)'
     if changed and set(changed) <= {'exefs_patches', 'mod_sites'}:
@@ -651,12 +654,46 @@ def apply_exefs_patches(main_path, patches, mod_sites=(), compatible_entries=())
     sites = site_addresses()
     for where, kind, addr in mod_sites:
         sites.setdefault(addr - MODULES[0][2], '%s (%s)' % (kind, where))
-    touched = set()
+    # Mods built for an emulator's LayeredFS (Eglantine and the like) put code and strings into the alignment gaps: text ends at
+    # its memory size but rodata starts at the next page, and likewise rodata and data. The loader maps those gaps (as zeros), so a
+    # record there is valid. Widen the segment before the gap to reach the next one (the file grows by zero bytes, the header's
+    # offsets, sizes and hashes follow) when a record needs it; text widened this way is lifted with the rest of text.
+    # Two patch files may not write the same gap bytes: mods put their own code there, and "the later mod wins" would leave the
+    # earlier mod's hooks jumping into the later one's code.
+    gaps = [(segs[i][1] + segs[i][2], segs[i + 1][1]) for i in (0, 1)]    # as the dump has them, before widening
+    widen = [False, False]
+    for where, mem in ((w, m) for _, w, m in patches):
+        for off, b in mem:
+            for i in (0, 1):
+                if off < segs[i + 1][1] and off + len(b) > segs[i][1] + segs[i][2]:
+                    widen[i] = True          # the record touches the gap after segment i
+    if any(widen):
+        tail = bytes(data[segs[2][0] + segs[2][2]:])
+        parts = []
+        newsegs = []
+        pos = segs[0][0]
+        for i, (fo, mo, sz) in enumerate(segs):
+            body = bytes(data[fo:fo + sz])
+            if i < 2 and widen[i]:
+                full = segs[i + 1][1] - mo
+                body += bytes(full - sz)
+                sz = full
+            newsegs.append((pos, mo, sz))
+            parts.append(body)
+            pos += sz
+        data = bytearray(data[:segs[0][0]]) + b''.join(parts) + tail
+        for i, (fo, mo, sz) in enumerate(newsegs):
+            data[0x10 + 0x10 * i:0x14 + 0x10 * i] = fo.to_bytes(4, 'little')
+            data[0x18 + 0x10 * i:0x1C + 0x10 * i] = sz.to_bytes(4, 'little')
+            data[0x60 + 4 * i:0x64 + 4 * i] = sz.to_bytes(4, 'little')    # compressed size of a plain segment
+        segs = newsegs
+        progress('verify', 0, 1, 'Note: exefs patches write into the alignment gap after %s; widened to the next segment'
+                 % ' and after '.join(n for n, w in zip(('text', 'rodata'), widen) if w))
+    touched = set(range(3)) if any(widen) else set()
     owner = {}
     for name, where, mem in patches:
         for off, b in mem:
-            seg = next((i for i, (fo, mo, sz) in enumerate(segs) if mo <= off and off + len(b) <= mo + sz), None)
-            if seg is None:
+            if not (segs[0][1] <= off and off + len(b) <= segs[2][1] + segs[2][2]):
                 raise Fail('%s: 0x%x..0x%x is outside main\'s text, rodata and data' % (where, off, off + len(b)))
             for a in range(off & ~3, off + len(b), 4):
                 if a in sites and not (sites[a] == 'entryhook' and a == off
@@ -664,14 +701,22 @@ def apply_exefs_patches(main_path, patches, mod_sites=(), compatible_entries=())
                                        and not any(addr - MODULES[0][2] == a for _, _, addr in mod_sites)):
                     raise Fail('%s patches 0x%x, where this release has a main.sites %s site: the two cannot be combined. '
                                'Remove the patch or ask for the site to be moved.' % (where, a, sites[a]))
+            shared = next((a for lo, hi in gaps for a in range(max(off, lo), min(off + len(b), hi))
+                           if owner.get(a, where) != where), None)
+            if shared is not None:
+                raise Fail('%s and %s both write the alignment gap in main at 0x%x, so one would overwrite the other. '
+                           'Remove or switch off one of them.' % (owner[shared], where, shared))
             clash = next((owner[a] for a in range(off, off + len(b)) if owner.get(a, where) != where), None)
             if clash:
                 progress('verify', 0, 1, 'Note: %s overwrites bytes %s patched at 0x%x (the later mod wins)' % (where, clash, off))
             for a in range(off, off + len(b)):
                 owner[a] = where
-            fo, mo, _ = segs[seg]
-            data[fo + off - mo:fo + off - mo + len(b)] = b
-            touched.add(seg)
+            # write piece by piece: a record may run across a segment boundary (the segments are contiguous in memory here)
+            for i, (fo, mo, sz) in enumerate(segs):
+                lo, hi = max(off, mo), min(off + len(b), mo + sz)
+                if lo < hi:
+                    data[fo + lo - mo:fo + hi - mo] = b[lo - off:hi - off]
+                    touched.add(i)
     for i in touched:
         fo, _, sz = segs[i]
         data[0xA0 + 0x20 * i:0xC0 + 0x20 * i] = hashlib.sha256(data[fo:fo + sz]).digest()
@@ -691,8 +736,11 @@ def apply_exefs_patches(main_path, patches, mod_sites=(), compatible_entries=())
 # so that sites for another version of the game are left out. Set up lifts main with main.sites plus these sites; they are part
 # of the build stamp, so installing, updating or removing such a mod lifts again, and so does switching it off or on (a folder
 # name starting with - or _, as find_mod_dirs reads it). The list main was lifted with is written next to fefw.exe (fefw.sites,
-# write_lifted_sites), so the runtime can tell a mod whose sites are missing from this build.
+# write_lifted_sites), so the runtime can tell a mod whose sites are missing from this build. A change that only takes sites away
+# (removing or switching off a mod, with no exefs patch changing) does not lift again: a site no mod hooks only calls into the
+# runtime, which finds no hook there (mod_sites_lifted; the checkout's launcher decides the same way, setup.rs lift_done).
 MOD_SITE_KINDS = ('inline', 'midhook', 'entryhook')
+WARNED_SITES = set()   # (file, line) of unknown site kinds already reported (collect_mod_sites)
 
 
 def collect_mod_sites(game, build_id):
@@ -706,7 +754,7 @@ def collect_mod_sites(game, build_id):
             if not f.lower().endswith('.sites') or not os.path.isfile(os.path.join(ex, f)):
                 continue
             where = '%s/exefs/%s' % (name, f)
-            bid, recs = None, []
+            bid, recs, skipped = None, [], []
             text = open(os.path.join(ex, f), encoding='utf-8-sig', errors='replace').read()
             for ln, line in enumerate(text.splitlines(), 1):
                 t = line.split('#', 1)[0].split()
@@ -718,7 +766,10 @@ def collect_mod_sites(game, build_id):
                     bid = t[1]
                     continue
                 if t[0] not in MOD_SITE_KINDS:
-                    raise Fail('%s:%d: "%s" is not a site a mod can add (%s)' % (where, ln, t[0], ', '.join(MOD_SITE_KINDS)))
+                    # A kind another port defines, or a later one: skipped with a warning (below, once the build ID matches) rather
+                    # than stopping Set up, as the three ports agreed in fefw-recomp issue #165.
+                    skipped.append((ln, t[0]))
+                    continue
                 try:
                     if len(t) != 2:
                         raise ValueError
@@ -730,11 +781,36 @@ def collect_mod_sites(game, build_id):
                 raise Fail('%s has no @nsobid line (the build ID of the main its sites are for)' % where)
             if not bid_matches(bid, build_id):
                 continue                 # another version of the game
+            for ln, kind in skipped:     # stderr, once per run: --check prints one JSON line on stdout
+                key = (where, ln)
+                if key not in WARNED_SITES:
+                    WARNED_SITES.add(key)
+                    print('warning: %s:%d: "%s" is not a site a mod can add here (%s): skipped'
+                          % (where, ln, kind, ', '.join(MOD_SITE_KINDS)), file=sys.stderr, flush=True)
             for ln, kind, addr in recs:
                 if addr % 4 or not MODULES[0][2] <= addr < MODULES[1][2]:
                     raise Fail('%s:%d: 0x%x is not an instruction address in main (main is at 0x%x)' % (where, ln, addr, MODULES[0][2]))
                 found.append(('%s:%d' % (where, ln), kind, addr))
     return found
+
+
+def mod_sites_lifted(game, build_id, mod_sites):
+    """Whether every site the installed mods add is in <game>/fefw.sites, the list fefw.exe was lifted with (for this build ID)."""
+    try:
+        text = open(os.path.join(game, 'fefw.sites'), encoding='utf-8-sig', errors='replace').read()
+    except OSError:
+        return False
+    bid, have = None, set()
+    for line in text.splitlines():
+        t = line.split('#', 1)[0].split()
+        if len(t) == 2 and t[0].lower() == '@nsobid':
+            bid = t[1]
+        elif len(t) >= 2:
+            try:
+                have.add((t[0], int(t[1], 16)))
+            except ValueError:
+                return False
+    return bid is not None and bid_matches(bid, build_id) and all((k, a) in have for _, k, a in mod_sites)
 
 
 def mod_sites_stamp(mod_sites):
@@ -931,7 +1007,8 @@ def lift(runner, exefs, gen, jobs, sites):
         if name == 'main':
             args += ['--sites', sites]
         cmd = [sys.executable, '-I', os.path.abspath(__file__), '--lift-one', json.dumps(args)]
-        rc, tail = runner.run(cmd, cwd=RECOMP)
+        # the lifter's warnings (a worker process died, the lift goes on with fewer) reach setup.log as they happen
+        rc, tail = runner.run(cmd, cwd=RECOMP, on_line=lambda s: s.startswith('nxrecomp: warning:') and print(s, flush=True))
         if rc != 0:
             raise Fail('Translating %s failed (exit %d):\n%s' % (name, rc, tail))
         open(marker, 'w').write('ok\n')
@@ -972,7 +1049,59 @@ def pgo_gen_skip(src):
         return False
 
 
-def compile_all(runner, gen, obj, jobs, env, variant):
+# The objects of the lifted code are kept in <game>/build/objcache/<module> from one build to the next, as
+# <unit>.<object_key>.<hash of the object>.o: most releases that make Set up build again change few of the generated files, or none.
+def compile_inputs(runner, env, variant):
+    """What every object depends on besides its module's generated files: Zig, the flags and the shared headers."""
+    rc, version = runner.run([ZIG, 'version'], env=env)
+    if rc != 0:
+        raise Fail('The bundled compiler does not run (exit %d):\n%s' % (rc, version))
+    return [version, cxxflags(variant), tree_hash(RECOMP, ['include'])]
+
+
+def object_key(shared, headers, src):
+    """The name part that says what an object was built from: shared (compile_inputs), the module's generated headers (every
+    file the lifter wrote there that is not a unit; module_headers) and the unit's source."""
+    return hashlib.sha256(json.dumps([shared, headers, sha256(src)]).encode()).hexdigest()[:16]
+
+
+def module_headers(d):
+    return [(f, sha256(os.path.join(d, f))) for f in sorted(os.listdir(d)) if not f.endswith('.cpp') and f != '.lifted']
+
+
+def cached_objects(d):
+    """{(unit, key): path} of the objects in d that are still what was written (a power loss can leave a renamed file short or
+    zeroed); the rest, and the half-written files of a stopped build, are removed."""
+    found = {}
+    for f in os.listdir(d):
+        path = os.path.join(d, f)
+        parts = f.split('.')
+        try:
+            if len(parts) == 4 and parts[3] == 'o' and sha256(path)[:12] == parts[2]:
+                found[parts[0], parts[1]] = path
+            else:
+                os.remove(path)
+        except OSError:                  # held open (an antivirus): not used this time
+            pass
+    return found
+
+
+def prune_objects(cache, objects):
+    """After a successful link: remove the objects this build did not use."""
+    keep = {os.path.normcase(p) for paths in objects.values() for p in paths}
+    for name, _, _, _, _ in MODULES:
+        d = os.path.join(cache, name)
+        for f in os.listdir(d):
+            path = os.path.join(d, f)
+            if os.path.normcase(path) not in keep:
+                try:
+                    os.remove(path)
+                except OSError:          # held open (an antivirus): the next build removes it
+                    pass
+
+
+def compile_all(runner, gen, cache, jobs, env, variant):
+    """Compile every unit that has no object in the cache yet -> {module: [object paths]} for link."""
     units = []
     for name, _, _, _, shards in MODULES:
         d = os.path.join(gen, name)
@@ -980,21 +1109,32 @@ def compile_all(runner, gen, obj, jobs, env, variant):
             if f.endswith('.cpp'):
                 units.append((name, os.path.join(d, f)))
     total = len(units)
+    shared = compile_inputs(runner, env, variant)
+    headers, cached = {}, {}
+    for name, _, _, _, _ in MODULES:
+        d = os.path.join(cache, name)
+        os.makedirs(d, exist_ok=True)
+        cached[name] = cached_objects(d)
+        headers[name] = module_headers(os.path.join(gen, name))
+    objects = {name: [] for name, _, _, _, _ in MODULES}
     todo = []
     for name, src in units:
-        o = os.path.join(obj, name, os.path.basename(src)[:-4] + '.o')
-        if not os.path.isfile(o):
-            todo.append((name, src, o))
+        unit = os.path.basename(src)[:-4]
+        key = object_key(shared, headers[name], src)
+        if (unit, key) in cached[name]:
+            objects[name].append(cached[name][unit, key])
+        else:
+            todo.append((name, src, os.path.join(cache, name, '%s.%s' % (unit, key))))
     done = total - len(todo)
+    if done:
+        print('%d of %d units are unchanged since an earlier build: their objects are reused' % (done, total), flush=True)
     progress('compile', done, total, 'Compiling: %d of %d' % (done, total))
-    for name, _, _, _, _ in MODULES:
-        os.makedirs(os.path.join(obj, name), exist_ok=True)
     # biggest first, so the long ones do not end up last on a single core
     todo.sort(key=lambda t: -os.path.getsize(t[1]))
 
     def one(t):
-        name, src, o = t
-        tmp = o + '.tmp'
+        name, src, stem = t
+        tmp = stem + '.o.tmp'
         cmd = [ZIG, 'c++'] + cxxflags(variant) + ['-I', os.path.join(RECOMP, 'include'), '-I', os.path.dirname(src), '-c', src, '-o', tmp]
         if PGO['gen'] and pgo_gen_skip(src):     # see pgo_gen_skip
             cmd = [x for x in cmd if x not in ('-fprofile-generate',)]
@@ -1002,7 +1142,9 @@ def compile_all(runner, gen, obj, jobs, env, variant):
         if rc != 0:
             return 'Compiling %s/%s failed (exit %d):\n%s' % (name, os.path.basename(src), rc, tail)
         try:
+            o = '%s.%s.o' % (stem, sha256(tmp)[:12])
             replace_retry(tmp, o)
+            objects[name].append(o)
         except OSError as e:     # a failed unit, retried one at a time below, not an abort of the whole build
             return 'Compiling %s/%s: %s' % (name, os.path.basename(src), e)
         return None
@@ -1050,6 +1192,7 @@ def compile_all(runner, gen, obj, jobs, env, variant):
             raise Fail(err)
         done += 1
         progress('compile', done, total, 'Compiling: %d of %d' % (done, total))
+    return objects
 
 
 def replace_retry(src, dst):
@@ -1082,14 +1225,16 @@ def clear_high_entropy_va(exe):
         f.write(dc.to_bytes(2, 'little'))
 
 
-def link(runner, obj, game, env, variant):
+def link(runner, objects, obj, game, env, variant):
+    """fefw.exe from the lifted code's objects (compile_all) and the SDK; the archives and other objects go to obj."""
     progress('link', 0, 1, 'Linking fefw.exe')
+    os.makedirs(obj, exist_ok=True)
     libs = []
     for name, _, _, _, _ in MODULES:
         a = os.path.join(obj, 'fefw_%s.a' % name)
         if os.path.isfile(a):
             os.remove(a)
-        objs = sorted(os.path.join(obj, name, f) for f in os.listdir(os.path.join(obj, name)) if f.endswith('.o'))
+        objs = sorted(objects[name])
         rsp = os.path.join(obj, '%s.rsp' % name)
         # UTF-8, not the ANSI code page: zig ar reads the response file as UTF-8, so a game folder path with non-ASCII
         # characters (an accented user name) failed the archive step.
@@ -1178,7 +1323,7 @@ def main():
     ap.add_argument('--exefs')
     ap.add_argument('--game')
     ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 2) - 1))
-    ap.add_argument('--keep', action='store_true', help='keep the generated sources and objects')
+    ap.add_argument('--keep', action='store_true', help='keep the generated sources and all build files')
     ap.add_argument('--check', action='store_true', help='only say whether <game>/build/done.json matches these tools')
     ap.add_argument('--cpu', default='auto', help='the build for the processor: fma, compat or auto (CPU_VARIANTS)')
     ap.add_argument('--pgo-gen', help='developer: build instrumented for a profile, linking this profile runtime library (.a)')
@@ -1260,14 +1405,17 @@ def main():
         lift(runner, stage, gen, a.jobs, sites)
         times['lift'] = round(time.time() - t, 1)
         t = time.time()
-        compile_all(runner, gen, obj, a.jobs, env, variant)
+        # a profile-guided build's objects are not kept: the key does not cover the profile's contents
+        cache = os.path.join(obj if PGO['gen'] or PGO['use'] else build, 'objcache')
+        objects = compile_all(runner, gen, cache, a.jobs, env, variant)
         times['compile'] = round(time.time() - t, 1)
         t = time.time()
-        exe = link(runner, obj, game, env, variant)
+        exe = link(runner, objects, obj, game, env, variant)
         times['link'] = round(time.time() - t, 1)
         done = dict(stamp, active_main_sha256=sha256(main_path), exe_sha256=sha256(exe),
                     seconds=times, finished=time.strftime('%Y-%m-%d %H:%M:%S'))
         publish(game, build, stage, exe, done, sites, want['main_build_id'])
+        prune_objects(cache, objects)
         if not a.keep:
             progress('finish', 0, 1, 'Removing the build files')
             for d in ('lift', 'obj', 'zig-cache', 'exefs'):

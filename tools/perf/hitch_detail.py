@@ -41,9 +41,9 @@ def parse(path):
     rx_t = re.compile(r'^\[\s*([0-9.]+) \w t\d+ ([^\]]*)\]')
     with open(path, encoding='utf-8', errors='replace') as f:
         for line in f:
-            if 'pacing off: loading' in line:
+            if 'nvn.replay: loading start' in line or 'pacing off: loading' in line:
                 loading = True
-            elif 'nvn.replay: pacing on' in line:
+            elif 'nvn.replay: loading end' in line or 'nvn.replay: pacing on' in line:
                 loading = False
             m = rx_t.match(line)
             if not m:

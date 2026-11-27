@@ -19,6 +19,7 @@
 
 #include "extras/framegen.h"
 #include "extras/temporal.h"
+#include "nxrt/boot_timeline.h"
 #include "nxrt/config.h"
 #include "nxrt/extras.h"
 #include "nxrt/gfx.h"
@@ -498,6 +499,7 @@ PFN_vkGetInstanceProcAddr streamline_preinit() {
     }
     s.started = true;
     s.framegen = fg;
+    boot_mark("streamline");
     NXLOG_I(kTag, "Streamline %d.%d.%d started from %s: the Vulkan instance and device are created through it", SL_VERSION_MAJOR, SL_VERSION_MINOR,
             SL_VERSION_PATCH, narrow(dir).c_str());
     log_streamline_modules("after slInit");

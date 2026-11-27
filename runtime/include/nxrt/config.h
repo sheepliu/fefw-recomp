@@ -32,6 +32,8 @@ bool config_has(const char* section, const char* key);                          
 const char* config_source(const char* section, const char* key);
 // Logs (Info, tag "config") every key read so far with its effective value and source.
 void config_log_effective();
+// Logs (warning) every ini key nothing has read yet, naming the right section when the key is read in another one. Returns the count.
+int config_log_unread(double seconds);
 // The environment variable name used for a key, e.g. NXRT_DIAG_WATCHDOG_SECONDS.
 std::string config_env_name(const char* section, const char* key);
 

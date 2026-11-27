@@ -50,6 +50,11 @@ NXTEST(gpu_rule_on_fake_lists) {
     bool matched = false;
 
     // Wonder's Windows port picked the first device, the iGPU; the rule must not depend on the order
+    {
+        const GpuCandidate xtx{"AMD Radeon RX 7900 XTX", 2, 24ull << 30}, xt{"AMD Radeon RX 7900 XT", 2, 20ull << 30};
+        CHECK_EQ(pick_gpu({xtx, xt}, "AMD Radeon RX 7900 XT", &matched), 1u);
+        CHECK_EQ(pick_gpu({xtx, xt}, "7900 xtx", &matched), 0u);
+    }
     CHECK_EQ(pick_gpu({igpu, dgpu}, "", &matched), 1u);
     CHECK(matched);
     CHECK_EQ(pick_gpu({dgpu, igpu}, nullptr, &matched), 0u);

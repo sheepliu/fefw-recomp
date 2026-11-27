@@ -38,7 +38,9 @@ struct BindingDesc {
 struct ProgLayout {
     VkDescriptorSetLayout sets[5] = {};         // 0..3 the program's own; kPoolSet (4) the shared pool arrays, when a stage samples through them
     VkPipelineLayout layout = VK_NULL_HANDLE;
-    std::vector<BindingDesc> bindings;          // every used descriptor of every stage, sorted by (set, binding)
+    std::vector<BindingDesc> bindings;          // every used descriptor of every stage, grouped by set (0..3, kPoolSet)
+    uint16_t set_begin[5] = {};                 // [set_begin[s], set_end[s]) in `bindings` for set s
+    uint16_t set_end[5] = {};
     bool has_set[5] = {};
     VkShaderStageFlags push_stages = 0;         // push constant range [0, push_bytes) of generated stages (ShaderInfo::push_bytes); 0 = none
     uint32_t push_bytes = 0;
@@ -54,6 +56,10 @@ struct ProgLayout {
     // A per-program invariant of the replay: a storage buffer the program's shaders write (one that [nvn] gfx_ssbo_readonly proves read-only
     // does not count) or a storage image. A draw of this program then writes memory; worked out once here instead of over every binding a draw.
     bool writes_storage = false;
+    // Per-program precomputed texture/image binding indices into `bindings`, avoiding full-binding scans in prep/feedback/vol3d/depth checks.
+    bool has_3d_sampler = false;
+    std::vector<uint16_t> sampled_tex_bindings;  // COMBINED_IMAGE_SAMPLER with SamplerBinding / HandleInUniform / ImageBinding
+    std::vector<uint16_t> storage_img_bindings;  // STORAGE_IMAGE
 };
 
 // [nvn] push_uniforms (default true): programs whose set 0 fits the device's push descriptor limit push it (ProgLayout::push_set0). False when the
@@ -241,7 +247,7 @@ struct PipeUpgrade {
 // null: not possible for this key, build it whole. *up (when given) gets the upgrade the linked pipeline will be replaced by (null: none queued).
 VkPipeline gpl_link(const GraphicsKey& key, const ProgLayout& layout, std::shared_ptr<PipeUpgrade>* up = nullptr, bool* pending = nullptr);
 // [nvn] gpl_async: a draw whose shader parts are not compiled yet gets no pipeline while frames are flowing (*pending = true: skip it and ask
-// again later); the parts compile on the background threads ahead of everything else. While the game loads (no present for 100 ms) the draw
+// again later); the parts compile on the background threads ahead of everything else. While the game loads (no present for 2 s) the draw
 // builds them itself as before, so one-time renders of a loading screen are never lost.
 void gpl_note_presents(uint64_t presents);   // the replay, once per submission: when presents were last seen moving
 bool gpl_ab_whole();                                                 // measurement only ([nvn] gpl_ab): true in the windows that run the optimised pipelines
@@ -253,7 +259,7 @@ void gpl_program_bound(const ShaderInfo* const stages[6]);           // a comman
 void gpl_prebuild(std::function<bool(GraphicsKey&, const ProgLayout*&)> resolve, bool front);
 // True when the draw can link this key now: eligible, and its two shader parts are built.
 bool gpl_ready(const GraphicsKey& key, const ProgLayout& layout);
-bool gpl_frames_flowing();                                           // a present within the last 100 ms (draws may be skipped rather than wait)
+bool gpl_frames_flowing();                                           // a present within the last 2 s (draws may be skipped rather than wait)
 // A job for the pipeline-library threads (compute pipelines, compute_prebuild): ahead of the hot programs' parts. False when they are off.
 bool gpl_queue_task(std::function<void()> fn);
 void gpl_progress_log();                                             // one log line when something changed since the last call

@@ -77,6 +77,18 @@ void detail_install();
 std::string detail_summary();      // "" when nothing is changed
 // The render-target pool's allocator was given room past the pool ([fefw] rt_pool_overflow_mb): renders above half of a 2160p output fit.
 bool res_rt_pool_extended();
+// Shrinks an output size to what the runtime draws. wide ([fefw] ultrawide on) and wider than 16:9: the same shape, within 5120x2160 when
+// the render-target pool has enough room past it and raising the window size has not failed, else within 3840x2160. Any other size: each
+// side within the game's 3840x2160. Sizes that fit are left as they are.
+void res_fit_output(int* w, int* h, bool wide);
+// fefw_crowd.cpp: [fefw] npc_distance scales the hub crowd's NPC model limit, display distance and draw budget (1 = the game's own:
+// nothing installed). Installed from play_install, removed from play_remove.
+void crowd_install(uint64_t base);
+void crowd_remove();
+// The game's file cache (fefw_filecache.cpp): a "file cache" line every [fefw] file_cache_log seconds, and [fefw] file_cache_mb.
+void filecache_install(uint64_t base);
+uint64_t filecache_used_bytes();     // 0 before the game's set-up or when the build does not match
+uint64_t filecache_budget_bytes();
 
 // fefw_wide.cpp: outputs wider than 16:9 ([fefw] ultrawide; hooks after Kompas9's ultrawide patch). res_install calls wide_install with
 // the output it gives the game; nothing is installed unless that output is wider than 16:9.
@@ -84,11 +96,12 @@ std::string wide_mode();                             // [fefw] ultrawide: "auto"
 bool wide_aspect(int w, int h);                      // wider than 16:9 (by more than 1 %)
 void wide_install(uint64_t base, int out_w, int out_h);
 void wide_remove();
+void wide_output_fitted(int out_w, int out_h);       // the output was shrunk after wide_install, the same shape: what wide_info reports
 struct WideInfo {
     bool active = false;
     int out_w = 0, out_h = 0;
     float k = 1.0f;                                  // the output's width over a 16:9 picture's of the same height
-    static constexpr int kCounters = 11;
+    static constexpr int kCounters = 12;
     uint64_t counts[kCounters] = {};                 // times each hook did its work
     const char* names[kCounters] = {};
 };

@@ -6,6 +6,7 @@
 // image applies when it is built (fs.cpp, on the game's first file access, long before the first frame).
 #define _SILENCE_CXX20_U8PATH_DEPRECATION_WARNING
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <cwctype>
 #include <cstdlib>
@@ -18,14 +19,18 @@
 #include <unordered_map>
 #include <vector>
 
+#include "nxrt/boot_timeline.h"
 #include "nxrt/abi.h"
 #include "nxrt/config.h"
 #include "nxrt/dispatch.h"
 #include "nxrt/game.h"
 #include "nxrt/hooks.h"
+#include "nxrt/kernel.h"
 #include "nxrt/log.h"
 #include "nxrt/memory.h"
 #include "nxrt/mod_api.h"
+#include "nxrt/mod_interfaces.h"
+#include "nxrt/mod_panels.h"
 #include "nxrt/services_api.h"
 #include "services_internal.h"
 
@@ -75,8 +80,20 @@ struct Editor {
     std::string owner_name;      // a runtime edit's owner, for the log
 };
 
+// A panel a mod added to the Mods tab (add_panel, version 4)
+struct Panel {
+    std::string title;
+    NxModPanelFn fn;
+    void* user;
+    const Mod* owner;            // the mod whose nxmod_early / nxmod_init added it (removed if that mod declines), or null
+    bool live;                   // shown: added outside those, or that mod's nxmod_init has returned 0
+};
+
 struct State {
     std::mutex mu;
+    std::vector<Panel> panels;
+    std::atomic<size_t> live_panels{0};   // has_panels without the lock
+    std::atomic<bool> panel_visible{false};
     std::vector<Editor> editors;
     bool edits_closed = false;   // the RomFS image has asked: later edit_file calls are too late
     std::vector<std::string> folders;   // the installed mods' folders (mod_folder), filled on first use
@@ -96,6 +113,10 @@ State& st() {
     static State s;
     return s;
 }
+
+// The mod whose nxmod_early / nxmod_init is running on this thread, or null. add_panel is called from any thread, so it goes by this
+// and not by State::in_init: another thread's panel is not the starting mod's.
+thread_local const Mod* t_starting = nullptr;
 
 std::string mod_name(const NxModApi* api) {
     std::lock_guard<std::mutex> lk(st().mu);
@@ -140,7 +161,15 @@ bool read_site_list(const std::filesystem::path& file, SiteList* out) {
     std::ifstream f(file);
     if (!f) return false;
     std::string line;
+    bool first = true;
     while (std::getline(f, line)) {
+        if (first) {
+            first = false;
+            if (line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF &&
+                static_cast<unsigned char>(line[1]) == 0xBB && static_cast<unsigned char>(line[2]) == 0xBF) {
+                line.erase(0, 3);
+            }
+        }
         if (const size_t h = line.find('#'); h != std::string::npos) line.resize(h);
         char kind[32] = {}, arg[80] = {};
         if (std::sscanf(line.c_str(), "%31s %79s", kind, arg) != 2) continue;
@@ -322,6 +351,8 @@ int64_t api_read_file(const char* path, void* buf, uint64_t cap) {
     const uint64_t n = std::min<uint64_t>(static_cast<uint64_t>(size), buf ? cap : 0);
     if (n) {
         f.seekg(0);
+        // a large read goes from the C runtime straight into the buffer, which may be guest memory ([memory] heap_lazy_commit)
+        if (!nxrt::mem::heap_touch(reinterpret_cast<uint64_t>(buf), n)) return -1;
         f.read(static_cast<char*>(buf), static_cast<std::streamsize>(n));
         if (static_cast<uint64_t>(f.gcount()) != n) return -1;
     }
@@ -330,6 +361,7 @@ int64_t api_read_file(const char* path, void* buf, uint64_t cap) {
 
 int api_write_file(const char* path, const void* data, uint64_t size) {
     if (!path || !*path || (size && !data)) return 0;
+    if (!nxrt::mem::heap_touch(reinterpret_cast<uint64_t>(data), size)) return 0;   // as in api_read_file
     const std::filesystem::path p = std::filesystem::u8path(path);
     std::filesystem::path tmp = p;
     tmp += L".tmp";
@@ -380,6 +412,7 @@ void withdraw(Mod* m) {
     std::lock_guard<std::mutex> lk(st().mu);
     std::erase_if(st().frame, [m](const FrameFn& f) { return f.owner == m; });
     std::erase_if(st().editors, [m](const Editor& e) { return e.owner == m; });
+    std::erase_if(st().panels, [m](const Panel& p) { return p.owner == m; });   // never live: their mod had not started
     for (auto& [name, f] : st().fns)   // the thunks stay (the game may hold their addresses): they answer 0 from now on
         if (f.owner == m) f.fn = nullptr;
 }
@@ -394,12 +427,22 @@ void start_all() {
     for (Mod* m : mods) {
         if (m->declined) continue;
         st().in_init = m;
+        t_starting = m;
         const int rc = m->init(&m->api, m->dir.c_str());
+        t_starting = nullptr;
         st().in_init = nullptr;
         if (rc != 0) {
             withdraw(m);
             NXLOG_W(kTag, "%s: declined to start (nxmod_init returned %d); its hooks are removed", m->name.c_str(), rc);
             continue;   // the DLL stays loaded: it may still own memory the runtime saw
+        }
+        {
+            std::lock_guard<std::mutex> lk(st().mu);
+            for (Panel& p : st().panels)
+                if (p.owner == m && !p.live) {
+                    p.live = true;
+                    st().live_panels.fetch_add(1, std::memory_order_relaxed);
+                }
         }
         NXLOG_I(kTag, "%s: code mod started (%zu hooks)", m->name.c_str(), m->hooks.size());
     }
@@ -409,6 +452,7 @@ void start_all() {
 int frame_hook(::Ctx* c, uint64_t, void*) {
     if (!st().started) {
         st().started = true;
+        boot_mark("game's first frame update");
         start_all();
     }
     std::vector<FrameFn> fns;
@@ -444,30 +488,7 @@ void load_one(const std::string& mod, const std::filesystem::path& mod_dir, cons
     Mod* m = new Mod;
     m->name = name;
     m->dll = dll;
-    m->api.version = NXMOD_API_VERSION;
-    m->api.size = sizeof(NxModApi);
-    m->api.game_id = game::info().id;
-    m->api.main_base = base;
-    m->api.log = &api_log;
-    m->api.hook_inline = &api_hook_inline;
-    m->api.hook_mid = &api_hook_mid;
-    m->api.hook_entry = &api_hook_entry;
-    m->api.hook_remove = &api_hook_remove;
-    m->api.call_guest = &api_call_guest;
-    m->api.is_mapped = &api_is_mapped;
-    m->api.on_frame = &api_on_frame;
-    m->api.is_function = &api_is_function;
-    m->api.make_function = &api_make_function;
-    m->api.make_writable = &api_make_writable;
-    m->api.edit_file = &api_edit_file;
-    m->api.mod_count = &api_mod_count;
-    m->api.mod_folder = &api_mod_folder;
-    m->api.read_file = &api_read_file;
-    m->api.write_file = &api_write_file;
-    m->api.zstd_decompress = &api_zstd_decompress;
-    m->api.zstd_compress = &api_zstd_compress;
-    m->api.alloc = &api_alloc;
-    m->api.free_mem = &api_free;
+    make_mod_api(&m->api, base);
     m->init = init;
     m->dir = u8(mod_dir);
     {
@@ -478,7 +499,9 @@ void load_one(const std::string& mod, const std::filesystem::path& mod_dir, cons
     // nxmod_early (optional): before the game's file system is set up, so the mod can register file edits
     if (const auto early = reinterpret_cast<NxModEarlyFn>(GetProcAddress(dll, "nxmod_early"))) {
         st().in_init = m;
+        t_starting = m;
         const int rc = early(&m->api, m->dir.c_str());
+        t_starting = nullptr;
         st().in_init = nullptr;
         if (rc != 0) {
             m->declined = true;
@@ -488,22 +511,74 @@ void load_one(const std::string& mod, const std::filesystem::path& mod_dir, cons
     }
 }
 
-}  // namespace
-
-int sites_missing(const std::string& mod_dir) {
+ModSiteCheck check_mod_sites_against(const std::string& mod_dir, const SiteList& l) {
     namespace stdfs = std::filesystem;
-    const SiteList& l = lifted_sites();
-    if (!l.known || mod_dir.empty()) return -1;
+    ModSiteCheck out;
+    if (mod_dir.empty()) return out;
     std::error_code ec;
-    int missing = 0;
+    if (l.known) out.missing = 0;
+    std::set<std::string> unknown;
     for (const stdfs::directory_entry& e : stdfs::directory_iterator(stdfs::u8path(mod_dir) / "exefs", ec)) {
         if (!e.is_regular_file(ec) || _wcsicmp(e.path().extension().c_str(), L".sites") != 0) continue;
         SiteList want;
         if (!read_site_list(e.path(), &want) || want.bid.empty() || !same_build(want.bid, l.bid)) continue;
-        for (const auto& s : want.sites) missing += l.sites.count(s) == 0;
+        for (const auto& s : want.sites) {
+            // only the kinds a mod can add (Set up skips any other with a warning, issue #165), or such a line would read as
+            // missing on every start
+            const std::string& k = s.first;
+            if (k != "inline" && k != "midhook" && k != "entryhook") {
+                unknown.insert(k);
+                continue;
+            }
+            if (l.known) out.missing += l.sites.count(s) == 0;
+        }
     }
-    return missing;
+    out.unknown.assign(unknown.begin(), unknown.end());
+    return out;
 }
+
+}  // namespace
+
+void make_mod_api(::NxModApi* out, uint64_t base) {
+    if (!out) return;
+    ::NxModApi api{};
+    api.version = NXMOD_API_VERSION;
+    api.size = sizeof(::NxModApi);
+    api.game_id = game::info().id;
+    api.main_base = base;
+    api.log = &api_log;
+    api.hook_inline = &api_hook_inline;
+    api.hook_mid = &api_hook_mid;
+    api.hook_entry = &api_hook_entry;
+    api.hook_remove = &api_hook_remove;
+    api.call_guest = &api_call_guest;
+    api.is_mapped = &api_is_mapped;
+    api.on_frame = &api_on_frame;
+    api.is_function = &api_is_function;
+    api.make_function = &api_make_function;
+    api.make_writable = &api_make_writable;
+    api.edit_file = &api_edit_file;
+    api.mod_count = &api_mod_count;
+    api.mod_folder = &api_mod_folder;
+    api.read_file = &api_read_file;
+    api.write_file = &api_write_file;
+    api.zstd_decompress = &api_zstd_decompress;
+    api.zstd_compress = &api_zstd_compress;
+    api.alloc = &api_alloc;
+    api.free_mem = &api_free;
+    api.add_panel = &add_panel;
+    api.panel_visible = &panel_visible;
+    api.get_interface = &::nxrt::nxmod::get_interface;
+    *out = api;
+}
+
+ModSiteCheck check_mod_sites(const std::string& mod_dir, const std::string& lifted_sites_file) {
+    SiteList l;
+    if (!lifted_sites_file.empty()) read_site_list(std::filesystem::u8path(lifted_sites_file), &l);
+    return check_mod_sites_against(mod_dir, l);
+}
+
+int sites_missing(const std::string& mod_dir) { return check_mod_sites_against(mod_dir, lifted_sites()).missing; }
 
 std::string notice() {
     std::lock_guard<std::mutex> lk(st().mu);
@@ -575,17 +650,58 @@ bool file_edit_run(const std::string& image_path, std::vector<uint8_t>& data) {
     return changed;
 }
 
+int add_panel(const char* title, NxModPanelFn fn, void* user) {
+    // ObeliskChamber's version 4 has open_list(Ctx* c, item, list) in this slot, and a mod built for it calls it with its game
+    // thread's Ctx, which arrives here as the title. Refused, so the mod sees that no screen opened: taken as a panel, the menu item
+    // (a guest address) would be called as the panel's function.
+    if (title && static_cast<const void*>(title) == static_cast<const void*>(kernel::current_ctx())) {
+        NXLOG_W(kTag, "a code mod called open_list (ObeliskChamber's list screen), which this port does not have");
+        return 0;
+    }
+    if (!title || !*title || !fn) return 0;
+    std::lock_guard<std::mutex> lk(st().mu);
+    // added from nxmod_early / nxmod_init: kept back until nxmod_init returns 0, so the overlay never calls into a mod that is still
+    // starting or that declined
+    const Mod* owner = t_starting;
+    st().panels.push_back({title, fn, user, owner, owner == nullptr});
+    if (!owner) st().live_panels.fetch_add(1, std::memory_order_relaxed);
+    NXLOG_I(kTag, "%s: added the panel \"%s\" to the Mods tab", owner ? owner->name.c_str() : "a code mod", title);
+    return 1;
+}
+
+std::vector<PanelInfo> panels() {
+    std::lock_guard<std::mutex> lk(st().mu);
+    std::vector<PanelInfo> out;
+    for (const Panel& p : st().panels)
+        if (p.live) out.push_back({p.title, p.owner ? p.owner->name : std::string(), p.fn, p.user});
+    return out;
+}
+
+bool has_panels() { return st().live_panels.load(std::memory_order_relaxed) != 0; }
+void set_panel_visible(bool visible) { st().panel_visible.store(visible, std::memory_order_relaxed); }
+int panel_visible() { return st().panel_visible.load(std::memory_order_relaxed) ? 1 : 0; }
+
 void load_dll_mods(uint64_t base, uint64_t frame_update) {
     if (st().loaded) return;
     st().loaded = true;
     st().main_base = base;
-    // a mod whose hook sites this build was not lifted with: say so on screen as well as in the log, since its hooks would never run
+    // a mod whose hook sites this build was not lifted with, or that uses unknown site kinds: say so on screen as well as in the log
     for (const RomfsMod& mod : installed_mods()) {
         if (mod.exefs.empty()) continue;
-        const int missing = sites_missing(u8(std::filesystem::u8path(mod.exefs).parent_path()));
-        if (missing <= 0) continue;
+        const ModSiteCheck check = check_mod_sites_against(u8(std::filesystem::u8path(mod.exefs).parent_path()), lifted_sites());
+        if (!check.unknown.empty()) {
+            std::string kinds;
+            for (const std::string& k : check.unknown) {
+                NXLOG_W(kTag, "%s: unknown hook site kind \"%s\" in exefs/*.sites (this port knows inline, midhook, entryhook): skipped",
+                        mod.name.c_str(), k.c_str());
+                kinds += (kinds.empty() ? "" : ", ") + k;
+            }
+            std::lock_guard<std::mutex> lk(st().mu);
+            st().notices.push_back(mod.name + ": skipped unknown hook site kind(s): " + kinds);
+        }
+        if (check.missing <= 0) continue;
         NXLOG_W(kTag, "%s: %d of its hook sites (exefs/*.sites) are not in this build: its hooks will not run. Run Set up.",
-                mod.name.c_str(), missing);
+                mod.name.c_str(), check.missing);
         std::lock_guard<std::mutex> lk(st().mu);
         st().notices.push_back(mod.name + ": run Set up (its hook sites are not in this build)");
     }

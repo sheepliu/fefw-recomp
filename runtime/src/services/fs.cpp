@@ -12,6 +12,14 @@
 // Command ids, argument layouts: Switchbrew "Filesystem services", ScarletNX fs.swipc (GPL-3.0-or-later), Ryujinx IFileSystemProxy (MIT).
 // The commit/recovery design is smo-recomp runtime/fs/nnfs.c (GPL-3.0), see fs_volume.h.
 #define _SILENCE_CXX20_U8PATH_DEPRECATION_WARNING
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
 #include <algorithm>
 #include <cwctype>
 #include <cstdio>
@@ -23,6 +31,7 @@
 #include <sstream>
 
 #include "fs_romfs.h"
+#include "nxrt/boot_timeline.h"
 #include "nxrt/nup.h"
 #include "fs_volume.h"
 #include "nxrt/config.h"
@@ -459,11 +468,22 @@ std::shared_ptr<fs::RomfsImage> rom_image() {
     fs::RomfsEdits edits;
     edits.wants = &modapi::file_edit_wanted;
     edits.edit = &modapi::file_edit_run;
-    if (!img->build(dir, &err, overlays, modapi::file_edits_close() ? &edits : nullptr)) {
+    std::string cache_path;
+    if (!nup::is_nup(dir) && config_get_bool("fs", "romfs_cache", true)) {
+        wchar_t exe[32768];
+        const DWORD n = GetModuleFileNameW(nullptr, exe, 32768);
+        if (n > 0 && n < 32768) {
+            const stdfs::path p = stdfs::path(exe).parent_path() / L"romfs_cache.bin";
+            const std::u8string u = p.u8string();
+            cache_path.assign(reinterpret_cast<const char*>(u.data()), u.size());
+        }
+    }
+    if (!img->build(dir, &err, overlays, modapi::file_edits_close() ? &edits : nullptr, cache_path)) {
         NXLOG_E("fs", "RomFS folder '%s' cannot be served: %s (set [fs] romfs)", dir.c_str(), err.c_str());
         st().rom_failed = true;
         return nullptr;
     }
+    boot_mark("RomFS ready (with its mods)");
     const fs::RomfsImage::Stats s = img->stats();
     NXLOG_I("fs", "RomFS image from %s: %u files, %u directories, %llu bytes of data, image size %llu", dir.c_str(), s.files, s.dirs,
             static_cast<unsigned long long>(s.data_bytes), static_cast<unsigned long long>(img->size()));

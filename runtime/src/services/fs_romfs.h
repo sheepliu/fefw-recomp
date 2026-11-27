@@ -36,8 +36,10 @@ public:
     // replaces the game's, a new path is added. Names match the game's ignoring ASCII case and keep the game's spelling. An overlay that
     // cannot be read is skipped with a warning; it never fails the build.
     // `edits` (optional) is applied to the merged tree, so an edit sees a mod's replacement of a file, not the game's original.
+    // `cache_path` (optional, loose folders only): when non-empty, loads the base tree from this cache file if its top-level
+    // fingerprint still matches `host_dir`, and writes it after a fresh scan. Overlays and edits are always applied fresh on top.
     bool build(const std::string& host_dir, std::string* err = nullptr, const std::vector<std::string>& overlays = {},
-               const RomfsEdits* edits = nullptr);
+               const RomfsEdits* edits = nullptr, const std::string& cache_path = {});
     bool built() const;
     uint64_t size() const;                                  // total image size in bytes
     // Copies [offset, offset + len) of the image into dst. False when the range is outside the image or a host file cannot be read

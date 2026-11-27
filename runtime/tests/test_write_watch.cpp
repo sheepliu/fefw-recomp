@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <future>
 #include <string>
 #include <thread>
 #include <vector>
@@ -455,4 +456,67 @@ NXTEST(import_freeze_holds_writes_until_it_ends) {
     teardown(r);
   }
   nxrt::config_set("memory", "freeze_table", "1");
+}
+
+// Lock order: a heap commit or decommit over a range an import has frozen waits for the freeze without holding the heap's lock, so the
+// freeze's own reads of the heap's page table (heap_rw_pages) and every other thread's go on meanwhile. Holding the lock there, the
+// change waited for the freeze while a freeze that had yet to read the table waited for the lock, and neither ended.
+NXTEST(heap_changes_wait_for_an_import_freeze_without_the_heap_lock) {
+    for (const bool decommit : {false, true}) {
+        ww::Region* r = setup();
+        REQUIRE(r != nullptr);
+        std::atomic<bool> changed{false};
+        std::thread changer;
+        std::future<int> table;   // outside the freeze's scope: with the lock held it can only finish once the freeze ends
+        {
+            const ww::ImportFreeze fz(reinterpret_cast<void*>(mem::kHeapBase + 4 * kPg), 4 * kPg);
+            changer = std::thread([&] {
+                changed.store(decommit ? mem::heap_decommit(0, 16 * kPg) : mem::heap_commit(0, 16 * kPg));
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            CHECK(!changed.load());                                  // waits for the freeze
+            table = std::async(std::launch::async, [] { return mem::heap_rw_pages(mem::kHeapBase + 4 * kPg, 4 * kPg); });
+            CHECK_MSG(table.wait_for(std::chrono::seconds(2)) == std::future_status::ready,
+                      std::string("the page table was locked while the ") + (decommit ? "decommit" : "commit") + " waited for the freeze");
+        }   // the freeze ends
+        changer.join();
+        table.wait();
+        CHECK(changed.load());
+        CHECK_EQ(mem::is_mapped(mem::kHeapBase, 16 * kPg), !decommit);
+        teardown(r);
+    }
+}
+
+NXTEST(has_written_and_write_seq_track_faults_and_forget) {
+    ww::Region* r = setup();
+    REQUIRE(r != nullptr);
+    CHECK(!ww::has_written(r));
+    CHECK(ww::arm(r, 0, 8));
+    const uint64_t seq0 = ww::write_seq();
+    CHECK(!ww::has_written(r));
+
+    // A write fault sets has_written and bumps write_seq.
+    *reinterpret_cast<volatile uint32_t*>(mem::kHeapBase + 2 * kPg) = 0xfeed;
+    CHECK(ww::has_written(r));
+    const uint64_t seq1 = ww::write_seq();
+    CHECK(seq1 > seq0);
+
+    std::vector<uint64_t> w;
+    ww::take_written(r, w);
+    CHECK(w.size() == 1 && w[0] == 2);
+    CHECK(!ww::has_written(r));
+
+    // A second take_written is a fast no-op.
+    w.clear();
+    ww::take_written(r, w);
+    CHECK(w.empty());
+
+    // forget() on armed pages also sets has_written and bumps write_seq.
+    ww::forget(mem::kHeapBase + 4 * kPg, kPg, false);
+    CHECK(ww::has_written(r));
+    CHECK(ww::write_seq() > seq1);
+    ww::take_written(r, w);
+    CHECK(w.size() == 1 && w[0] == 4);
+    CHECK(!ww::has_written(r));
+    teardown(r);
 }

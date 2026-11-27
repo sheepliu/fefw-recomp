@@ -40,6 +40,34 @@ void diag_note_file(const char* what, const char* path);       // what: "open", 
 std::vector<std::string> diag_recent_files();                  // oldest first, "[tid] what path"
 void diag_clear_recent_files();
 
+// ---- GPU failure & dispatch diagnostics -----------------------------------------------------------------------------------
+// Records the first unexpected Vulkan failure (and separately the first VK_ERROR_DEVICE_LOST, so an earlier recoverable error
+// like OOM never masks a later device loss). Expected non-error results (VK_SUCCESS, VK_NOT_READY, VK_TIMEOUT, VK_INCOMPLETE,
+// VK_SUBOPTIMAL_KHR, VK_ERROR_OUT_OF_DATE_KHR, VK_ERROR_SURFACE_LOST_KHR) are ignored.
+void diag_vk_note(int result, const char* call, const char* file, int line);
+// Supplies the NVN back end's submit/timeline summary for the first-failure record; null clears it.
+void diag_set_submit_state(std::string (*fn)());
+// Formatted Vulkan failure summary. Empty when nothing failed unless `include_none` is true.
+std::string diag_vk_failure_text(bool include_none = false);
+
+// Fixed 64-slot ring of recent compute dispatches on the render thread, flushed by freeze and device-lost dumps.
+// Plain POD copy; no heap allocation in the hot path.
+struct DispatchNote {
+    static constexpr uint16_t kIndirect = 1, kMissingCs = 2, kBarrierBefore = 4;
+    uint64_t index = 0;        // 1-based monotonic sequence number (filled by diag_note_dispatch)
+    uint64_t serial = 0;       // submission serial (0 outside a submission)
+    uint64_t indirect = 0;     // guest GPU address of indirect dispatch args when kIndirect is set
+    uint32_t x = 0, y = 0, z = 0;
+    uint32_t barriers = 0;     // full memory barriers recorded in the command buffer since the previous dispatch
+    uint32_t bindings = 0;     // descriptor bindings of the compute layout
+    uint16_t flags = 0;
+    char shader[17] = {};      // 16-char hex compute shader hash, "" when missing
+    char missing[17] = {};     // missing shader cache key when kMissingCs is set
+};
+void diag_note_dispatch(const DispatchNote& note);
+std::string diag_dispatch_text();
+void diag_gpu_reset_for_test();
+
 // ---- crash handler -------------------------------------------------------------------------------------------------------
 struct CrashOptions {
     const char* report_path = nullptr;   // nullptr: "<exe name>_crash.txt" next to the exe; "" = no file
@@ -71,6 +99,9 @@ std::string crash_report_path();
 // A known problem found before the crash (an incomplete game dump, #64): the report starts with "LIKELY CAUSE: <text>", which the
 // launcher shows instead of the bare exit code. "" clears it.
 void crash_set_hint(const char* text);
+// Windows could not commit the game's heap (mem/memory.cpp): its own "LIKELY CAUSE:" line, first, kept apart from crash_set_hint's so
+// setting or clearing it leaves that one alone. "" clears it.
+void crash_set_memory_hint(const char* text);
 // Number of exceptions the installed handler has turned into reports (tests).
 uint32_t crash_exceptions_reported();
 
@@ -105,5 +136,8 @@ uint32_t watchdog_fire_count();
 // Extra sections of the freeze dump: each function returns text (it must never block: the process may be frozen). Registered once at start-up.
 void diag_add_report(std::string (*fn)());
 std::string diag_thread_dump();        // the dump text the watchdog produces, on demand (also used by the SIGUSR-style "dump_threads" file)
+std::string diag_memory_text(const char* when);   // process footprint, guard limit, system RAM/commit and video memory ("freeze", "the crash", "device loss")
+std::string diag_full_dump(const char* header, const char* when);   // shared report composer for freeze and device-lost dumps
+std::string diag_device_lost_dump(const char* where, int result, uint64_t frames, const std::string& context);
 
 }  // namespace nxrt

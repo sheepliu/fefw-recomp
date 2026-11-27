@@ -8,6 +8,8 @@ For development. Players should use the zip on the Releases page instead. You ne
 - for the launcher: Rust (stable) and Node.js 20+
 - optional: NASM 2.14+ (faster movie decoding; on PATH, or `NX_TOOLCHAIN\bin`), sccache
 
+A Release build of the runtime uses link-time optimisation and a recorded execution profile; see [PGO.md](PGO.md).
+
 ## With the launcher
 
 ```
@@ -109,7 +111,8 @@ the launcher's **Runner** setting (empty: Steam's own Proton, else `umu-run`, el
 under Wine and Proton, also when the game is started from Steam (**Add to Steam** on the Play page adds it as a non-Steam game).
 Updating from the launcher works the same way, with the release's `-linux-x64.tar.gz` asset in place of the `-win64.zip`.
 A fork can build a launcher that follows its own releases: `FEFW_UPDATE_REPO=<owner>/<repo>` at build time, and `FEFW_BUILD_ID=<tag>`
-when its release tags are not version numbers (any other latest tag then counts as an update).
+when its release tags are not version numbers (any other latest tag then counts as an update). The same two variables apply to the
+runtime of a release package (`-DFEFW_RT_DLL=ON`), which tells the player about a newer release in game.
 
 The Linux package is made from the Windows one, after `make-release.ps1`, on x86_64 Linux or WSL2:
 

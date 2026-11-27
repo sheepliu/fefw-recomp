@@ -92,6 +92,7 @@ struct Page {
     double monitors_at = -1e9;
     std::vector<std::string> audio_devices;   // Audio page: output device names, read when the page opens and by its Refresh button
     bool audio_loaded = false;
+    std::vector<std::string> gpus;         // Graphics page: the cards the game can run on, read when the page loads
 };
 
 void mark(Page& p) { p.dirty = true; }
@@ -637,6 +638,7 @@ void hdr_group(Page& p) {
         ImGui::EndCombo();
     }
     restart_badge();
+    if (h.mode == extras::HdrMode::Off) return;   // HDR off: only the switch itself; the rest shows again once it is picked
 
     const int format = static_cast<int>(h.format);
     const bool format_open = ImGui::BeginCombo("Format##hdr_format", kHdrFormatNames[format]);
@@ -1007,6 +1009,27 @@ void picture_group(Page& p) {
 void gpu_group(Page& p) {
     DisplaySettings& d = p.edit.display;
     ImGui::SeparatorText("GPU and shaders");
+    std::string gpu_label = d.gpu == "auto" ? "Automatic (discrete GPU with the most video memory)"
+                          : d.gpu == "discrete" ? "Discrete GPU"
+                          : d.gpu == "integrated" ? "Integrated GPU (saves power)"
+                          : d.gpu;
+    if (ImGui::BeginCombo("Graphics card", gpu_label.c_str())) {
+        auto choice = [&](const std::string& value, const std::string& label) {
+            if (ImGui::Selectable(label.c_str(), d.gpu == value) && d.gpu != value) {
+                d.gpu = value;
+                mark(p);
+            }
+        };
+        choice("auto", "Automatic (discrete GPU with the most video memory)");
+        choice("discrete", "Discrete GPU");
+        choice("integrated", "Integrated GPU (saves power)");
+        for (const std::string& name : p.gpus) choice(name, name);
+        ImGui::EndCombo();
+    }
+    restart_badge();
+    tip("Which graphics card draws the game. Pick the integrated GPU on a laptop or dual-GPU PC to leave the discrete card idle and save power; "
+        "it is slower, so lower the resolution if the frame rate drops. A card that cannot run the game is skipped and the log says so. "
+        "[gfx] gpu in the ini wins over this.");
     int astc_sel = 1;
     for (int i = 0; i < kAstcCount; ++i)
         if (d.astc_quality == kAstcValues[i]) astc_sel = i;
@@ -1082,7 +1105,7 @@ void color_group(Page& p) {
 void graphics_page(Page& p) {
     hdr_group(p);
     picture_group(p);
-    color_group(p);
+    if (!extras::hdr_scene_active()) color_group(p);   // SDR only: the picture controls are not applied with HDR on
     gpu_group(p);
 }
 
@@ -1408,6 +1431,7 @@ void draw_settings_page(UiHost& host) {
         p.edit = host.settings();
         p.edit.fps = host.settings().fps;
         refresh_out_text(p);
+        p.gpus = host.gpu_names();
         p.loaded = true;
     }
     poll_capture(host, p);

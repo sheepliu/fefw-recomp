@@ -28,6 +28,7 @@ void log_set_level(LogLevel l);
 LogLevel log_level();
 bool log_enabled(LogLevel l);          // l <= current level
 const char* log_path();                // path of the file actually open ("" when none)
+double log_uptime();                   // seconds since log_init, as in each line's prefix (0 before it)
 void log_set_thread_name(const char* name);   // copied; shown in the line prefix of this thread
 const char* log_thread_name();
 LogLevel log_parse_level(const char* s, LogLevel fallback);

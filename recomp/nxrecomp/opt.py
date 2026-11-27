@@ -64,6 +64,7 @@ TOK = re.compile(r'''
 |(?P<other>\b\w+\(c[,)]|>\(c[,)])
 ''', re.X)
 GOTO = re.compile(r'\bgoto (L_\w+);')
+GOTO_STMT = re.compile(r'goto L_\w+;')
 # 'vstore': `vzero(&V); V.f[0] = t;` (a scalar result into element 0, the rest cleared) as one whole-register store (cxx.h lane0_*)
 VSTORE = re.compile(r'\bvzero\(&c->v\[(\d+)\]\); c->v\[\1\]\.(f|df|w|d)\[0\] = t;')
 VSTORE_REP = r'c->v[\1] = nx::lane0_\2(t);'
@@ -152,7 +153,11 @@ class Func:
             return False
         if t.startswith('goto '):
             return True
-        return bool(re.search(r'(?:^|; |\{ )return;(?: \})*$', t) or re.search(r'(?:^|; |\{ )goto L_\w+;(?: \})*$', t))
+        while t.endswith(' }'):
+            t = t[:-2]
+        i = max(t.rfind('; '), t.rfind('{ '))
+        stmt = t[i + 2:] if i >= 0 else t
+        return stmt == 'return;' or bool(GOTO_STMT.fullmatch(stmt))
 
 
 def _uses(func):
@@ -445,11 +450,13 @@ def optimize(text, flags_abi=True, vregs=True, keep_cs=True, xregs=True, vstore=
 
 TREG = re.compile(r'c->x\[(8|9|1[0-7])\]')
 TREG_CALL = re.compile(r'(\b(?:f_[0-9a-f]+|h_\w+)\(c\);|\bcall_indirect\(c, [^;]*\);|\bhost_import\(c, NX_IMPORT_ID\(\d+, \d+\)\);)')
+# what may stand between a call and the `return;` of a branch that left the function (the flags read back after it, braces)
+TREG_TAIL = re.compile(r'(?:[ \t{}]|gf\.\w+ = [^;\n]*;)*return;')
 TREG_SYNC = re.compile(r'(\bguest_svc\(c, [^;]*?\);|\bnx_site_inline\(c, 0x[0-9a-f]+ULL\);)')
 TREG_MID = re.compile(r'\bif \(nx_site_midhook\(c, (0x[0-9a-f]+ULL)\)\) return;')
 
 
-def temps_local(text):
+def temps_local(text, nonabi=frozenset()):
     """'tregs' (perf/codegen2): x8..x17 in function locals that never meet the context at a call or a return.
 
     AAPCS64: x9..x15 are temporaries, x16/x17 the intra-procedure-call scratch registers and x8 the indirect result register; none of
@@ -459,7 +466,13 @@ def temps_local(text):
     the context (a function that reads one before writing it still sees the caller's value), x8 is stored before each call and read
     back after it (it may be an argument), and at an SVC or a site callout every one of them is synced both ways. After a call the
     locals keep their values (the callee may not rely on or return anything in them). Runs on optimize()'s output of a function it did
-    not skip (no unknown helper that takes the context)."""
+    not skip (no unknown helper that takes the context).
+
+    `nonabi`: entries that are not reached by a call of the guest ABI but by a plain branch inside one guest function: the pieces the
+    lifter cuts a function into (a branch target that is no listed function, the function a midhook or an entry hook site makes of
+    its address). x9..x17 are live across such a branch, e.g. two values a loop body computed and its next block compares. A branch to
+    one of these (the call is followed by `return;` on its line) syncs every local both ways, like a site callout; a BL to the same
+    entry is an ordinary call."""
     lines = text.split('\n')
     m = HEAD.match(lines[0])
     if not m or lines[-1] != '}':
@@ -473,8 +486,12 @@ def temps_local(text):
     st = ' '.join('c->x[%d] = gx%d;' % (r, r) for r in used)
     ld = ' '.join('gx%d = c->x[%d];' % (r, r) for r in used)
     body = TREG.sub(lambda mt: 'gx' + mt.group(1), body)
-    if 8 in used:
-        body = TREG_CALL.sub(lambda mt: '{ c->x[8] = gx8; %s gx8 = c->x[8]; }' % mt.group(1), body)
+    def call(mt):
+        s = mt.group(1)
+        if nonabi and s.startswith('f_') and int(s[2:s.index('(')], 16) in nonabi and TREG_TAIL.match(body, mt.end()):
+            return '{ %s %s %s }' % (st, s, ld)
+        return '{ c->x[8] = gx8; %s gx8 = c->x[8]; }' % s if 8 in used else s
+    body = TREG_CALL.sub(call, body)
     body = TREG_SYNC.sub(lambda mt: '{ %s %s %s }' % (st, mt.group(1), ld), body)
     body = TREG_MID.sub(lambda mt: '%s if (nx_site_midhook(c, %s)) return; %s' % (st, mt.group(1), ld), body)
     blines = body.split('\n')

@@ -1,0 +1,58 @@
+# Retakes the README's launcher screenshots (docs/screenshots/) when the launcher's frontend changes on master, and opens a
+# pull request if any picture differs. Nothing is committed to master directly. See launcher/screenshots/capture.mjs.
+#
+# Opening the pull request needs Settings > Actions > General > "Allow GitHub Actions to create and approve pull requests".
+name: Screenshots
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - 'launcher/index.html'
+      - 'launcher/src/**'
+      - 'launcher/public/**'
+      - 'launcher/screenshots/**'
+      - 'launcher/package-lock.json'
+      - '.github/workflows/screenshots.yml'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# a newer change replaces a run that is still capturing
+concurrency:
+  group: screenshots
+  cancel-in-progress: true
+
+jobs:
+  screenshots:
+    if: github.repository == 'metrist38/fefw-recomp'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: launcher/package-lock.json
+
+      - name: Capture
+        working-directory: launcher
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm run screenshots
+
+      - name: Open a pull request if a picture changed
+        uses: peter-evans/create-pull-request@v8
+        with:
+          branch: bot/readme-screenshots
+          base: master
+          delete-branch: true
+          add-paths: docs/screenshots/**
+          commit-message: "docs: update launcher screenshots"
+          title: "docs: update launcher screenshots"
+          body: |
+            Retaken by the **Screenshots** workflow from the current launcher frontend. Look over the picture diff before merging.

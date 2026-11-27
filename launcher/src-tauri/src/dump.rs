@@ -88,8 +88,11 @@ fn build_id(main: &Path) -> Option<String> {
 fn check_candidate(kind: &str, version: &str, dir: &Path, builds: &[(String, String)]) -> Candidate {
     let exefs = dir.join("exefs");
     let romfs = dir.join("romfs");
+    // Uncompressed .nup imports skip unpacking the 29 GB romfs/ tree and write a pointer to the .nup file instead;
+    // the runtime (fs_romfs.cpp) and extract_corpus.py read the RomFS straight out of the package.
+    let nup_romfs = fs::read_to_string(dir.join("romfs.nup")).ok().map(|s| PathBuf::from(s.trim())).filter(|p| p.is_file());
     let mut checks: Vec<Check> = EXEFS_FILES.iter().map(|f| Check { label: format!("exefs/{f}"), ok: exefs.join(f).is_file() }).collect();
-    checks.push(Check { label: "romfs/".into(), ok: romfs.is_dir() });
+    checks.push(Check { label: "romfs/".into(), ok: romfs.is_dir() || nup_romfs.is_some() });
     if exefs.join("main").is_file() {
         let id = build_id(&exefs.join("main"));
         checks.push(Check { label: "exefs/main is decrypted".into(), ok: id.is_some() });
@@ -101,7 +104,8 @@ fn check_candidate(kind: &str, version: &str, dir: &Path, builds: &[(String, Str
         }
     }
     let ok = checks.iter().all(|c| c.ok);
-    Candidate { kind: kind.into(), version: version.into(), path: fwd(dir), exefs: fwd(&exefs), romfs: fwd(&romfs), ok, checks }
+    let romfs_path = if romfs.is_dir() { romfs } else { nup_romfs.unwrap_or(romfs) };
+    Candidate { kind: kind.into(), version: version.into(), path: fwd(dir), exefs: fwd(&exefs), romfs: fwd(&romfs_path), ok, checks }
 }
 
 fn is_title_id(s: &str) -> bool {

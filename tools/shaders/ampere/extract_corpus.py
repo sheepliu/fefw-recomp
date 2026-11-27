@@ -209,8 +209,23 @@ def unzstd(path, data):
     if not ZSTD_TOOL:
         raise RuntimeError('zstd: no compression.zstd (Python 3.14), zstandard package or zstd/7z executable (--zstd)')
     tool = os.path.basename(ZSTD_TOOL).lower()
-    cmd = [ZSTD_TOOL, 'e', '-so', path] if tool.startswith('7z') else [ZSTD_TOOL, '-dcq', path]
-    r = subprocess.run(cmd, capture_output=True)
+    if os.path.isfile(path):
+        cmd = [ZSTD_TOOL, 'e', '-so', path] if tool.startswith('7z') else [ZSTD_TOOL, '-dcq', path]
+        r = subprocess.run(cmd, capture_output=True)
+    elif tool.startswith('7z'):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.zst', delete=False) as tf:
+            tf.write(data)
+            tmp = tf.name
+        try:
+            r = subprocess.run([ZSTD_TOOL, 'e', '-so', tmp], capture_output=True)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    else:
+        r = subprocess.run([ZSTD_TOOL, '-dcq'], input=data, capture_output=True)
     if r.returncode != 0:
         raise RuntimeError(f'{ZSTD_TOOL} failed on {path}: {r.stderr[:200]!r}')
     return r.stdout
@@ -373,6 +388,104 @@ def bnsh_rows(name, d):
     return slim(occs), progs
 
 
+def is_nup(path):
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, 'rb') as f:
+            return f.read(4) == b'NUP\x01'
+    except OSError:
+        return False
+
+
+def nup_romfs_entries(nup_path):
+    """Parse a .nup v1 package and return [(rel_path, offset, extent_size, codec)] for shader-bearing RomFS files."""
+    with open(nup_path, 'rb') as f:
+        sb = f.read(0x80)
+        if len(sb) < 0x80 or sb[:4] != b'NUP\x01':
+            raise RuntimeError(f'{nup_path}: not a .nup package')
+        toc_off, toc_size = struct.unpack_from('<QQ', sb, 0x08)
+        f.seek(toc_off)
+        toc = f.read(toc_size)
+    if len(toc) < 0x30 or toc[:4] != b'TOC\x01':
+        raise RuntimeError(f'{nup_path}: invalid .nup TOC')
+    pkg_count, = struct.unpack_from('<I', toc, 4)
+    dir_count, file_count, pool_off, pool_size = struct.unpack_from('<4Q', toc, 8)
+    pool = memoryview(toc)[pool_off:pool_off + pool_size]
+    pos = 0x30
+    pkgs = []
+    for _ in range(pkg_count):
+        _, _, _, romfs_dir, version = struct.unpack_from('<Q4I', toc, pos)
+        kind = toc[pos + 0x18]
+        pkgs.append((kind, version, romfs_dir))
+        pos += 0x40
+    # Highest update package, else base game (matches runtime/src/core/nup.cpp).
+    updates = [p for p in pkgs if p[0] == 1 and p[2] != 0xFFFFFFFF]
+    bases = [p for p in pkgs if p[0] == 0 and p[2] != 0xFFFFFFFF]
+    chosen = max(updates, key=lambda p: p[1]) if updates else (bases[0] if bases else None)
+    if chosen is None:
+        return []
+    dirs = []
+    for _ in range(dir_count):
+        no, nl, fc, cc = struct.unpack_from('<4I', toc, pos)
+        dirs.append((bytes(pool[no:no + nl]).decode('utf-8', 'replace'), fc, cc))
+        pos += 0x18
+    files = []
+    for _ in range(file_count):
+        no, nl = struct.unpack_from('<2I', toc, pos)
+        sz, eo, es = struct.unpack_from('<3Q', toc, pos + 8)
+        codec = toc[pos + 0x40]
+        files.append((bytes(pool[no:no + nl]).decode('utf-8', 'replace'), sz, eo, es, codec))
+        pos += 0x50
+    children = struct.unpack_from(f'<{(pool_off - pos) // 4}I', toc, pos)
+
+    out = []
+    stack = [(chosen[2], '')]
+    while stack:
+        d_id, prefix = stack.pop()
+        _, fc, cc = dirs[d_id]
+        for slot in range(fc, fc + cc):
+            cid = children[slot]
+            if cid < dir_count:
+                dname = dirs[cid][0]
+                stack.append((cid, f'{prefix}/{dname}' if prefix else dname))
+            else:
+                fname, _, eo, es, codec = files[cid - dir_count]
+                rel = f'{prefix}/{fname}' if prefix else fname
+                low = fname.lower()
+                low_nz = low[:-4] if low.endswith('.zst') else low
+                if (low.endswith(('.fdata', '.file')) and rel.startswith('motor_asset_re/')) or low_nz.endswith(BNSH_FILES):
+                    out.append((rel, eo, es, codec))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def scan_nup_entry(nup_path, rel, offset, extent_size, codec, out):
+    global OUT
+    OUT = out
+    low_priority()
+    with open(nup_path, 'rb') as f:
+        f.seek(offset)
+        data = f.read(extent_size)
+    if codec == 1:
+        data = unzstd(f'{nup_path}:{rel}', data)
+    name = os.path.basename(rel)
+    low = name.lower()
+    if low.endswith(('.fdata', '.file')):
+        rows = []
+        for o, a, b, usz, fk, tk, fl in entries(data):
+            tag = inflate(data, a, b, fl, 8)
+            if tag[:4] not in (b'_S2G', b'_DOK'):
+                continue
+            blob = inflate(data, a, b, fl)
+            rows += slim([(name, o, fk, tk, tag.decode('latin1'), go, si, stage_of(ctrl), ctrl, code, gb)
+                          for go, gb, secs in glslc_outputs(blob) for si, ctrl, code in secs])
+        return rows, []
+    if data[:4] == ZSTD_MAGIC:
+        data = unzstd(f'{nup_path}:{rel}', data)
+    return bnsh_rows(rel, data)
+
+
 def scan_file(path, out, rel):
     global OUT
     OUT = out
@@ -471,16 +584,20 @@ def main():
     ap.add_argument('--progress', action='store_true', help='print "scan: <done> <total>" lines while scanning')
     a = ap.parse_args()
     ZSTD_TOOL = find_zstd_tool(a.zstd)
+    nup_entries = None
     paths = []
-    ktgl = os.path.join(a.romfs, 'motor_asset_re')
-    for r, _, fs in os.walk(a.romfs):
-        for f in fs:
-            low = f.lower()
-            low_nz = low[:-4] if low.endswith('.zst') else low
-            p = os.path.join(r, f)
-            if (low.endswith(('.fdata', '.file')) and p.startswith(ktgl)) or low_nz.endswith(BNSH_FILES):
-                paths.append(p)
-    paths.sort(key=lambda p: os.path.relpath(p, a.romfs).replace(os.sep, '/'))
+    if is_nup(a.romfs):
+        nup_entries = nup_romfs_entries(a.romfs)
+    else:
+        ktgl = os.path.join(a.romfs, 'motor_asset_re')
+        for r, _, fs in os.walk(a.romfs):
+            for f in fs:
+                low = f.lower()
+                low_nz = low[:-4] if low.endswith('.zst') else low
+                p = os.path.join(r, f)
+                if (low.endswith(('.fdata', '.file')) and p.startswith(ktgl)) or low_nz.endswith(BNSH_FILES):
+                    paths.append(p)
+        paths.sort(key=lambda p: os.path.relpath(p, a.romfs).replace(os.sep, '/'))
     for sub in ('code', 'ctrl', 'glslc'):
         os.makedirs(os.path.join(a.out, sub), exist_ok=True)
     exefs = []
@@ -492,7 +609,10 @@ def main():
     occ = collections.Counter()
     rows, progs, kernels = [], [], []
     with ProcessPoolExecutor(a.jobs, initializer=_init_worker, initargs=(ZSTD_TOOL,)) as ex:
-        futs = [ex.submit(scan_file, p, a.out, os.path.relpath(p, a.romfs).replace(os.sep, '/')) for p in paths]
+        if nup_entries is not None:
+            futs = [ex.submit(scan_nup_entry, a.romfs, rel, eo, es, codec, a.out) for rel, eo, es, codec in nup_entries]
+        else:
+            futs = [ex.submit(scan_file, p, a.out, os.path.relpath(p, a.romfs).replace(os.sep, '/')) for p in paths]
         if a.main:
             futs.append(ex.submit(scan_main, a.main, a.out))
         kfuts = [ex.submit(scan_exefs_nso, p, a.out) for p in exefs]

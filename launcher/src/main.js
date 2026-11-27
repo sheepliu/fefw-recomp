@@ -4,6 +4,7 @@ import './components.css';
 import { listen } from '@tauri-apps/api/event';
 import { api, esc, icon, refreshIcons, errText, toast } from './util.js';
 import { t, initLang, getLang } from './i18n.js';
+import { languageButton } from './languageMenu.js';
 import * as play from './pages/play.js';
 import * as settings from './pages/settings.js';
 import * as setup from './pages/setup.js';
@@ -26,16 +27,13 @@ let visits = 0;
 let statusHandler = null;
 let setupHandler = null;
 let logHandler = null;
+let languageHandler = null;
 
 const ctx = {
   go,
   onStatus(fn) { statusHandler = fn; },
   onSetup(fn) { setupHandler = fn; },
   onLog(fn) { logHandler = fn; },
-  /** Repaints the surrounding chrome only: window title, nav labels, language attribute. The open page keeps its state. */
-  shell() { drawShell(); },
-  /** Repaints the chrome and renders the open page again from disk. */
-  redraw() { redrawForLang(); },
 };
 
 function drawNav() {
@@ -50,6 +48,7 @@ function drawNav() {
         )}</span></button>`
       : '');
   nav.querySelectorAll('[data-page]').forEach((b) => b.addEventListener('click', () => go(b.dataset.page)));
+  nav.append(...languageButton(redrawForLang));
   refreshIcons();
 }
 
@@ -63,7 +62,11 @@ function drawShell() {
 /** Redraws the shell and the open page after the interface language changed. */
 function redrawForLang() {
   drawShell();
-  if (current) go(current);
+  // none while a page is still loading: it draws itself in the new language when it is ready
+  if (languageHandler) {
+    languageHandler();
+    refreshIcons();
+  }
 }
 
 async function go(page, opts = {}) {
@@ -71,11 +74,18 @@ async function go(page, opts = {}) {
   statusHandler = null;
   setupHandler = null;
   logHandler = null;
+  languageHandler = null;
   drawNav();
   view.scrollTop = 0;
-  view.dataset.visit = String(++visits);
+  const visit = String(++visits);
+  view.dataset.visit = visit;
+  // How the page redraws itself in a new language without losing what is on it. A page that was left while it
+  // loaded must not take this over from the one on show.
+  const onLanguage = (fn) => {
+    if (view.dataset.visit === visit) languageHandler = fn;
+  };
   try {
-    await PAGES[page].mod.render(view, { ...ctx, ...opts });
+    await PAGES[page].mod.render(view, { ...ctx, onLanguage, ...opts });
   } catch (e) {
     view.innerHTML = `<div class="page"><div class="banner danger">${icon('circle-x')}<div>${errText(e)}</div></div></div>`;
     toast(errText(e), 'error');
@@ -98,7 +108,7 @@ async function boot() {
   } catch (e) {
     toast(errText(e), 'error');
   }
-  await initLang(() => redrawForLang(), cfg.lang);
+  await initLang(() => redrawForLang());
   drawShell();
   // first run: no game files chosen yet
   go(cfg.dump_dir ? 'play' : 'setup', { firstRun: !cfg.dump_dir });

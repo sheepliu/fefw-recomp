@@ -347,13 +347,15 @@ bool apply_fixed(Sec sec, const std::string& k, const std::string& v, Settings* 
             if (k == "haptic") {
                 gfx::haptic::Mode m = gfx::haptic::Mode::Auto;
                 if (!gfx::haptic::mode_from_name(v.c_str(), &m)) {
-                    *msg = "haptic must be auto, off, rumble or dualsense, got '" + v + "'";
+                    *msg = "haptic must be auto, off or rumble, got '" + v + "'";
                     return false;
                 }
                 s->pad.haptic = static_cast<int>(m);
                 return true;
             }
             if (k == "haptic_strength") return set_int(-1, 100, &s->pad.haptic_strength);
+            if (k == "hd_haptics") return set_bool(&s->pad.hd_haptics);
+            if (k == "dualsense_full_volume") return set_bool(&s->pad.dualsense_full_volume);
             if (k == key_alt_orbit()) return set_real(0.0, 6.0, &s->pad.alt_orbit);
             break;
         case Sec::Timing:
@@ -476,6 +478,12 @@ bool apply_fixed(Sec sec, const std::string& k, const std::string& v, Settings* 
                     return false;
                 }
                 s->display.astc_quality = q;
+                return true;
+            }
+            if (k == "gpu") {
+                const std::string q = lower(v);
+                if (q == "discrete" || q == "integrated") s->display.gpu = q;
+                else s->display.gpu = v.empty() || q == "auto" ? "auto" : v;
                 return true;
             }
             if (k == "astc_bc") {
@@ -757,7 +765,16 @@ bool parse_onto(const std::string& text, Settings* s, std::string* err, std::vec
             line = strip_inline_comment(line);
         }
 
-        if (line[0] == '[') {
+        // In a bindings section the left-bracket key ("[") is a real binding, like ";" above: a line starting with '['
+        // whose key before the last '=' parses as an input is a binding, not a section header.
+        bool bracket_binding = false;
+        if (line[0] == '[' && sec == Sec::Bindings) {
+            const size_t eq = line.rfind('=');
+            InputId probe;
+            bracket_binding = eq != kNpos && parse_input(trim(line.substr(0, eq)), &probe);
+        }
+
+        if (line[0] == '[' && !bracket_binding) {
             if (line.back() != ']') {
                 bail(i, "section header without ']'");
                 return false;
@@ -947,6 +964,8 @@ std::string format_settings(const Settings& s) {
     kv("rumble_scale", num(s.pad.rumble_scale));
     kv("haptic", gfx::haptic::mode_name(static_cast<gfx::haptic::Mode>(s.pad.haptic)));
     kv("haptic_strength", std::to_string(s.pad.haptic_strength));
+    kv("hd_haptics", flag(s.pad.hd_haptics));
+    kv("dualsense_full_volume", flag(s.pad.dualsense_full_volume));
     kv(key_alt_orbit(), num(s.pad.alt_orbit));
 
     o += "\n[padmap]\n";
@@ -986,6 +1005,7 @@ std::string format_settings(const Settings& s) {
     kv("shader_prewarm", flag(s.display.shader_prewarm));
     kv("astc_quality", s.display.astc_quality);
     kv("astc_bc", s.display.astc_bc);
+    kv("gpu", s.display.gpu.empty() ? std::string("auto") : s.display.gpu);
     kv("monitor", s.display.monitor <= 0 ? std::string("auto") : std::to_string(s.display.monitor));
 
     o += "\n[audio]\n";

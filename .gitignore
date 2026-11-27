@@ -38,3 +38,6 @@ obj/
 __pycache__/
 /export/
 /saves/
+# lifted game functions extracted for the local HLE tests (recomp/tests/hle_*_extract.py): game code, never committed
+recomp/tests/guest_fns.inc
+recomp/tests/cull_fns.inc

@@ -69,11 +69,30 @@ bool heap_has_section();                        // false: private memory, no oth
 uint64_t heap_reserved();                       // section size
 bool heap_commit(uint64_t offset, uint64_t size);     // commit [kHeapBase+offset, +size) (page granularity)
 bool heap_decommit(uint64_t offset, uint64_t size);
-uint64_t heap_committed();                      // bytes committed through heap_commit minus heap_decommit
+uint64_t heap_committed();                      // bytes committed (by heap_commit or at first use) minus heap_decommit
+// [memory] heap_lazy_commit: heap_commit only marks new pages, and each is committed at its first use. A fault handler does that for any
+// code that reads or writes them. The operating system and drivers do not fault into it (ReadFile and WriteFile on an uncommitted page just
+// fail): call heap_touch on a range before handing it to them. It commits the heap pages of [addr, +size); true outside the heap and with
+// the switch off, false when the system had no memory left for them.
+bool heap_touch(uint64_t addr, uint64_t size);
+// The write tracker's fault handler asks this first: true when addr was a heap page waiting for its first use, now committed (the access
+// can run again). Its handler runs before lazy commit's own, and its slow path would walk the heap view for every first touch.
+bool heap_lazy_fault(uint64_t addr);
+
+// Memory limits scaled to the PC ([memory] scale_limits = auto: on with 20 GiB of RAM or less or a card of 8.5 GiB or less): the physical
+// RAM the limits are sized for ([memory] test_ram_gb pretends a smaller PC, for tests), the graphics card's largest device-local heap (noted
+// by the device when it is made), whether scaling is on, and a size picked by RAM class: `at8` at 10 GiB or less (an 8 GB PC), `at16` at
+// 20 GiB or less (16 GB), else `over16`. With scaling off it returns `over16` (the old defaults). (Not "small": rpcndr.h defines it.)
+uint64_t limits_ram_bytes();
+void limits_note_video_heap(uint64_t bytes);
+uint64_t limits_video_heap_bytes();
+bool limits_scaled();
+int64_t limit_by_ram(int64_t over16, int64_t at16, int64_t at8);
 // The heap's own page table, without VirtualQuery (which walks every page of the run of identical pages after the address: up to 85 ms
 // on a 10 GiB heap): 1 when every page of [addr, addr + size) is in the primary view and this module left it committed read-write, 0 when
-// one is not, -1 when the table cannot say (outside the primary view, [memory] fast_query = false). heap_epoch() changes with every
-// change of the table, inside the change's ww::OsWriteScope: the write tracker reads it before and after, without holding a region lock.
+// one is not, -1 when the table cannot say (outside the primary view, [memory] fast_query = false). Pages still waiting for their first
+// use ([memory] heap_lazy_commit) count as read-write and are committed by the call. heap_epoch() changes with every change of what the
+// table answers, inside the change's ww::OsWriteScope (marking new pages for their first use and giving unused ones back need none): the write tracker reads it before and after, without holding a region lock.
 int heap_rw_pages(uint64_t addr, uint64_t size);
 uint64_t heap_epoch();
 // Another view of section pages [offset, offset+size). offset and size must be multiples of kAllocGranularity.

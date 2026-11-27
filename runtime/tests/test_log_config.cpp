@@ -259,6 +259,32 @@ NXTEST(log_file_output_is_written) {
     remove_log_files(p);
 }
 
+// [log] repeat_limit: lines from one call site beyond the limit in 10 s are left out (and not counted); warnings never are.
+NXTEST(log_repeat_limit_per_call_site) {
+    std::string p = temp_path("repeat");
+    REQUIRE(!p.empty());
+    remove_log_files(p);
+    clear_env();
+    config_clear();
+    _putenv_s("NXRT_LOG_REPEAT_LIMIT", "3");
+    LogOptions o;
+    o.path = p.c_str();
+    o.level = LogLevel::Info;
+    o.to_stderr = false;
+    log_init(o);
+    for (int i = 0; i < 10; i++) logf(LogLevel::Info, "rep", "same site %d", i);
+    for (int i = 0; i < 5; i++) logf(LogLevel::Warn, "rep", "warning %d", i);
+    log_flush();
+    std::string text = read_file(p);
+    CHECK(contains(text, "rep: same site 2"));
+    CHECK(!contains(text, "rep: same site 3"));
+    CHECK(contains(text, "rep: warning 4"));
+    CHECK_EQ(log_count(LogLevel::Info), 3u);
+    log_shutdown();
+    _putenv_s("NXRT_LOG_REPEAT_LIMIT", "0");   // the test process runs without the limit (test_main.cpp)
+    remove_log_files(p);
+}
+
 NXTEST(log_prev_rotation_on_second_init) {
     std::string p = temp_path("rotate");
     REQUIRE(!p.empty());
@@ -476,5 +502,32 @@ NXTEST(config_log_effective_lines) {
     config_log_effective();
     CHECK(count_containing(cap.lines, "config: [diag] watchdog_seconds = 10 (ini)") == 1);
     CHECK(count_containing(cap.lines, "config: probe_name = x (default)") == 1);
+    config_clear();
+}
+
+NXTEST(config_log_unread_lines) {
+    quiet_init(LogLevel::Info);
+    // [unread_b] probe_moved is read below; the ini has it in [unread_a], so the warning names [unread_b]
+    config_load_string("[unread_a]\nprobe_moved = 1\nprobe_typo = 2\n[unread_b]\nprobe_read = 3\n");
+    CHECK(config_get_int("unread_b", "probe_read", 0) == 3);
+    CHECK(config_get_int("unread_b", "probe_moved", 0) == 0);
+    Capture cap;
+    SinkGuard sg(&cap);
+    CHECK(config_log_unread(20.0) == 2);
+    CHECK(count_containing(cap.lines, "[unread_a] probe_moved = 1 is not a setting in [unread_a]: the game reads probe_moved in [unread_b]") == 1);
+    CHECK(count_containing(cap.lines, "[unread_a] probe_typo = 2 is not a known setting and was not read in the first 20 s") == 1);
+    CHECK(count_containing(cap.lines, "probe_read") == 0);
+    config_clear();
+}
+
+NXTEST(config_log_unread_known_and_wrong_section) {
+    quiet_init(LogLevel::Info);
+    // [nvn] tex_prep_mb is a known key: quiet when unread. gpl under [gfx] belongs in [nvn].
+    config_load_string("[nvn]\ntex_prep_mb = 512\n[gfx]\ngpl = false\n");
+    Capture cap;
+    SinkGuard sg(&cap);
+    CHECK(config_log_unread(20.0) == 1);
+    CHECK(count_containing(cap.lines, "tex_prep_mb") == 0);
+    CHECK(count_containing(cap.lines, "[gfx] gpl = false is not a setting in [gfx]: the game reads gpl in [nvn]") == 1);
     config_clear();
 }

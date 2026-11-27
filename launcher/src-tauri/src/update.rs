@@ -30,6 +30,7 @@ const PACKAGE: (&str, &str, [&str; 4]) =
 const PACKAGE: (&str, &str, [&str; 4]) =
     ("-linux-x64.tar.gz", "Linux", ["fefw-launcher.AppImage", "fefw_rt.dll", "tools/build/fefw_build.py", "tools/python/bin/python3"]);
 const AGENT: &str = "fefw-launcher";
+pub const CANCELLED: &str = "Update cancelled.";
 const CURL: &str = if cfg!(windows) { "curl.exe" } else { "curl" };
 const TAR: &str = if cfg!(windows) { "tar.exe" } else { "tar" };
 /// The launcher's working folder inside the install folder: downloads, the unpacked package, the previous version's files.
@@ -166,6 +167,8 @@ pub struct Run<'a> {
     pub install: PathBuf,
     pub game_dir: PathBuf,
     pub emit: &'a dyn Fn(Status),
+    /// asked just before the files are replaced; Err stops the update there
+    pub ready: &'a dyn Fn() -> Result<(), String>,
 }
 
 impl Run<'_> {
@@ -184,7 +187,7 @@ impl Run<'_> {
 
     fn cancelled(&self) -> Result<(), String> {
         if self.shared.cancel.load(Ordering::SeqCst) {
-            Err("Update cancelled.".into())
+            Err(CANCELLED.into())
         } else {
             Ok(())
         }
@@ -205,6 +208,7 @@ impl Run<'_> {
         self.cancelled()?;
         let top = self.unpack(&zip, &work.join("stage"))?;
         self.cancelled()?;
+        (self.ready)()?;
         self.set("install", 0, 0, "Installing");
         install(&self.install, &top, &work.join("old"))?;
         let _ = fs::remove_file(&zip);
@@ -250,7 +254,7 @@ impl Run<'_> {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = fs::remove_file(&part);
-                return Err("Update cancelled.".into());
+                return Err(CANCELLED.into());
             }
             let got = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
             self.set("download", got, rel.size, &format!("Downloading {} ({:.0} of {:.0} MiB)", rel.asset_name, mb(got), mb(rel.size)));
@@ -400,7 +404,8 @@ pub fn install(install: &Path, top: &Path, old: &Path) -> Result<(), String> {
             let target = install.join(rel);
             // symlink_metadata: a symlink (python-build-standalone has them) whose target was moved aside still counts
             let had = fs::symlink_metadata(&target).is_ok();
-            // a language table is added, never replaced: the copy in the install folder may be the player's own.
+            // a language file is added, never replaced: the copy in the install folder may be the player's own. The new
+            // launcher brings the unedited ones up to date itself (shipped.rs).
             let shared = rel.components().next().is_some_and(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case("locales"));
             if had && shared {
                 continue;
@@ -440,6 +445,9 @@ pub fn rebuild_needed(install: &Path, game_dir: &Path) -> (Option<bool>, String)
     }
     let mut c = Command::new(crate::setup::package_python(&tools));
     c.arg("-I").arg(tools.join("build").join("fefw_build.py")).arg("--check").arg("--game").arg(game_dir);
+    if let Some(v) = crate::cpu::build_variant() {
+        c.args(["--cpu", v]);
+    }
     crate::setup::quiet(&mut c);
     match c.stdin(Stdio::null()).output() {
         Ok(o) => {
@@ -589,7 +597,7 @@ mod tests {
                 println!("{} {} {}/{} {}", s.state, s.phase, s.done, s.total, s.message)
             }
         };
-        let run = Run { shared: &shared, install: install.clone(), game_dir: install.clone(), emit: &emit };
+        let run = Run { shared: &shared, install: install.clone(), game_dir: install.clone(), emit: &emit, ready: &|| Ok(()) };
         let st = run.run(&rel).expect("update");
         println!("done: {} rebuild {:?} ({})", st.message, st.rebuild, st.rebuild_reason);
         assert!(install.join("fefw_rt.dll").is_file() && install.join("tools/build/fefw_build.py").is_file());

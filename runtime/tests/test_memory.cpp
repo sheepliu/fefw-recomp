@@ -3,6 +3,8 @@
 
 #include "nxrt/config.h"
 #include "nxrt/memory.h"
+#include "../src/services/fs_romfs.h"
+#include "../src/services/fs_volume.h"
 
 #include <windows.h>
 
@@ -12,6 +14,11 @@
 #include <cstdio>
 #include <random>
 #include <string>
+#include <atomic>
+#include <filesystem>
+#include <fstream>
+#include <thread>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -70,7 +77,139 @@ bool host_mapped(uint64_t addr, uint64_t size) {
     return true;
 }
 
+// A small heap with [memory] heap_lazy_commit on: a section on Windows, private memory under Wine (which does not fault on a section's
+// uncommitted pages, so lazy commit stays off for one).
+struct LazyHeap {
+    LazyHeap() {
+        mem::shutdown();
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        const bool wine = ntdll && GetProcAddress(ntdll, "wine_get_version");
+        _putenv_s("NXRT_MEMORY_HEAP_LAZY_COMMIT", "1");
+        _putenv_s("NXRT_MEMORY_HEAP_SECTION", wine ? "0" : "1");
+        ok = mem::init() && mem::heap_create(kHeapSmall);
+    }
+    ~LazyHeap() {
+        mem::shutdown();
+        _putenv_s("NXRT_MEMORY_HEAP_LAZY_COMMIT", "");
+        _putenv_s("NXRT_MEMORY_HEAP_SECTION", "");
+    }
+    bool ok = false;
+};
+constexpr uint64_t kGran = 2ull << 20;   // the run a first use commits
+
 }  // namespace
+
+// [memory] heap_lazy_commit: heap_commit only marks; the first use commits the page's 2 MiB granule; heap_touch, views, protection changes
+// and the page table's callers commit what they are about to use.
+NXTEST(heap_lazy_commit_on_first_use) {
+    LazyHeap heap;
+    REQUIRE(heap.ok);
+    CHECK(mem::heap_commit(0, 24 * kGran));
+    CHECK_EQ(mem::heap_committed(), 0ull);
+    CHECK(mem::is_mapped(mem::kHeapBase, kPg));                  // but answers as mapped
+    CHECK(touch(mem::kHeapBase + 3 * kPg, true));                // first use: its granule is committed
+    CHECK_EQ(mem::heap_committed(), kGran);
+    word_at(mem::kHeapBase + 5 * kPg)[0] = 0xCAFE0003u;           // the rest of the granule needs no fault
+    CHECK_EQ(word_at(mem::kHeapBase + 5 * kPg)[0], 0xCAFE0003u);
+    CHECK(mem::heap_touch(mem::kHeapBase + kGran, kPg));         // heap_touch commits what it covers
+    CHECK_EQ(mem::heap_committed(), kGran + kPg);
+    CHECK_EQ(mem::heap_rw_pages(mem::kHeapBase + 2 * kGran, kGr), 1);   // committed for the caller
+    CHECK_EQ(mem::heap_committed(), kGran + kPg + kGr);
+    CHECK(mem::protect(mem::kHeapBase + 3 * kGran, kPg, mem::Prot::R));
+    CHECK(!touch(mem::kHeapBase + 3 * kGran, true));
+    CHECK(touch(mem::kHeapBase + 3 * kGran, false));
+    if (mem::heap_has_section()) {
+        void* v = mem::heap_private_view(4 * kGran, kGr);        // a view of section pages commits them first
+        REQUIRE(v != nullptr);
+        static_cast<volatile uint32_t*>(v)[0] = 0xCAFE0004u;
+        CHECK_EQ(word_at(mem::kHeapBase + 4 * kGran)[0], 0xCAFE0004u);
+        CHECK(mem::heap_private_view_unmap(v));
+        const uint64_t alias = mem::heap_alias(5 * kGran, kGr);
+        REQUIRE(alias != 0);
+        word_at(alias)[0] = 0xCAFE0005u;
+        CHECK_EQ(word_at(mem::kHeapBase + 5 * kGran)[0], 0xCAFE0005u);
+        CHECK(mem::heap_alias_unmap(alias));
+        const uint64_t held = mem::heap_committed();
+        void* part = mem::heap_private_view(7 * kGran, kPg + 1);   // a view maps whole pages: the partial last one is committed too
+        REQUIRE(part != nullptr);
+        CHECK_EQ(mem::heap_committed(), held + 2 * kPg);
+        static_cast<volatile uint8_t*>(part)[2 * kPg - 1] = 0x5A;
+        CHECK(mem::heap_private_view_unmap(part));
+    }
+    const uint64_t before = mem::heap_committed();
+    CHECK(mem::heap_commit(6 * kGran, kGran));                    // asked for again before any use: still waiting
+    CHECK_EQ(mem::heap_committed(), before);
+    CHECK(mem::heap_decommit(0, kPg));
+    CHECK(!touch(mem::kHeapBase, false));                         // a decommitted page faults, it is not committed again
+    const uint64_t epoch = mem::heap_epoch();
+    CHECK(mem::heap_decommit(8 * kGran, kGran));                  // never used: back to reserved
+    CHECK(mem::heap_epoch() != epoch);                            // the page table's answer changed
+    CHECK_EQ(mem::heap_rw_pages(mem::kHeapBase + 8 * kGran, kPg), 0);
+    CHECK(!touch(mem::kHeapBase + 8 * kGran, false));
+    CHECK(!touch(mem::kHeapBase + 24 * kGran, false));            // past what heap_commit asked for
+    CHECK(mem::heap_commit(0, kPg));                              // a page that was in use before is committed at once
+    CHECK(touch(mem::kHeapBase, true));
+}
+
+// Several threads touching the same 2 MiB granules at once, with no write-tracker handler installed (as at boot).
+NXTEST(heap_lazy_commit_threads_racing_for_a_granule) {
+    LazyHeap heap;
+    REQUIRE(heap.ok);
+    constexpr uint64_t kGrans = 48;
+    CHECK(mem::heap_commit(0, kGrans * kGran));
+    CHECK_EQ(mem::heap_committed(), 0ull);
+    constexpr int kThreads = 8;
+    std::atomic<int> ready{0}, lost{0};
+    std::vector<std::thread> th;
+    for (int t = 0; t < kThreads; ++t)
+        th.emplace_back([&, t] {
+            ready.fetch_add(1);
+            while (ready.load() < kThreads) {}
+            for (uint64_t g = 0; g < kGrans; ++g)      // every thread a different page of the same granule at the same time
+                if (!touch(mem::kHeapBase + g * kGran + static_cast<uint64_t>(t) * 7 * kPg, (t & 1) != 0)) lost.fetch_add(1);
+        });
+    for (auto& x : th) x.join();
+    CHECK_EQ(lost.load(), 0);
+    CHECK_EQ(mem::heap_committed(), kGrans * kGran);
+}
+
+// The operating system does not fault into the lazy commit: the runtime's file reads and writes commit the pages beforehand.
+NXTEST(heap_lazy_commit_file_reads_and_writes) {
+    namespace fs = nxrt::services::fs;
+    LazyHeap heap;
+    REQUIRE(heap.ok);
+    CHECK(mem::heap_commit(0, 16 * kGran));
+    std::error_code ec;
+    const std::filesystem::path dir = std::filesystem::temp_directory_path(ec) / ("nxrt_lazy_" + std::to_string(GetCurrentProcessId()));
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir / "rom", ec);
+    const std::string data(3 * kPg, 'x');
+    std::ofstream(dir / "rom" / "f.bin", std::ios::binary) << data;
+    {
+        fs::Volume v((dir / "vol").string(), false, false, 0);
+        REQUIRE(v.create_file("/a", 0) == 0);
+        std::shared_ptr<fs::VFile> f;
+        REQUIRE(v.open_file("/a", fs::kModeRead | fs::kModeWrite | fs::kModeAppend, &f) == 0);
+        // a write from pages never used reads zeros
+        CHECK_EQ(f->write(0, reinterpret_cast<const void*>(mem::kHeapBase + kGran), kPg), 0u);
+        CHECK_EQ(f->write(kPg, data.data(), data.size()), 0u);
+        uint64_t got = 0;
+        char* into = reinterpret_cast<char*>(mem::kHeapBase + 2 * kGran);
+        CHECK_EQ(f->read(0, into, 4 * kPg, &got), 0u);
+        CHECK_EQ(got, 4 * kPg);
+        CHECK(into[0] == 0 && std::memcmp(into + kPg, data.data(), data.size()) == 0);
+
+        fs::RomfsImage img;
+        std::string err;
+        REQUIRE(img.build((dir / "rom").string(), &err));
+        uint64_t off = 0, size = 0;
+        REQUIRE(img.file_extent("/f.bin", &off, &size) && size == data.size());
+        char* rom = reinterpret_cast<char*>(mem::kHeapBase + 4 * kGran);
+        CHECK(img.read(off, rom, size));
+        CHECK(std::memcmp(rom, data.data(), data.size()) == 0);
+    }
+    std::filesystem::remove_all(dir, ec);
+}
 
 NXTEST(init_is_idempotent_and_reinitialises) {
     mem::shutdown();

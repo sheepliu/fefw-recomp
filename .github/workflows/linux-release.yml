@@ -5,8 +5,10 @@
 #             (game-build/scripts/build_fefw.ps1, make-release.ps1)
 #   linux     makes fefw-recomp-<version>-linux-x64.tar.gz from that zip (game-build/scripts/make-release-linux.sh), then publishes
 #             both: added to the release when it exists (same names are replaced), else a new release at this commit
+#   decky     the Decky plugin as fefw-recomp-<version>-decky.zip (decky/package.py), published with the packages
+# The SteamOS installer (installer/) is published beside them under names without the version, which releases/latest/download finds.
 #
-# With publish off the packages are only kept as artifacts of the run.
+# With publish off all of them are only kept as artifacts of the run.
 name: Release
 
 on:
@@ -94,7 +96,9 @@ jobs:
       # launcher (or only the runtime) rebuilds only that part and reuses the rest.
       #
       # the runtime: the files make-release.ps1 takes from the build, built from runtime/, game-build/fefw, recomp/include and the
-      # texture transcoder (its third-party sources are fetched by a script that is part of tools/textures, so they are covered)
+      # texture transcoder (its third-party sources are fetched by a script that is part of tools/textures, so they are covered), and
+      # tauri.conf.json for the version the DLL names as its release (game-build/fefw/CMakeLists.txt). FEFW_UPDATE_REPO and a fork's
+      # FEFW_BUILD_ID are compiled into it too.
       - name: Cache key inputs
         id: ver
         run: |
@@ -117,7 +121,7 @@ jobs:
             game-build/fefw/build/rtdll/fefw_rt.lib
             game-build/fefw/build/rtdll/fonts
             game-build/fefw/build/rtdll/astcdec-*-shared.dll
-          key: rt-nasm-${{ steps.ver.outputs.image }}-${{ env.LLVM_VERSION }}-${{ hashFiles('runtime/**', 'game-build/fefw/**', 'recomp/include/**', 'tools/textures/**', 'game-build/scripts/build_fefw.ps1') }}
+          key: rt-nasm-${{ steps.ver.outputs.image }}-${{ env.LLVM_VERSION }}-${{ env.FEFW_UPDATE_REPO }}-${{ env.FEFW_BUILD_ID }}-${{ hashFiles('runtime/**', 'game-build/fefw/**', 'recomp/include/**', 'tools/textures/**', 'game-build/scripts/build_fefw.ps1', 'launcher/src-tauri/tauri.conf.json') }}
 
       - name: Texture transcoder sources
         if: steps.rt.outputs.cache-hit != 'true'
@@ -206,8 +210,37 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-  linux:
+  # the Steam Deck plugin, stamped with the release's version
+  decky:
     needs: windows
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.windows.outputs.version }}
+    defaults:
+      run:
+        working-directory: decky
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: npx --yes pnpm@9 install --frozen-lockfile
+      - run: npx --yes pnpm@9 run check
+      - run: npx --yes pnpm@9 test
+      - run: npx --yes pnpm@9 run build
+      - run: python3 package.py --version "$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: decky
+          path: decky/out/fefw-recomp-${{ needs.windows.outputs.version }}-decky.zip
+          compression-level: 0
+          if-no-files-found: error
+
+  linux:
+    needs: [windows, decky]
     # the oldest supported runner: the AppImage and the Python wheels then run on older glibc too
     runs-on: ubuntu-22.04
     env:
@@ -217,11 +250,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # GitHub's Ubuntu mirror is at times very slow (minutes for these packages), so what apt downloads is kept for later runs: a
+      # new cache each week, started from the last one. apt fetches only what the cache lacks.
+      - name: Week (names the package cache)
+        id: week
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ~/apt-archives
+          key: apt-ubuntu-22.04-${{ steps.week.outputs.week }}
+          restore-keys: apt-ubuntu-22.04-
+
       - name: System packages (Tauri, AppImage)
         run: |
+          mkdir -p ~/apt-archives/partial
+          apt=(sudo apt-get -o "Dir::Cache::archives=$HOME/apt-archives" -o APT::Keep-Downloaded-Packages=true)
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+          "${apt[@]}" install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
             build-essential file
+          "${apt[@]}" autoclean   # drops the versions that have been replaced
+          # apt wrote as root; the cache is saved by the runner's user
+          sudo rm -rf ~/apt-archives/partial ~/apt-archives/lock
+          sudo chown -R "$(id -u):$(id -g)" ~/apt-archives
 
       - uses: actions/setup-node@v4
         with:
@@ -248,8 +298,29 @@ jobs:
           name: win64-symbols
           path: work/base
 
+      # Zig and the Python build make-release-linux.sh downloads: it only fetches what is missing, and checks both hashes either way.
+      # ziglang.org can be very slow (13 minutes seen). The key follows the script's pinned versions and hashes.
+      - name: Cache key inputs
+        id: ver
+        run: |
+          pins=$(grep -E '^(ZIG|PYTHON)_[A-Z0-9_]+=' game-build/scripts/make-release-linux.sh)
+          echo "downloads=$(printf '%s' "$pins" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Downloads cache
+        uses: actions/cache@v4
+        with:
+          path: work/release/cache
+          key: release-linux-downloads-${{ steps.ver.outputs.downloads }}
+
+      # also inside the package: the installed plugin updates itself to it
+      - uses: actions/download-artifact@v4
+        with:
+          name: decky
+          path: work/base
       - name: Package (game-build/scripts/make-release-linux.sh)
-        run: game-build/scripts/make-release-linux.sh "work/base/fefw-recomp-$VERSION-win64.zip"
+        run: |
+          game-build/scripts/make-release-linux.sh "work/base/fefw-recomp-$VERSION-win64.zip" \
+              --decky "work/base/fefw-recomp-$VERSION-decky.zip"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -258,16 +329,28 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
+      - name: Installer (installer/), following this repository's releases
+        run: |
+          sed "s#metrist38/fefw-recomp#$GITHUB_REPOSITORY#g" installer/fefw_install.py > work/base/fefw-recomp-install.py
+          sed "s#metrist38/fefw-recomp#$GITHUB_REPOSITORY#g" installer/fefw-recomp-install.desktop > work/base/fefw-recomp-install.desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: |
+            work/base/fefw-recomp-install.py
+            work/base/fefw-recomp-install.desktop
+          if-no-files-found: error
       - name: Release
         if: inputs.publish
         run: |
           files=("work/base/fefw-recomp-$VERSION-win64.zip" "work/release/fefw-recomp-$VERSION-linux-x64.tar.gz"
-                 "work/base/fefw-recomp-$VERSION-win64-symbols.zip")
+                 "work/base/fefw-recomp-$VERSION-win64-symbols.zip" "work/base/fefw-recomp-$VERSION-decky.zip"
+                 "work/base/fefw-recomp-install.py" "work/base/fefw-recomp-install.desktop")
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${files[@]}" --clobber
           else
-            notes=$(printf 'Version %s, built from %s.\n\n- **Linux and Steam Deck:** `fefw-recomp-%s-linux-x64.tar.gz`. Extract, run `fefw-launcher.AppImage`, Set up, Play.\n- **Windows:** `fefw-recomp-%s-win64.zip`. Extract, run `fefw-launcher.exe`.\n\nSee README.txt in the package.' \
-              "$VERSION" "$GITHUB_SHA" "$VERSION" "$VERSION")
+            notes=$(printf 'Version %s, built from %s.\n\n- **Linux and Steam Deck:** `fefw-recomp-%s-linux-x64.tar.gz`. Extract, run `fefw-launcher.AppImage`, Set up, Play.\n- **SteamOS installer** (Desktop Mode): download `fefw-recomp-install.desktop` and open it. If your browser saves it ending in `.download`, remove that ending.\n- **Windows:** `fefw-recomp-%s-win64.zip`. Extract, run `fefw-launcher.exe`.\n- **Decky plugin** (early; updates and builds from Game Mode): `fefw-recomp-%s-decky.zip`.\n\nSee README.txt in the package.' \
+              "$VERSION" "$GITHUB_SHA" "$VERSION" "$VERSION" "$VERSION")
             gh release create "$TAG" "${files[@]}" --target "$GITHUB_SHA" --title "$VERSION" --latest=false --notes "$notes"
           fi
           gh release edit "$TAG" --draft=false --latest

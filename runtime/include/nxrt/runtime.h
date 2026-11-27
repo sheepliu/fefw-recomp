@@ -15,6 +15,7 @@ struct InitOptions {
     bool memory_init = true;            // reserve the stack and kernel regions
     bool load_symbols = true;           // load the linker map next to the exe
     bool services = true;               // register the Horizon system services (services.h) in the ipc registry
+    const char* app_build = nullptr;    // the program's version and commit, for the first log line and the crash reports
 };
 
 // Idempotent. Logs the effective configuration. Returns false when a mandatory piece (the address-space layout) failed.
@@ -25,5 +26,11 @@ void shutdown();
 std::string summary();
 bool initialised();
 const char* abi_source();   // which ABI header the runtime was built against
+const char* app_build();    // InitOptions::app_build ("" when the program gave none)
+void set_app_build(const char* b);   // init() sets it from InitOptions::app_build
+// Facts about this run that a log cut from the front would lose (the build, the GPU), repeated by the hitch monitor once a minute
+// ([diag] session_stamp_s) and at exit, so a report that keeps only the tail of the log still says what it came from.
+void set_session_note(const char* key, const std::string& value);   // any thread; a key set again replaces its value
+std::string session_stamp();   // "<app build>, ABI <n>; <key> <value>; ..."
 
 }  // namespace nxrt

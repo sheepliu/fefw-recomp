@@ -21,6 +21,7 @@
 #include <unordered_set>
 
 #include "nxrt/config.h"
+#include "nxrt/diag.h"
 #include "nxrt/ftrace.h"
 #include "nxrt/gauge.h"
 #include "nxrt/log.h"
@@ -75,7 +76,22 @@ struct GfxEntry {
     std::shared_ptr<PipeUpgrade> up;
 };
 std::unordered_map<uint64_t, std::vector<GfxEntry>> g_gfx;
+// Render-thread direct-mapped cache of settled graphics pipelines in front of g_gfx (avoids unordered_map bucket + vector lookup).
+struct GfxFastSlot {
+    uint64_t hash = 0;
+    GraphicsKey key;
+    VkPipeline pipe = VK_NULL_HANDLE;
+};
+constexpr size_t kGfxFastSlots = 2048;
+GfxFastSlot g_gfx_fast[kGfxFastSlots];
 // Compute pipelines by (shader, layout, integer samplers: set << 17 | binding << 1 | signed, see spirv_int_samplers; empty for the translated module).
+struct CompFastSlot {
+    const ShaderInfo* cs = nullptr;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+};
+constexpr size_t kCompFastSlots = 64;
+CompFastSlot g_comp_fast[kCompFastSlots];
 std::map<std::tuple<const ShaderInfo*, VkPipelineLayout, std::vector<uint32_t>>, VkPipeline> g_compute;
 std::map<std::pair<const ShaderInfo*, std::vector<uint32_t>>, VkShaderModule> g_int_samplers;   // their modules (null: could not be made)
 VkPipelineCache g_cache = VK_NULL_HANDLE;
@@ -694,11 +710,23 @@ const ProgLayout* prog_layout(const ShaderInfo* const stages[6]) {
             }
         }
     }
+    std::stable_sort(pl.bindings.begin(), pl.bindings.end(), [](const BindingDesc& a, const BindingDesc& b) { return a.set < b.set; });
+    for (uint32_t s = 0; s < 5; ++s) { pl.set_begin[s] = 0; pl.set_end[s] = 0; }
+    for (size_t i = 0; i < pl.bindings.size(); ) {
+        const uint32_t s = pl.bindings[i].set;
+        size_t j = i + 1;
+        while (j < pl.bindings.size() && pl.bindings[j].set == s) ++j;
+        if (s < 5) {
+            pl.set_begin[s] = static_cast<uint16_t>(i);
+            pl.set_end[s] = static_cast<uint16_t>(j);
+        }
+        i = j;
+    }
     std::vector<VkDescriptorSetLayoutBinding> lbs[4];
     std::string sig;                                   // the descriptors of the program, as bytes: the key of the shared layout
     for (int set = 0; set < 4; ++set) {
-        for (const BindingDesc& d : pl.bindings) {
-            if (d.set != static_cast<uint32_t>(set)) continue;
+        for (uint32_t bi = pl.set_begin[set]; bi < pl.set_end[set]; ++bi) {
+            const BindingDesc& d = pl.bindings[bi];
             VkDescriptorSetLayoutBinding b = {};
             b.binding = d.binding;
             b.descriptorType = d.type;
@@ -790,9 +818,19 @@ const ProgLayout* prog_layout(const ShaderInfo* const stages[6]) {
     pl.push_bytes = pcr.size;
     // Per-program invariant (ProgLayout::writes_storage): begin_draw used to walk every binding of the program for this on each draw.
     static const bool ssbo_ro_pass = config_get_bool("nvn", "gfx_ssbo_readonly", true);
-    for (const BindingDesc& d : pl.bindings)
-        pl.writes_storage |= (d.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && !(ssbo_ro_pass && !d.shader->refl.bindings[d.index].written)) ||
+    for (uint32_t bi = 0; bi < pl.bindings.size(); ++bi) {
+        const BindingDesc& d = pl.bindings[bi];
+        const DescriptorBinding& b = d.shader->refl.bindings[d.index];
+        pl.writes_storage |= (d.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && !(ssbo_ro_pass && !b.written)) ||
                              d.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        if (d.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
+            pl.storage_img_bindings.push_back(static_cast<uint16_t>(bi));
+        } else if (d.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                   (b.nvn.source == NvnSource::SamplerBinding || b.nvn.source == NvnSource::HandleInUniform || b.nvn.source == NvnSource::ImageBinding)) {
+            pl.sampled_tex_bindings.push_back(static_cast<uint16_t>(bi));
+            if (b.image.dim == 2 && b.nvn.source != NvnSource::ImageBinding) pl.has_3d_sampler = true;
+        }
+    }
     return &g_layouts.emplace(key, std::move(pl)).first->second;
 }
 
@@ -1062,12 +1100,24 @@ VkPipeline build_graphics_pipeline(const GraphicsKey& key, const ProgLayout& lay
 VkPipeline graphics_pipeline(const GraphicsKey& key, const ProgLayout& layout) {
     ensure_cache();
     const uint64_t h = key.hash();
+    GfxFastSlot& fast = g_gfx_fast[(h ^ (h >> 19)) & (kGfxFastSlots - 1)];
+    if (fast.pipe && fast.hash == h && fast.key == key) {
+        auto& hits = counters().pipeline_cache_hits;
+        hits.store(hits.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        return fast.pipe;
+    }
     auto& bucket = g_gfx[h];
     for (auto& e : bucket)
         if (e.first == key) {
-            counters().pipeline_cache_hits.fetch_add(1, std::memory_order_relaxed);
+            auto& hits = counters().pipeline_cache_hits;
+            hits.store(hits.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
             if (e.up && e.up->state.load(std::memory_order_acquire) != 0) gpl_take_upgrade(e.second, e.alt, e.up);
             if (e.alt && gpl_ab_whole()) return e.alt;
+            if (!e.up && !e.alt && e.second) {
+                fast.hash = h;
+                fast.key = key;
+                fast.pipe = e.second;
+            }
             return e.second;
         }
     prewarm_init();
@@ -1241,11 +1291,22 @@ void compute_progress_log() {
 
 VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgLayout& layout, const std::vector<SpvIntSampler>& ints) {
     ensure_cache();
+    if (ints.empty()) {
+        const size_t h = (reinterpret_cast<uintptr_t>(cs) >> 4) ^ (reinterpret_cast<uintptr_t>(layout.layout) >> 3);
+        CompFastSlot& fast = g_comp_fast[h & (kCompFastSlots - 1)];
+        if (fast.pipe && fast.cs == cs && fast.layout == layout.layout) return fast.pipe;
+    }
     std::vector<uint32_t> ikey;
     for (const SpvIntSampler& s : ints) ikey.push_back(s.set << 17 | s.binding << 1 | (s.is_signed ? 1u : 0u));
     const auto k = std::make_tuple(cs, layout.layout, ikey);
     auto it = g_compute.find(k);
-    if (it != g_compute.end()) return it->second;
+    if (it != g_compute.end()) {
+        if (ints.empty() && it->second) {
+            const size_t h = (reinterpret_cast<uintptr_t>(cs) >> 4) ^ (reinterpret_cast<uintptr_t>(layout.layout) >> 3);
+            g_comp_fast[h & (kCompFastSlots - 1)] = {cs, layout.layout, it->second};
+        }
+        return it->second;
+    }
     if (ints.empty() && compute_async_mode()) {  // built ahead (compute_prebuild)?
         std::unique_lock<std::mutex> lk(g_comp_mu);
         auto jt = g_comp_jobs.find(cs);
@@ -1262,10 +1323,13 @@ VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgLayout& layout, cons
                         return VK_NULL_HANDLE;   // nothing recorded: the next dispatch asks again
                     }
                     const auto t0 = std::chrono::steady_clock::now();
+                    const bool on_rt = nxrt::hitch_on_render_thread();
+                    const uint64_t hp0 = on_rt ? nxrt::hitch_ticks() : 0;
                     {
                         NXFT("pipe.compute.wait");
                         g_comp_cv.wait(lk, [&] { return j->state == 2; });
                     }
+                    if (on_rt) nxrt::hitch_phase_add(nxrt::kHpRenderPipeline, nxrt::hitch_ticks() - hp0);
                     ++g_comp_stats.waited;
                     g_comp_stats.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 }
@@ -1347,6 +1411,7 @@ struct PoolCopy {
     bool written = false;                       // every element written once
     uint64_t tex_version = 0, smp_version = 0;  // the registrations it holds
     uint64_t used = 0, used_before = 0;         // serial of the last submission that bound it, and of the one before that
+    uint32_t used_split = 0;                    // earliest Frame::split_seq in `used` that bound it (earlier splits are already on the GPU)
     std::vector<uint32_t> pending;              // texture ids holding the dummy until their texture is in its sampled layout
     std::vector<uint32_t> held;                 // the same for textures whose first upload waits for a later frame (pool_hold): looked at once a frame
 };
@@ -1784,7 +1849,7 @@ VkDescriptorSet pool_set(TexturePool* tp, SamplerPool* sp, Frame& f) {
     pp->last_use = f.serial;
     auto bind = [&](int i) {
         PoolCopy& c = pp->copies[static_cast<size_t>(i)];
-        if (c.used != f.serial) { c.used_before = c.used; c.used = f.serial; }
+        if (c.used != f.serial) { c.used_before = c.used; c.used = f.serial; c.used_split = f.split_seq; }
         pp->cur = i;
         return c.set;
     };
@@ -1793,9 +1858,12 @@ VkDescriptorSet pool_set(TexturePool* tp, SamplerPool* sp, Frame& f) {
         const PoolCopy& c = pp->copies[static_cast<size_t>(pp->cur)];
         if (c.written && c.tex_version == tv && c.smp_version == sv && !pending_ready(c, tp)) return bind(pp->cur);
     }
-    // a set no submission in flight reads: the current one when only this submission has bound it, else the most up to date idle one
+    // a set no submission in flight reads: the current one when only this unsubmitted split part has bound it, else the most up to date idle one
     const uint64_t done = poll_completed();
-    auto idle = [&](const PoolCopy& c) { return (c.used == f.serial ? c.used_before : c.used) <= done; };
+    auto idle = [&](const PoolCopy& c) {
+        if (c.used == f.serial) return c.used_split == f.split_seq && c.used_before <= done;
+        return c.used <= done;
+    };
     int pick = pp->cur >= 0 && idle(pp->copies[static_cast<size_t>(pp->cur)]) ? pp->cur : -1;
     for (size_t i = 0; pick < 0 && i < pp->copies.size(); ++i)
         if (idle(pp->copies[i]) && pp->copies[i].written) pick = static_cast<int>(i);
@@ -1829,13 +1897,35 @@ VkDescriptorSet pool_set(TexturePool* tp, SamplerPool* sp, Frame& f) {
     if (pick < 0) {
         // every set is being read by submissions in flight: wait for the one bound longest ago
         size_t oldest = 0;
-        for (size_t i = 1; i < pp->copies.size(); ++i)
-            if (pp->copies[i].used < pp->copies[oldest].used) oldest = i;
+        for (size_t i = 1; i < pp->copies.size(); ++i) {
+            const PoolCopy& a = pp->copies[i];
+            const PoolCopy& b = pp->copies[oldest];
+            if (a.used < b.used || (a.used == b.used && a.used_split < b.used_split)) oldest = i;
+        }
         static int logged = 0;
         if (logged++ < 10) NXLOG_W(kTag, "pool arrays: all %zu sets of a pool pair are in flight; waiting for submission %llu", pp->copies.size(),
                                    static_cast<unsigned long long>(pp->copies[oldest].used));
         submit_recorded();
-        while (poll_completed() < pp->copies[oldest].used) std::this_thread::yield();
+        if (pp->copies[oldest].used >= f.serial) {
+            // Every copy was bound by earlier split parts of this submission, whose timeline serial has not been signalled yet:
+            // drain the queue so those already-submitted parts finish before reusing their descriptor set.
+            VkResult wr;
+            {
+                std::lock_guard<std::mutex> lk(device().queue_mutex());
+                wr = vkQueueWaitIdle(device().queue());
+            }
+            if (wr != VK_SUCCESS) diag_vk_note(static_cast<int>(wr), "vkQueueWaitIdle (nvn pool_set)", __FILE__, __LINE__);
+            const uint64_t now_done = poll_completed();
+            for (PoolCopy& cp : pp->copies) {
+                if (cp.used == f.serial && cp.used_split < f.split_seq) {
+                    cp.used = now_done;
+                    cp.used_before = now_done;
+                    cp.used_split = 0;
+                }
+            }
+        } else {
+            while (poll_completed() < pp->copies[oldest].used) std::this_thread::yield();
+        }
         pick = static_cast<int>(oldest);
     }
     update_copy(pp->copies[static_cast<size_t>(pick)], tp, sp);
@@ -2145,11 +2235,13 @@ void pipeline_shutdown() {
             if (e.up && e.up->state.load() == 1 && e.up->pipe) vkDestroyPipeline(d, e.up->pipe, nullptr);     // built and never taken
         }
     g_gfx.clear();
+    for (GfxFastSlot& s : g_gfx_fast) s.pipe = VK_NULL_HANDLE;
     g_gfx_keys.sub(g_gfx_keys.get());
     gpl_shutdown();                              // the parts the pipelines were linked from
     for (auto& [k, p] : g_compute)
         if (p) vkDestroyPipeline(d, p, nullptr);
     g_compute.clear();
+    for (CompFastSlot& s : g_comp_fast) s = CompFastSlot();
     for (auto& [k, m] : g_int_samplers)
         if (m) vkDestroyShaderModule(d, m, nullptr);
     g_int_samplers.clear();

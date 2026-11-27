@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>fefw-recomp — Fire Emblem: Fortune's Weave PC Port</title>
+  <meta name="description" content="A native Windows PC port of Fire Emblem: Fortune's Weave (Nintendo Switch 2), made by static recompilation with Vulkan 1.3, 60/120 FPS, ultrawide, HDR, DLSS/FSR 3/XeSS, and Linux/Steam Deck support.">
+  <meta property="og:title" content="fefw-recomp — Fire Emblem: Fortune's Weave PC Port">
+  <meta property="og:description" content="Native PC port of Fire Emblem: Fortune's Weave made by static recompilation. Not an emulator. Requires your own legally dumped copy.">
+  <meta property="og:type" content="website">
+  <meta name="theme-color" content="#14152a">
+  <link rel="icon" type="image/png" href="assets/icon.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="container header-inner">
+      <a href="#top" class="brand" aria-label="fefw-recomp home">
+        <img src="assets/icon.png" alt="" class="brand-icon" width="32" height="32">
+        <span class="brand-name">fefw-recomp</span>
+      </a>
+
+      <button class="nav-toggle" type="button" aria-label="Toggle navigation" aria-expanded="false" aria-controls="primary-nav">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <line x1="4" y1="7" x2="20" y2="7"></line>
+          <line x1="4" y1="12" x2="20" y2="12"></line>
+          <line x1="4" y1="17" x2="20" y2="17"></line>
+        </svg>
+      </button>
+
+      <nav id="primary-nav" class="primary-nav" aria-label="Primary">
+        <a href="#features">Features</a>
+        <a href="#downloads">Downloads</a>
+        <a href="#setup">Setup</a>
+        <a href="#releases">Release Notes</a>
+        <a href="#legal">Legal</a>
+        <a id="nav-github" href="https://github.com/metrist38/fefw-recomp" class="btn btn-sm btn-ghost" target="_blank" rel="noopener noreferrer">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">
+            <path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0 1 12 6.844a9.59 9.59 0 0 1 2.504.337c1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.02 10.02 0 0 0 22 12.017C22 6.484 17.522 2 12 2Z"/>
+          </svg>
+          GitHub
+        </a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="top">
+    <!-- Hero -->
+    <section class="hero">
+      <div class="hero-glow" aria-hidden="true"></div>
+      <div class="container hero-grid">
+        <div class="hero-copy">
+          <div class="eyebrow-row">
+            <span class="pill pill-accent">Static Recompilation</span>
+            <span class="pill pill-gold" id="hero-version-pill">Loading latest release…</span>
+          </div>
+          <h1>Fire Emblem: Fortune's Weave <span class="text-gradient">natively on PC</span></h1>
+          <p class="hero-lead">
+            <strong>fefw-recomp</strong> translates the Nintendo Switch 2 game code into C++ and compiles it into a regular Windows program running on a lightweight Vulkan 1.3 runtime. It is not an emulator.
+          </p>
+          <div class="hero-actions">
+            <a id="hero-primary-download" href="#downloads" class="btn btn-primary btn-lg">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="7 10 12 15 17 10"/>
+                <line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              <span id="hero-primary-label">Download Latest</span>
+            </a>
+            <a href="#handheld-installer" class="btn btn-secondary btn-lg" data-needs-installer hidden>Steam Deck &amp; Handhelds</a>
+            <a href="#releases" class="btn btn-secondary btn-lg">Release Notes</a>
+            <a href="https://recomplauncher.com/game/fefw-recomp" class="btn btn-ghost btn-lg" target="_blank" rel="noopener noreferrer">RecompLauncher</a>
+          </div>
+          <p class="hero-disclaimer">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+            </svg>
+            No game files are included. Requires your own legally dumped copy at update <strong>131072</strong>.
+          </p>
+        </div>
+
+        <div class="hero-card">
+          <div class="hero-card-header">
+            <img src="assets/icon.png" alt="fefw-recomp icon" class="hero-emblem" width="64" height="64">
+            <div>
+              <div class="hero-card-title">At a Glance</div>
+              <div class="hero-card-sub" id="hero-release-meta">Fetching release info…</div>
+            </div>
+          </div>
+          <dl class="spec-list">
+            <div class="spec-row">
+              <dt>Platforms</dt>
+              <dd>Windows 10/11 (x64) &middot; Linux / Steam Deck (Proton)</dd>
+            </div>
+            <div class="spec-row">
+              <dt>Graphics API</dt>
+              <dd>Vulkan 1.3 (HDR, Ultrawide, 60 / 120 FPS)</dd>
+            </div>
+            <div class="spec-row">
+              <dt>Upscaling &amp; FG</dt>
+              <dd>DLSS, AMD FSR 3, Intel XeSS, TAAU, LSFG-VK</dd>
+            </div>
+            <div class="spec-row">
+              <dt>Required Dump</dt>
+              <dd>Decrypted Switch 2 update <code>131072</code> (folder or <code>.nup</code>)</dd>
+            </div>
+            <div class="spec-row">
+              <dt>License</dt>
+              <dd>GPL-3.0 (Open Source)</dd>
+            </div>
+          </dl>
+        </div>
+      </div>
+    </section>
+
+    <!-- Features -->
+    <section id="features" class="section">
+      <div class="container">
+        <div class="section-head">
+          <h2>Built for PC from the ground up</h2>
+          <p>Everything the console game offers, paired with modern display, input, performance, and modding features.</p>
+        </div>
+
+        <div class="features-grid">
+          <article class="card feature-card">
+            <div class="feature-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            </div>
+            <h3>Native Execution</h3>
+            <p>Game code is statically recompiled to native x64 C++ and rendered directly via Vulkan 1.3 — no emulator overhead in between.</p>
+          </article>
+
+          <article class="card feature-card">
+            <div class="feature-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+            </div>
+            <h3>60 / 120 FPS &amp; Ultrawide</h3>
+            <p>Play at 60 or 120 FPS at any output resolution, with native 21:9, 32:9, or wider aspect ratios and a centered 16:9 HUD.</p>
+          </article>
+
+          <article class="card feature-card">
+            <div class="feature-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.8h6.1l-4.9 3.6 1.9 5.8L12 14.6l-5 3.6 1.9-5.8-4.9-3.6h6.1z"/></svg>
+            </div>
+            <h3>DLSS, FSR 3 &amp; XeSS</h3>
+            <p>Built-in TAAU plus optional DLSS, AMD FSR 3, and Intel XeSS upscaling, DLSS &amp; FSR 3 frame generation, and LSFG-VK on Linux.</p>
+          </article>
+
+          <article class="card feature-card">
+            <div class="feature-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+            </div>
+            <h3>True HDR Output</h3>
+            <p>Full HDR presentation with separate brightness controls for the 3D scene and the menus/HUD, plus windowed, borderless, or fullscreen.</p>
+          </article>
+
+          <article class="card feature-card">
+            <div class="feature-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="12" x2="10" y2="12"/><line x1="8" y1="10" x2="8" y2="14"/><line x1="15" y1="13" x2="15.01" y2="13"/><line x1="18" y1="11" x2="18.01" y2="11"/><rect x="2" y="6" width="20" height="12" rx="4"/></svg>
+            </div>
+            <h3>Controllers, Mouse &amp; HD Rumble</h3>
+            <p>Seamless switching between keyboard, native Joy-Con 2 PC mouse mode, and any controller, with DualSense/Pro HD Rumble and Xbox 4-motor rumble.</p>
+          </article>
+
+          <article class="card feature-card">
+            <div class="feature-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+            </div>
+            <h3>Mods, DLC &amp; In-Game Overlay</h3>
+            <p>Supports RomFS mods, exefs <code>.ips</code>/<code>.pchtxt</code> patches, native DLL code mods, your own dumped DLC, all game languages, and an <strong>F1</strong> live overlay.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- Downloads -->
+    <section id="downloads" class="section section-alt">
+      <div class="container">
+        <div class="section-head">
+          <h2>Downloads</h2>
+          <p>Always pulled live from the latest GitHub Release. Extract to its own folder and run the launcher — nothing else to install.</p>
+        </div>
+
+        <div id="download-status" class="status-banner" hidden></div>
+
+        <!-- shown by app.js when the latest release has the installer -->
+        <div id="handheld-installer" class="card handheld-card" data-needs-installer hidden>
+          <div class="handheld-head">
+            <div>
+              <span class="pill pill-gold">Steam Deck &amp; handhelds</span>
+              <h3>One-file installer</h3>
+              <p>In Desktop Mode, download one file and open it. It installs the game, Decky Loader and the fefw-recomp plugin, and adds the game to your Steam library with artwork, asking before each step.</p>
+            </div>
+            <a id="handheld-download" class="btn btn-primary btn-lg" href="https://github.com/metrist38/fefw-recomp/releases/latest">Download Installer</a>
+          </div>
+          <ol class="steps-list">
+            <li><strong>Switch to Desktop Mode</strong> and download <code>fefw-recomp-install.desktop</code>. If your browser saves it ending in <code>.download</code>, remove that ending.</li>
+            <li><strong>Open the file</strong> (choose to run it if asked) and answer its questions.</li>
+            <li><strong>In the launcher</strong> it opens, choose your dump and press <strong>Set up</strong>.</li>
+            <li><strong>Back in Game Mode,</strong> play from your library. The plugin in the Quick Access Menu updates and rebuilds the game and changes its main graphics settings.</li>
+          </ol>
+          <p class="note-text">
+            For SteamOS-style handhelds; the Decky plugin is early. So far tried on CachyOS Handheld, not yet on SteamOS or Bazzite. On Bazzite, install Decky Loader first with <code>ujust setup-decky</code>.
+          </p>
+        </div>
+
+        <div id="downloads-grid" class="downloads-grid">
+          <div class="card download-card skeleton">
+            <div class="skeleton-line w-40"></div>
+            <div class="skeleton-line w-80"></div>
+            <div class="skeleton-line w-60"></div>
+          </div>
+          <div class="card download-card skeleton">
+            <div class="skeleton-line w-40"></div>
+            <div class="skeleton-line w-80"></div>
+            <div class="skeleton-line w-60"></div>
+          </div>
+        </div>
+
+        <div id="extra-assets-wrap" class="extra-assets-wrap" hidden>
+          <details class="details-card">
+            <summary>Other release files &amp; checksums</summary>
+            <ul id="extra-assets-list" class="asset-list"></ul>
+          </details>
+        </div>
+
+        <div class="launcher-callout card">
+          <div class="launcher-callout-copy">
+            <h3>Prefer a unified recomp launcher?</h3>
+            <p>You can also install, configure, and update <strong>fefw-recomp</strong> directly through RecompLauncher.</p>
+          </div>
+          <a href="https://recomplauncher.com/game/fefw-recomp" class="btn btn-secondary" target="_blank" rel="noopener noreferrer">
+            Get it on RecompLauncher
+          </a>
+        </div>
+      </div>
+    </section>
+
+    <!-- Setup & Requirements -->
+    <section id="setup" class="section">
+      <div class="container">
+        <div class="section-head">
+          <h2>Getting Started</h2>
+          <p>The included launcher verifies your dump, compiles the game on your PC, and prepares shaders automatically.</p>
+        </div>
+
+        <div class="setup-grid">
+          <div class="card setup-card">
+            <div class="setup-card-head">
+              <h3>Quick Setup</h3>
+              <div class="tabs" role="tablist" aria-label="Platform instructions">
+                <button type="button" class="tab-btn is-active" role="tab" aria-selected="true" data-tab="windows">Windows</button>
+                <button type="button" class="tab-btn" role="tab" aria-selected="false" data-tab="linux">Linux / Steam Deck</button>
+              </div>
+            </div>
+
+            <div class="tab-panel" data-panel="windows">
+              <ol class="steps-list">
+                <li><strong>Download &amp; extract</strong> <code>fefw-recomp-&lt;version&gt;-win64.zip</code> into its own folder.</li>
+                <li><strong>Run <code>fefw-launcher.exe</code></strong> and open the <strong>Setup</strong> page.</li>
+                <li><strong>Select your dump</strong> (a folder with <code>exefs\</code> &amp; <code>romfs\</code>, a <code>base\</code> + <code>updates\</code> folder, or a <code>.nup</code> package) and click <strong>Set up</strong>. You can pause and resume anytime.</li>
+                <li><strong>Press Play.</strong> Your saves are stored in <code>save\</code> next to the launcher; press <strong>F1</strong> in-game for the settings overlay.</li>
+              </ol>
+              <p class="note-text">
+                <strong>Updating:</strong> Extract the new release to a new folder, copy over your <code>save\</code> (and <code>mods\</code>) folder, and run <strong>Set up</strong> again.
+              </p>
+            </div>
+
+            <div class="tab-panel" data-panel="linux" hidden>
+              <ol class="steps-list">
+                <li><strong>Download &amp; extract</strong> <code>fefw-recomp-&lt;version&gt;-linux-x64.tar.gz</code> and run <code>fefw-launcher.AppImage</code>.</li>
+                <li><strong>Select your dump</strong> on the <strong>Setup</strong> page and click <strong>Set up</strong> to build the game and prepare shaders.</li>
+                <li><strong>Play via Proton:</strong> Play uses Steam Proton, <code>umu-run</code>, or Wine — or click <strong>Add to Steam</strong> on the Play page to launch from Steam (including Steam Deck Game Mode).</li>
+                <li><strong>Frame Generation:</strong> Install <strong>LSFG-VK</strong> from <strong>Settings &gt; Frame rate</strong> (requires Lossless Scaling on Steam).</li>
+              </ol>
+              <p class="note-text" data-needs-installer hidden>
+                <strong>On a handheld?</strong> The <a href="#handheld-installer">one-file installer</a> does these steps for you and adds updating from Game Mode.
+              </p>
+              <p class="note-text">
+                <strong>Steam Deck tip:</strong> After updating to a new release, run <strong>Set up</strong> in Desktop Mode (without the Decky plugin) before launching from Game Mode.
+              </p>
+            </div>
+          </div>
+
+          <div class="card reqs-card">
+            <h3>System Requirements</h3>
+            <ul class="reqs-list">
+              <li>
+                <span class="req-label">OS</span>
+                <span>Windows 10 / 11 (64-bit), or Linux / SteamOS with Proton</span>
+              </li>
+              <li>
+                <span class="req-label">CPU</span>
+                <span>64-bit x86 CPU with SSE4.2 &amp; POPCNT (FMA3 / Haswell+ or Piledriver+ recommended for the faster build)</span>
+              </li>
+              <li>
+                <span class="req-label">GPU</span>
+                <span>Vulkan 1.3 capable GPU with an up-to-date driver</span>
+              </li>
+              <li>
+                <span class="req-label">Memory &amp; Storage</span>
+                <span>16 GB RAM and ~30 GB free disk space</span>
+              </li>
+              <li>
+                <span class="req-label">Game Files</span>
+                <span>Your own decrypted dump of <em>Fire Emblem: Fortune's Weave</em> at update <strong>131072</strong></span>
+              </li>
+            </ul>
+            <div class="reqs-links">
+              <a id="link-config-docs" href="https://github.com/metrist38/fefw-recomp/blob/master/runtime/docs/CONFIG.md" target="_blank" rel="noopener noreferrer">Configuration Reference &rarr;</a>
+              <a id="link-building-docs" href="https://github.com/metrist38/fefw-recomp/blob/master/docs/BUILDING.md" target="_blank" rel="noopener noreferrer">Building from Source &rarr;</a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Release Notes -->
+    <section id="releases" class="section section-alt">
+      <div class="container">
+        <div class="section-head section-head-row">
+          <div>
+            <h2>Release Notes</h2>
+            <p>Fetched directly from GitHub Releases.</p>
+          </div>
+          <a id="all-releases-link" href="https://github.com/metrist38/fefw-recomp/releases" class="btn btn-ghost btn-sm" target="_blank" rel="noopener noreferrer">
+            All releases on GitHub &rarr;
+          </a>
+        </div>
+
+        <div id="latest-release-notes" class="card release-featured">
+          <div class="skeleton-line w-40"></div>
+          <div class="skeleton-line w-80"></div>
+          <div class="skeleton-line w-70"></div>
+          <div class="skeleton-line w-60"></div>
+        </div>
+
+        <div id="older-releases-wrap" class="older-releases-wrap" hidden>
+          <h3 class="subsection-title">Previous Releases</h3>
+          <div id="older-releases-list" class="older-releases-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Legal -->
+    <section id="legal" class="section">
+      <div class="container">
+        <div class="card legal-card">
+          <h2>Legal &amp; Disclaimer</h2>
+          <p>
+            <strong>Fire Emblem</strong>, <strong>Fire Emblem: Fortune's Weave</strong>, <strong>Nintendo</strong>, and <strong>Nintendo Switch 2</strong> are trademarks of Nintendo. They are used solely to identify which game this software works with. This project is not affiliated with, sponsored by, or endorsed by Nintendo or Intelligent Systems.
+          </p>
+          <p>
+            This project contains only original code and third-party open-source code under free licences (GPL-3.0 and compatible). It contains <strong>no game code, game data, decryption keys, firmware, or proprietary upscaler DLLs</strong>. To use it, you must supply your own game files dumped from a copy you legally own.
+          </p>
+          <p>
+            Optional upscaler libraries (DLSS, FSR 3, XeSS) are never hosted or mirrored here; when requested in the launcher, they are downloaded directly from NVIDIA's, AMD's, and Intel's official GitHub repositories under their respective licence terms.
+          </p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <div class="footer-brand">
+        <img src="assets/icon.png" alt="" width="24" height="24">
+        <span>fefw-recomp &middot; Released under GPL-3.0</span>
+      </div>
+      <div class="footer-links">
+        <a id="footer-repo" href="https://github.com/metrist38/fefw-recomp" target="_blank" rel="noopener noreferrer">Repository</a>
+        <a id="footer-issues" href="https://github.com/metrist38/fefw-recomp/issues" target="_blank" rel="noopener noreferrer">Report an Issue</a>
+        <a id="footer-legal" href="https://github.com/metrist38/fefw-recomp/blob/master/LEGAL.md" target="_blank" rel="noopener noreferrer">LEGAL.md</a>
+        <a id="footer-license" href="https://github.com/metrist38/fefw-recomp/blob/master/LICENSE" target="_blank" rel="noopener noreferrer">License</a>
+      </div>
+    </div>
+  </footer>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

@@ -7,6 +7,7 @@
 #include <vector>
 
 struct NxModFile;    // nxrt/mod_api.h
+struct NxModApi;     // nxrt/mod_api.h
 
 namespace nxrt::services {
 
@@ -60,6 +61,9 @@ uint32_t display_vsync_handle();
 
 // ---- code mods (mods_dll.cpp, nxrt/mod_api.h) ------------------------------------------------------------------------------------
 namespace modapi {
+// The table a code mod is given (version 6, every function pointer): what load_dll_mods passes to nxmod_init and nxmod_early.
+// main_base is main's guest address. Exposed so tests can build the loader's exact table without a game running.
+void make_mod_api(::NxModApi* api, uint64_t main_base);
 // Loads the exefs/*.dll of the installed mods and calls their nxmod_init (once; later calls do nothing). base = main's guest address,
 // frame_update = the game's frame boundary relative to base (GamePlay::frame_update; 0 = no frame calls). Play mode start, main thread.
 void load_dll_mods(uint64_t base, uint64_t frame_update);
@@ -80,7 +84,14 @@ bool file_edit_wanted(const std::string& image_path);
 // Hook sites (a mod's exefs/*.sites, built in by Set up): how many sites the mod in mod_dir lists for this game build that the running
 // fefw.exe was not lifted with (0 = all there); -1 when the build's own list (<exe>.sites) is unknown. Any thread.
 int sites_missing(const std::string& mod_dir);
-// What the overlay shows on screen at start about code mods (installed mods whose sites are missing): lines, "" for nothing.
+// Result of checking a mod's exefs/*.sites against a lifted site list file (exposed so unit tests can exercise the filter).
+struct ModSiteCheck {
+    int missing = -1;                  // known-kind sites absent from the lifted list (-1 if the lifted list could not be read)
+    std::vector<std::string> unknown;  // sorted, unique site kinds this port does not support (skipped with a warning)
+};
+ModSiteCheck check_mod_sites(const std::string& mod_dir, const std::string& lifted_sites_file);
+// What the overlay shows on screen at start about code mods (installed mods whose sites are missing or use unknown site kinds):
+// lines, "" for nothing.
 std::string notice();
 bool file_edit_run(const std::string& image_path, std::vector<uint8_t>& data);
 // A file edit of the runtime or the game module itself (not a mod), with the same NxModFile interface: match gets the image path in lower

@@ -14,10 +14,16 @@
 //   Xbox One / Series     -> the four motors (two grips, two triggers) from the library's converter, through SDL's rumble calls
 //   anything else         -> the standard rumble, which play.cpp keeps sending itself (legacy_rumble() stays true)
 //
+// With [pad] hd_haptics on (the default), a DualSense also gets the library's HD Haptics: taps on the controller speaker.
+// (The library also deepens heavy hits, but only for low-band rumble from 0.30 up; the battles measured so far peaked at
+// 0.25.) On a cable the speaker is audio channel 1, routed there by an effects report sent through SDL;
+// wireless, it travels in the 398-byte report 0x36, which then replaces 0x32. The adaptive triggers are left alone: this
+// game uses L2 / R2 for menus, where a kick would never be felt.
+//
 // Threading. Five threads reach this file:
 //   the game's thread      push(), every frame (via play.cpp's vibration sink)
 //   the 1 ms worker        ticks the engines, sends the packets and motor values, runs the watchdog and the test pattern
-//   the Bluetooth writer   only for a wireless DualSense: builds and writes report 0x32 on its own 10.67 ms clock
+//   the Bluetooth writer   only for a wireless DualSense: builds and writes report 0x32 / 0x36 on its own 10.67 ms clock
 //   SDL's audio thread     audio_callback(), which asks the DSP for haptic samples
 //   the main thread        configure(), pad_added(), pad_removed(), shutdown(), status()
 //
@@ -52,16 +58,17 @@
 #include "nxrt/input_source.h"
 #include "nxrt/log.h"
 #include "nxrt/platform.h"
+#include "pad_volume.h"
 
 namespace nxrt::gfx::haptic {
 namespace {
 
 constexpr const char* kTag = "haptic";
 
-// The library's own constants (renhdrum.h v0.4.0, kept in third_party/renhdrum). The header is not included: these are the
-// ABI-stable parts we call. renhdrum_version() must be on the same major.minor branch (0x0004xx) before anything is created;
+// The library's own constants (renhdrum.h v0.6.0, kept in third_party/renhdrum). The header is not included: these are the
+// ABI-stable parts we call. renhdrum_version() must be on the same major.minor branch (0x0006xx) before anything is created;
 // a patch release of that branch keeps the ABI and is accepted.
-constexpr uint32_t kExpectedVersion = 0x000400;
+constexpr uint32_t kExpectedVersion = 0x000600;
 constexpr int64_t kStaleUs = 250000;                 // silence watchdog: no new value for this long -> neutral sample
 constexpr uint64_t kEnumPeriodNs = 2000000000ull;    // the DualSense audio endpoint takes 1-2 s to appear after the cable
 constexpr int kSendFailuresBeforeFallback = 3;       // SDL refusing the packets this many times drops back to the rumble
@@ -72,6 +79,9 @@ constexpr uint64_t kDsBtPeriodNs = 10666666ull;      // RENHDRUM_DS5_BT_PERIOD_N
 constexpr uint8_t kDsBtBufferLength = 0xFF;          // RENHDRUM_DS5_BT_BUFFER_LENGTH_DEFAULT
 constexpr uint64_t kDsBtIdleNs = 2000000000ull;      // stop writing this long after the last vibration: the radio rests
 constexpr int kDsBtFailuresMax = 50;                 // consecutive failed writes (about half a second) -> standard rumble
+constexpr size_t kDsBt36ReportSize = 398;            // RENHDRUM_DS5_BT36_REPORT_SIZE
+constexpr size_t kDsEffectsSize = 47;                // RENHDRUM_DS5_EFFECTS_SIZE: SDL's DualSense effects block
+constexpr int32_t kDsSpeakerPercent = 100;           // the library suggests 60: too quiet with this game's gentle rumble
 constexpr uint32_t kXboxGripMs = 2000;               // the grips: longer than a tick, the converter re-sends well before
 constexpr uint32_t kXboxTriggerMs = 200;             // the triggers: short, so a lost stop cannot leave them buzzing
 constexpr int64_t kXboxRetryUs = 100000;             // a refused Xbox send is retried at most this often
@@ -109,6 +119,8 @@ struct Api {
     bool ok = false;
     bool has_ds = false;       // DualSense DSP (wired audio, and the base of the wireless path)
     bool has_ds_bt = false;    // DualSense report 0x32
+    bool has_ds_hd = false;    // DualSense HD haptics: the controller speaker
+    bool has_ds_bt36 = false;  // ... and report 0x36, which carries it wirelessly
     bool has_xbox = false;     // Xbox four-motor converter
     HMODULE dll = nullptr;
     uint32_t (*version)() = nullptr;
@@ -124,6 +136,9 @@ struct Api {
     int32_t (*dsp_set_half)(RenDsDsp*, bool, float, float, float, float) = nullptr;
     int32_t (*dsp_fill)(RenDsDsp*, float*, size_t) = nullptr;
     int32_t (*dsp_bt_report)(RenDsDsp*, uint8_t, uint8_t*) = nullptr;
+    int32_t (*dsp_set_speaker)(RenDsDsp*, int32_t) = nullptr;
+    int32_t (*dsp_bt36_report)(RenDsDsp*, const uint8_t*, uint8_t, uint8_t*) = nullptr;
+    int32_t (*speaker_block)(int32_t, uint8_t*) = nullptr;
     RenXbox* (*xb_create)(bool) = nullptr;
     void (*xb_destroy)(RenXbox*) = nullptr;
     int32_t (*xb_push)(RenXbox*, int64_t, bool, float, float, float, float) = nullptr;
@@ -224,6 +239,9 @@ bool load_api() {
                bind(a.dll, "renhdrum_dualsense_dsp_set_half_target", &a.dsp_set_half) &&
                bind(a.dll, "renhdrum_dualsense_dsp_fill_f32", &a.dsp_fill);
     a.has_ds_bt = a.has_ds && bind(a.dll, "renhdrum_dualsense_dsp_build_bt_report", &a.dsp_bt_report);
+    a.has_ds_hd = a.has_ds && bind(a.dll, "renhdrum_dualsense_dsp_set_speaker", &a.dsp_set_speaker) &&
+                  bind(a.dll, "renhdrum_hd_haptics_speaker_block", &a.speaker_block);
+    a.has_ds_bt36 = a.has_ds_hd && bind(a.dll, "renhdrum_dualsense_dsp_build_bt36_report", &a.dsp_bt36_report);
     a.has_xbox = bind(a.dll, "renhdrum_xbox_rumble_create", &a.xb_create) &&
                  bind(a.dll, "renhdrum_xbox_rumble_destroy", &a.xb_destroy) &&
                  bind(a.dll, "renhdrum_xbox_rumble_push_half_sample", &a.xb_push) &&
@@ -250,6 +268,8 @@ std::atomic<Backend> g_backend{Backend::None};
 std::atomic<bool> g_running{false};       // a backend is really driving the pad right now
 std::atomic<uint32_t> g_pad_id{0};        // g_pad.id, readable without g_host_mu: legacy_rumble() runs on the game's thread
 std::atomic<bool> g_rumble_on{true};      // [pad] rumble: the master switch, and it covers every output path
+std::atomic<bool> g_hd_wanted{false};     // [pad] hd_haptics
+std::atomic<bool> g_full_volume{false};   // [pad] dualsense_full_volume
 std::atomic<uint64_t> g_next_enum_ns{0};  // next DualSense audio endpoint scan
 std::atomic<float> g_last_amp{0.f};
 std::atomic<uint64_t> g_pushes{0};
@@ -295,6 +315,11 @@ uint8_t g_last_pkt[10] = {};              // the last packet sent to it
 bool g_last_pkt_live = false;             // ... and it was not silence
 int64_t g_last_send_us = 0;
 
+// DualSense HD haptics on a cable: an effects report routed the pad's sound to its speaker. Belongs to whoever drives the
+// pad (the worker while it runs, else the main thread with g_life_mu held).
+bool g_hd_speaker = false;
+bool g_bt36 = false;                      // the writer sends report 0x36; set before it starts
+
 // The wireless DualSense writer. The handle is opened by attach() before the thread starts, used by that thread only, and
 // closed by detach() after joining it, so it needs no lock of its own.
 SDL_hid_device* g_hid = nullptr;
@@ -326,6 +351,23 @@ float strength_scale() {
 }
 
 int64_t now_us() { return static_cast<int64_t>(SDL_GetTicksNS() / 1000); }
+
+// ---- DualSense speaker ------------------------------------------------------------------------------------------------------
+
+// Routes the wired pad's channel 1 to its speaker, or back. SDL adds the report framing; g_host_mu is held as in
+// send_packet().
+bool send_speaker_route(bool on) {
+    uint8_t block[kDsEffectsSize];
+    if (api().speaker_block(on ? 1 : 0, block) != 0) return false;
+    std::lock_guard<std::mutex> lk(g_host_mu);
+    return g_pad.joy && SDL_SendJoystickEffect(g_pad.joy, block, static_cast<int>(kDsEffectsSize));
+}
+
+// The pad keeps the route until told otherwise, so every way of leaving the wired haptics comes through here.
+void release_speaker() {
+    if (g_hd_speaker) send_speaker_route(false);
+    g_hd_speaker = false;
+}
 
 // ---- DualSense audio --------------------------------------------------------------------------------------------------------
 
@@ -412,6 +454,8 @@ bool open_dualsense_audio() {
         note("the DualSense haptics engine did not start: standard rumble in use");
         return false;
     }
+    const bool hd = g_hd_wanted.load(std::memory_order_relaxed) && api().has_ds_hd;
+    if (hd) api().dsp_set_speaker(dsp, kDsSpeakerPercent);
     {
         std::lock_guard<std::mutex> lk(g_eng_mu);
         g_dsp = dsp;
@@ -424,14 +468,20 @@ bool open_dualsense_audio() {
         if (g_pad.joy) SDL_RumbleJoystick(g_pad.joy, 0, 0, 0);
     }
     SDL_ResumeAudioStreamDevice(stream);
+    if (g_full_volume.load(std::memory_order_relaxed)) pad_volume::raise(SDL_GetAudioDeviceName(dev));
     {
         std::lock_guard<std::mutex> lk(g_audio_mu);
         g_stream = stream;
         g_dev = dev;
     }
     g_running.store(true, std::memory_order_relaxed);
-    note("4-channel 48 kHz audio on the wire");
-    NXLOG_I(kTag, "DualSense haptics on the wired pad: 4-channel 48 kHz audio, %s", SDL_GetAudioDeviceName(dev));
+    if (hd) {
+        g_hd_speaker = send_speaker_route(true);
+        if (!g_hd_speaker) NXLOG_W(kTag, "the DualSense did not take the speaker report: %s", SDL_GetError());
+    }
+    note(hd ? "4-channel 48 kHz audio on the wire, with speaker" : "4-channel 48 kHz audio on the wire");
+    NXLOG_I(kTag, "DualSense haptics on the wired pad: 4-channel 48 kHz audio, HD haptics %s, %s", hd ? "on" : "off",
+            SDL_GetAudioDeviceName(dev));
     return true;
 }
 
@@ -444,6 +494,7 @@ void close_dualsense_audio() {
         g_dev = 0;
     }
     if (stream) SDL_DestroyAudioStream(stream);   // waits for the callback to return, so g_eng_mu is not held here
+    pad_volume::restore();                         // nothing to do unless the cable path raised it
     {
         std::lock_guard<std::mutex> lk(g_eng_mu);
         if (g_dsp) {
@@ -505,10 +556,12 @@ void drop_to_rumble(const char* why) {
     NXLOG_W(kTag, "%s", why);
 }
 
-// The wireless DualSense: one report 0x32 every 10.67 ms on its own precise clock (the 1 ms worker's sleep would jitter the
-// audio the report carries). It writes while something is playing and for two seconds after, then leaves the radio quiet.
+// The wireless DualSense: one report (0x32, or 0x36 with HD haptics) every 10.67 ms on its own precise clock (the 1 ms
+// worker's sleep would jitter the audio the report carries). It writes while something is playing and for two seconds after,
+// then leaves the radio quiet.
 int bt_writer(void*) {
-    uint8_t report[kDsBtReportSize];
+    uint8_t report[kDsBt36ReportSize];
+    const size_t size = g_bt36 ? kDsBt36ReportSize : kDsBtReportSize;
     uint64_t next = SDL_GetTicksNS();
     uint64_t last_signal = 0;
     int fails = 0;
@@ -517,12 +570,19 @@ int bt_writer(void*) {
         int r = -1;
         {
             std::lock_guard<std::mutex> lk(g_eng_mu);
-            if (g_dsp) r = api().dsp_bt_report(g_dsp, kDsBtBufferLength, report);
+            if (g_dsp && g_bt36) {
+                r = api().dsp_bt36_report(g_dsp, nullptr, 0, report);   // no effects block: the triggers stay as they are
+            } else if (g_dsp) {
+                r = api().dsp_bt_report(g_dsp, kDsBtBufferLength, report);
+            }
         }
         const uint64_t now = SDL_GetTicksNS();
         if (r == 1) last_signal = now;
-        if (r >= 0 && last_signal && now - last_signal < kDsBtIdleNs) {
-            if (SDL_hid_write(g_hid, report, sizeof(report)) < 0) {
+        // 0x36: the library says when a report is due (it keeps its own two second tail). 0x32: it says whether this one
+        // carries vibration, and the tail is kept here.
+        const bool due = g_bt36 ? r == 1 : r >= 0 && last_signal && now - last_signal < kDsBtIdleNs;
+        if (due) {
+            if (SDL_hid_write(g_hid, report, size) < 0) {
                 if (++fails >= kDsBtFailuresMax) {
                     drop_to_rumble("the DualSense stopped taking the Bluetooth haptics: the standard rumble is in use again");
                     break;
@@ -605,6 +665,7 @@ int worker(void*) {
                 if (g_running.load(std::memory_order_relaxed)) {
                     close_dualsense_audio();
                     g_running.store(false, std::memory_order_relaxed);
+                    release_speaker();   // before the rescan below can open the endpoint again
                     note("the DualSense audio endpoint went away: the standard rumble is in use again");
                     NXLOG_W(kTag, "the DualSense audio endpoint went away: the standard rumble is in use until it is back");
                 }
@@ -713,6 +774,8 @@ bool start_dualsense_bt(const PadState& pad) {
         note("the DualSense haptics engine did not start: standard rumble in use");
         return false;
     }
+    g_bt36 = g_hd_wanted.load(std::memory_order_relaxed) && api().has_ds_bt36;
+    if (g_bt36) api().dsp_set_speaker(dsp, kDsSpeakerPercent);
     {
         std::lock_guard<std::mutex> lk(g_eng_mu);
         g_dsp = dsp;
@@ -728,7 +791,7 @@ bool start_dualsense_bt(const PadState& pad) {
     // not be overwritten here afterwards.
     g_backend.store(Backend::DualSenseBt, std::memory_order_relaxed);
     g_running.store(true, std::memory_order_relaxed);
-    note("report 0x32 over Bluetooth");
+    note(g_bt36 ? "report 0x36 over Bluetooth, with speaker" : "report 0x32 over Bluetooth");
     g_hid = hid;
     g_bt_run.store(true, std::memory_order_relaxed);
     g_bt_thread = SDL_CreateThread(bt_writer, "nxrt_haptic_bt", nullptr);
@@ -740,7 +803,8 @@ bool start_dualsense_bt(const PadState& pad) {
         note("the haptics thread did not start: standard rumble in use");
         return false;
     }
-    NXLOG_I(kTag, "DualSense haptics on the wireless pad: report 0x32 every %.2f ms", static_cast<double>(kDsBtPeriodNs) / 1e6);
+    NXLOG_I(kTag, "DualSense haptics on the wireless pad: report %s every %.2f ms", g_bt36 ? "0x36" : "0x32",
+            static_cast<double>(kDsBtPeriodNs) / 1e6);
     return true;
 }
 
@@ -749,6 +813,8 @@ void detach() {
     const Backend was = g_backend.load(std::memory_order_relaxed);
     stop_worker();
     stop_bt_writer();
+    release_speaker();   // both threads are stopped, and the joystick is still open
+    g_bt36 = false;
     close_dualsense_audio();
     RenXbox* xbox = nullptr;
     {
@@ -816,8 +882,7 @@ void attach() {
         NXLOG_I(kTag, "pad \"%s\": mode %s -> backend %s%s%s", pad.name, mode_name(mode), backend_name(Backend::None), "; ", g_detail);
         return;
     }
-    const bool want_ds = mode == Mode::Auto || mode == Mode::DualSense;
-    if (pad.dualsense && want_ds) {
+    if (pad.dualsense) {
         if (!api().has_ds) {
             note("this renhdrum.dll has no DualSense haptics: standard rumble in use");
         } else if (pad.bt) {
@@ -895,8 +960,6 @@ void attach() {
                 note(pad.wired ? "four motors (grips and triggers), on the wire" : "four motors (grips and triggers), wireless");
             }
         }
-    } else if (pad.dualsense) {
-        note("DualSense haptics are off: standard rumble in use");
     } else {
         note("%s has no haptic backend here: standard rumble in use", pad.name);
     }
@@ -937,7 +1000,43 @@ bool is_pro(const uint16_t vendor, const uint16_t product) {
     return vendor == 0x057E && (product == 0x2006 || product == 0x2007 || product == 0x2009);
 }
 
+// SDL learns the transport from the system's description of the device. Wine does not describe a Bluetooth device as one, so
+// SDL calls a wireless DualSense wired there, and the haptics would go to the audio endpoint of a cable that is not plugged
+// in. The pad's own report descriptor still tells.
+bool dualsense_on_bluetooth(SDL_Joystick* joy) {
+    const char* path = SDL_GetJoystickPath(joy);
+    SDL_hid_device* d = path && *path ? SDL_hid_open_path(path) : nullptr;
+    if (!d) return false;
+    uint8_t desc[4096];
+    const int n = SDL_hid_get_report_descriptor(d, desc, sizeof(desc));
+    SDL_hid_close(d);
+    return n > 0 && dualsense_descriptor_is_bluetooth(desc, static_cast<size_t>(n));
+}
+
 }  // namespace
+
+bool dualsense_descriptor_is_bluetooth(const uint8_t* desc, size_t size) {
+    // HID short items: a prefix byte (size, type, tag), then 0, 1, 2 or 4 bytes of value. Long items (0xFE) carry their size.
+    uint32_t report_id = 0;
+    for (size_t i = 0; desc && i < size;) {
+        const uint8_t prefix = desc[i];
+        if (prefix == 0xFE) {
+            if (i + 1 >= size) break;
+            i += 3u + desc[i + 1];
+            continue;
+        }
+        const size_t len = (prefix & 3) == 3 ? 4 : prefix & 3;
+        if (i + 1 + len > size) break;
+        if ((prefix & 0xFC) == 0x84) {          // global item Report ID
+            report_id = 0;
+            for (size_t k = 0; k < len; ++k) report_id |= static_cast<uint32_t>(desc[i + 1 + k]) << (8 * k);
+        } else if ((prefix & 0xFC) == 0x90 && report_id == 0x31) {   // main item Output, in the Bluetooth state report
+            return true;
+        }
+        i += 1 + len;
+    }
+    return false;
+}
 
 const char* backend_name(Backend b) {
     switch (b) {
@@ -950,14 +1049,17 @@ const char* backend_name(Backend b) {
     }
 }
 
-void configure(Mode m, int strength_percent, double rumble_scale, bool rumble_on) {
+void configure(Mode m, int strength_percent, double rumble_scale, bool rumble_on, bool hd_haptics, bool full_volume) {
     const int strength = std::clamp(strength_percent, -1, 100);
     const float scale = static_cast<float>(std::clamp(static_cast<float>(rumble_scale), 0.f, 2.f));
     std::lock_guard<std::mutex> lk(g_life_mu);
     const bool was_on = g_rumble_on.exchange(rumble_on, std::memory_order_relaxed);
-    // Only a different mode or a different master switch changes what drives the pad. The strength and the scale are read by
-    // push() on the next value, so moving the slider must not touch the audio stream.
-    const bool changed = m != g_mode.load(std::memory_order_relaxed) || was_on != rumble_on;
+    const bool was_hd = g_hd_wanted.exchange(hd_haptics, std::memory_order_relaxed);
+    const bool was_full = g_full_volume.exchange(full_volume, std::memory_order_relaxed);
+    // Only a different mode or a different switch changes what drives the pad. The strength and the scale are read by push()
+    // on the next value, so moving the slider must not touch the audio stream.
+    const bool changed =
+        m != g_mode.load(std::memory_order_relaxed) || was_on != rumble_on || was_hd != hd_haptics || was_full != full_volume;
     g_mode.store(m, std::memory_order_relaxed);
     g_strength.store(strength, std::memory_order_relaxed);
     g_scale.store(scale, std::memory_order_relaxed);
@@ -988,6 +1090,10 @@ void pad_added(uint32_t instance_id) {
     // Third-party XInput pads may report another gamepad type, so Microsoft's vendor id counts as well.
     const bool xbox = SDL_GetGamepadTypeForID(static_cast<SDL_JoystickID>(instance_id)) == SDL_GAMEPAD_TYPE_XBOXONE ||
                       vendor == 0x045E;
+    const bool dualsense = is_dualsense(name, vendor, product);
+    const bool ds_bt = dualsense && conn != SDL_JOYSTICK_CONNECTION_WIRELESS && dualsense_on_bluetooth(joy);
+    if (ds_bt)
+        NXLOG_I(kTag, "pad \"%s\": SDL does not report it as wireless, but its reports are Bluetooth's", name ? name : "controller");
     std::lock_guard<std::mutex> lk(g_life_mu);
     {
         std::lock_guard<std::mutex> hl(g_host_mu);
@@ -1000,11 +1106,11 @@ void pad_added(uint32_t instance_id) {
         g_pad_id.store(instance_id, std::memory_order_relaxed);
         g_pad.joy = joy;
         g_pad.product = product;
-        g_pad.dualsense = is_dualsense(name, vendor, product);
+        g_pad.dualsense = dualsense;
         g_pad.pro = is_pro(vendor, product);
         g_pad.xbox = xbox && !g_pad.dualsense && !g_pad.pro;
-        g_pad.bt = conn == SDL_JOYSTICK_CONNECTION_WIRELESS;
-        g_pad.wired = conn == SDL_JOYSTICK_CONNECTION_WIRED;
+        g_pad.bt = ds_bt || conn == SDL_JOYSTICK_CONNECTION_WIRELESS;
+        g_pad.wired = !ds_bt && conn == SDL_JOYSTICK_CONNECTION_WIRED;
         g_pad.rumble = rumble;
         std::snprintf(g_pad.name, sizeof(g_pad.name), "%s", name ? name : "controller");
     }
@@ -1081,6 +1187,15 @@ bool test_start() {
     }
     g_test_until_ns.store(SDL_GetTicksNS() + 400000000ull, std::memory_order_relaxed);   // 0.4 s, shorter than a watchdog
     return true;
+}
+
+void release_for_exit() {
+    std::lock_guard<std::mutex> lk(g_life_mu);
+    // only a wired DualSense keeps anything: the speaker route of HD haptics, and a raised volume
+    const bool speaker = g_backend.load(std::memory_order_relaxed) == Backend::DualSenseUsb && g_hd_wanted.load(std::memory_order_relaxed);
+    if (!speaker && !pad_volume::raised()) return;
+    detach();
+    SDL_Delay(50);   // SDL writes effects reports on its own thread: give it time before the process goes
 }
 
 void shutdown() {

@@ -2,8 +2,10 @@
 // The ImGui overlay: toggle key through the input queue, which events it consumes, relative mouse released while it is shown and
 // restored when hidden, extra panels, the configured toggle key.
 #include <SDL3/SDL.h>
+#include <imgui.h>
 
 #include "gfx_test_util.h"
+#include "nxrt/mod_panels.h"
 #include "nxrt/overlay.h"
 NXTEST_GROUP(gfx_overlay)
 
@@ -230,4 +232,108 @@ NXTEST(menu_changes_are_applied_between_frames) {
     o.apply_pending();   // nothing pending: nothing happens
     CHECK_EQ(rig.rend->stats().swapchain_creates, creates);
     CHECK_EQ(rig.dev->validation_stats().errors, 0ull);
+}
+
+NXTEST(mod_panels_are_drawn_and_unclosed_widgets_are_closed) {
+    namespace modapi = nxrt::services::modapi;
+    static int runs, ticked;
+    runs = 0;
+    ticked = 1;
+    const auto fn = [](const NxModUi* ui, void*) {
+        ++runs;
+        ui->text("a panel");
+        ui->checkbox("a box", &ticked);
+        ui->end_disabled();             // nothing open: ignored
+        ui->tree_pop();
+        ui->begin_disabled(1);          // left open, both: draw_mod_panels closes them, or ImGui asserts at the end of the frame
+        ui->tree_node("a node", 1);
+    };
+    REQUIRE(modapi::add_panel("gfx test panel", fn, nullptr) == 1);
+    Rig rig;
+    REQUIRE(rig.make(false));
+    Overlay& o = *rig.overlay;
+    o.add_panel("mods", [] { draw_mod_panels(); });
+    rig.frame();
+    CHECK_EQ(runs, 0);
+    CHECK_EQ(modapi::panel_visible(), 0);
+    o.set_visible(true);
+    for (int i = 0; i < 3; ++i) rig.frame();
+    CHECK(runs > 0);
+    CHECK_EQ(modapi::panel_visible(), 1);
+    o.set_visible(false);
+    CHECK_EQ(modapi::panel_visible(), 0);
+}
+
+NXTEST(mod_panel_sliders_clamp_typed_values) {
+    // Ctrl+click turns a slider into a text box; a mod may use the value as an index, so what is typed stays within min..max.
+    namespace modapi = nxrt::services::modapi;
+    static int target, step, whole;
+    static float real;
+    target = -1;
+    whole = 3;
+    real = 0.5f;
+    const auto fn = [](const NxModUi* ui, void*) {
+        if (target < 0) return;
+        ImVec2 at;
+        ui->slider_int("whole", &whole, 0, 7, nullptr);
+        if (target == 0) at = ImGui::GetItemRectMin();
+        ui->slider_float("real", &real, 0.f, 1.f, nullptr);
+        if (target == 1) at = ImGui::GetItemRectMin();
+        ImGuiIO& io = ImGui::GetIO();
+        switch (step++) {             // a few frames apart: ImGui takes queued input one change per frame
+            case 4: io.AddMousePosEvent(at.x + 10.f, at.y + ImGui::GetFrameHeight() * 0.5f); io.AddKeyEvent(ImGuiMod_Ctrl, true); break;
+            case 8: io.AddMouseButtonEvent(0, true); break;
+            case 12: io.AddMouseButtonEvent(0, false); io.AddKeyEvent(ImGuiMod_Ctrl, false); break;
+            case 16: io.AddInputCharactersUTF8("999"); break;
+            case 24: io.AddKeyEvent(ImGuiKey_Enter, true); break;
+            case 28: io.AddKeyEvent(ImGuiKey_Enter, false); break;
+            default: break;
+        }
+    };
+    REQUIRE(modapi::add_panel("gfx slider panel", fn, nullptr) == 1);
+    Rig rig;
+    REQUIRE(rig.make(false));
+    Overlay& o = *rig.overlay;
+    o.add_panel("mods", [] { draw_mod_panels(); });
+    o.set_visible(true);
+    for (int slider = 0; slider < 2; ++slider) {
+        target = slider;
+        step = 0;
+        for (int i = 0; i < 40; ++i) rig.frame();
+    }
+    target = -1;
+    std::printf("    typed 999: int slider 0..7 gave %d, float slider 0..1 gave %.2f\n", whole, real);
+    CHECK_EQ(whole, 7);
+    CHECK(real == 1.f);
+}
+
+NXTEST(mod_panel_ending_in_same_line_does_not_move_the_next_one) {
+    namespace modapi = nxrt::services::modapi;
+    static bool active;
+    static float button_bottom, next_top, frame_h;
+    active = true;
+    button_bottom = next_top = frame_h = 0.f;
+    const auto first = [](const NxModUi* ui, void*) {
+        if (!active) return;
+        ui->button("last widget");
+        button_bottom = ImGui::GetItemRectMax().y;
+        ui->same_line();
+    };
+    const auto second = [](const NxModUi*, void*) {
+        if (!active) return;
+        next_top = ImGui::GetCursorScreenPos().y;
+        frame_h = ImGui::GetFrameHeight();
+    };
+    REQUIRE(modapi::add_panel("gfx same line panel", first, nullptr) == 1);
+    REQUIRE(modapi::add_panel("gfx following panel", second, nullptr) == 1);
+    Rig rig;
+    REQUIRE(rig.make(false));
+    Overlay& o = *rig.overlay;
+    o.add_panel("mods", [] { draw_mod_panels(); });
+    o.set_visible(true);
+    for (int i = 0; i < 4; ++i) rig.frame();
+    active = false;
+    std::printf("    button ends at %.0f, the next panel's contents start at %.0f (a header is %.0f high)\n", button_bottom, next_top, frame_h);
+    REQUIRE(frame_h > 0.f);
+    CHECK(next_top >= button_bottom + frame_h);   // the next header is on a line of its own, below the button
 }

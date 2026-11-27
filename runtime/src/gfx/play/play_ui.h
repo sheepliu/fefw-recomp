@@ -4,6 +4,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "play_engine.h"
 #include "play_types.h"
@@ -46,6 +47,8 @@ public:
     virtual void cancel_capture() = 0;
     // An input the page must not let the player bind (the key that opens this menu). The page keeps waiting for another one.
     virtual bool reserved_key(const InputId& id) const { (void)id; return false; }
+    // The names of the graphics cards the game can run on, for the GPU choice on the Graphics page (empty: not known).
+    virtual std::vector<std::string> gpu_names() const { return {}; }
 };
 
 // Draws the settings menu: pages Display, Graphics, Controls (mouse, keyboard bindings, gamepad, Switch layout, status), Audio and About, plus

@@ -62,6 +62,7 @@ namespace SpirvHarness
             StaticGpuAccessor.TexturePoolLength = int.Parse(Opt(args, "--texture-pool", "65536"));
             StaticGpuAccessor.SamplerPoolLength = int.Parse(Opt(args, "--sampler-pool", "4096"));
             Debug = args.Contains("--debug-mode");
+            AmpereTranslator.NativeIAbs = args.Contains("--native-iabs");
             // --no-divergent-barriers (or FEFW_NO_DIVERGENT_BARRIERS=1 in the environment, which the launcher's setup inherits): answer what Ryujinx's
             // Vulkan backend answers on Intel GPUs, so barriers on potentially divergent blocks are left out (GitHub issue #45)
             StaticGpuAccessor.NoDivergentBarriers = args.Contains("--no-divergent-barriers") || Environment.GetEnvironmentVariable("FEFW_NO_DIVERGENT_BARRIERS") == "1";

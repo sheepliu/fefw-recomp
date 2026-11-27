@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <psapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -181,7 +182,7 @@ std::string format_threads(const std::vector<ThreadDump>& threads) {
 // said "no frame tick" while the last opened files pointed at audio. Recording
 // the process footprint, the guard's limit and the machine's remaining memory
 // makes the next report distinguish a deadlock from an exhausted system.
-std::string memory_text() {
+std::string memory_text(const char* when) {
     PROCESS_MEMORY_COUNTERS_EX pmc{};
     pmc.cb = sizeof pmc;
     const bool got = GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof pmc) != 0;
@@ -190,11 +191,14 @@ std::string memory_text() {
     const bool got_system = GlobalMemoryStatusEx(&ms) != 0;
     const double gb = 1024.0 * 1024.0 * 1024.0;
     char b[512];
-    std::string out = "memory at freeze:\n";
+    std::string out = "memory at ";
+    out += (when && when[0]) ? when : "freeze";
+    out += ":\n";
     if (got) {
+        const uint64_t priv = memguard_commit_bytes(pmc.PrivateUsage, pmc.PagefileUsage);
         std::snprintf(b, sizeof b,
                       "  private commit %.2f GB, working set %.2f GB, peak working set %.2f GB, pagefile %.2f GB\n",
-                      static_cast<double>(pmc.PrivateUsage) / gb, static_cast<double>(pmc.WorkingSetSize) / gb,
+                      static_cast<double>(priv) / gb, static_cast<double>(pmc.WorkingSetSize) / gb,
                       static_cast<double>(pmc.PeakWorkingSetSize) / gb, static_cast<double>(pmc.PagefileUsage) / gb);
         out += b;
     } else {
@@ -277,14 +281,9 @@ std::string extra_reports() {
     return out;
 }
 
-// Header line, then the thread dump. Goes to the log and the report file; returns the full text for on_fire.
+// Header line, then every section of the dump. Goes to the log and the report file; returns the full text for on_fire.
 std::string emit_dump(const std::string& report_path, const std::string& header) {
-    std::string text = header;
-    text += '\n';
-    text += memory_text();
-    text += dump_text();
-    text += kernel::sync_wait_report();
-    text += extra_reports();
+    const std::string text = diag_full_dump(header.c_str(), "freeze");
     log_lines(text);
     write_report(report_path, text);
     return text;
@@ -318,6 +317,7 @@ struct Control {
     std::thread th;
     // Parameters, written by watchdog_start before the thread is created.
     double threshold_s = 0;
+    double boot_threshold_s = 0;   // until the first frame tick ([diag] watchdog_boot_seconds)
     uint32_t poll_ms = 250;
     std::string report_path;   // "" = no file
     std::string request_path;  // <exe dir>\dump_threads
@@ -368,7 +368,10 @@ void run_loop(Control* c) {
             }
         }
         const double idle_s = std::chrono::duration<double>(now - last_change).count();
-        if (!fired && idle_s >= c->threshold_s) {
+        // Before the first frame the start-up itself (the RomFS scan, the code mods' edits, the first shader and texture loads) can take
+        // longer than the threshold without anything being stuck. Until the first tick the longer start-up threshold applies.
+        const double limit = frames == 0 ? c->boot_threshold_s : c->threshold_s;
+        if (!fired && idle_s >= limit) {
             fired = true;
             std::string header;
             appendf(header, "FREEZE: no frame tick for %.1f s (frame count %llu)", idle_s,
@@ -401,6 +404,9 @@ void watchdog_start(const WatchdogOptions& opt) {
     if (!(secs > 0)) return;      // disabled (also for a NaN value)
     const std::string exe = exe_path();
     c.threshold_s = secs;
+    // [diag] watchdog_boot_seconds (default 60): the threshold until the first frame; never below watchdog_seconds
+    c.boot_threshold_s = std::max(secs, config_get_double("diag", "watchdog_boot_seconds", 60.0));
+    if (!(c.boot_threshold_s > 0)) c.boot_threshold_s = secs;
     c.poll_ms = opt.poll_ms ? opt.poll_ms : 1;
     c.report_path = opt.report_path ? std::string(opt.report_path) : default_report_path(exe);
     c.request_path = exe_dir(exe) + "\\dump_threads";
@@ -412,7 +418,7 @@ void watchdog_start(const WatchdogOptions& opt) {
     }
     c.th = std::thread(run_loop, &c);
     g_running.store(true);
-    NXLOG_I("watchdog", "started: threshold %.1f s, poll %u ms, report file %s", secs, c.poll_ms,
+    NXLOG_I("watchdog", "started: threshold %.1f s (%.1f s before the first frame), poll %u ms, report file %s", secs, c.boot_threshold_s, c.poll_ms,
             c.report_path.empty() ? "(none)" : c.report_path.c_str());
 }
 
@@ -448,6 +454,19 @@ uint64_t diag_frame_count() { return g_frames.load(std::memory_order_relaxed); }
 uint32_t watchdog_fire_count() { return g_fires.load(std::memory_order_relaxed); }
 
 std::string diag_thread_dump() { return dump_text(); }
+
+std::string diag_memory_text(const char* when) { return memory_text(when); }
+
+std::string diag_full_dump(const char* header, const char* when) {
+    std::string text = header ? header : "";
+    if (!text.empty() && text.back() != '\n') text += '\n';
+    text += diag_vk_failure_text(when && std::strcmp(when, "device loss") == 0);
+    text += memory_text(when);
+    text += dump_text();
+    text += kernel::sync_wait_report();
+    text += extra_reports();
+    return text;
+}
 
 void diag_add_report(std::string (*fn)()) {
     std::lock_guard<std::mutex> lk(g_report_mu);

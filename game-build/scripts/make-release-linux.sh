@@ -17,19 +17,23 @@
 #       libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
 #   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 # The Ryujinx sources for the translator are cloned into work/refs/ryubing on first use (or RYUBING_DIR).
+# --decky puts the Decky plugin's ZIP (decky/package.py, same version) in the package, as decky/fefw-recomp-decky.zip: the plugin
+# offers to update itself to it after an update. Without it the package has none and the plugin stays as it is.
 # Output: <out>/fefw-recomp-<version>-linux-x64.tar.gz (a tarball, so the executable bits survive).
 set -euo pipefail
 
-usage() { echo "usage: $0 <fefw-recomp-<version>-win64.zip> [--out DIR] [--version NAME]" >&2; exit 2; }
+usage() { echo "usage: $0 <fefw-recomp-<version>-win64.zip> [--out DIR] [--version NAME] [--decky ZIP]" >&2; exit 2; }
 [ $# -ge 1 ] || usage
 WIN_ZIP=$(realpath "$1"); shift
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT="$ROOT/work/release"
+DECKY=""
 VERSION=$(basename "$WIN_ZIP" | sed -n 's/^fefw-recomp-\(.*\)-win64\.zip$/\1/p')
 while [ $# -gt 0 ]; do
     case "$1" in
         --out) OUT=$(realpath -m "$2"); shift 2 ;;
         --version) VERSION="$2"; shift 2 ;;
+        --decky) DECKY=$(realpath "$2"); shift 2 ;;
         *) usage ;;
     esac
 done
@@ -99,7 +103,12 @@ cp -a "$OUT/harness-linux" "$PKG/tools/spirv_harness"
 echo "--- from this checkout"
 cp "$ROOT/game-build/release/fefw_build.py" "$PKG/tools/build/fefw_build.py"
 cp "$ROOT/tools/shaders/ampere/extract_corpus.py" "$PKG/tools/shaders/extract_corpus.py"
+cp "$ROOT/recomplauncher.json" "$PKG/recomplauncher.json"
 sed "s/@VERSION@/$VERSION/" "$ROOT/game-build/release/README-linux.txt" > "$PKG/README.txt"
+if [ -n "$DECKY" ]; then
+    mkdir -p "$PKG/decky"
+    cp "$DECKY" "$PKG/decky/fefw-recomp-decky.zip"
+fi
 
 echo "--- Zig $ZIG_VERSION"
 zig="$CACHE/zig-x86_64-linux-$ZIG_VERSION.tar.xz"

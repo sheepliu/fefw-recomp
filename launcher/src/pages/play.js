@@ -1,5 +1,6 @@
 import { api, esc, icon, refreshIcons, toast, errText } from '../util.js';
 import { t } from '../i18n.js';
+import { confirmUpscalerFiles } from '../upscalerCheck.js';
 import { statusText, stepTitle } from '../rusttext.js';
 
 const hex = (c) => '0x' + (c >>> 0).toString(16).toUpperCase().padStart(8, '0');
@@ -32,14 +33,37 @@ function reportHtml(s) {
 }
 
 export async function render(el, ctx) {
+  const visit = el.dataset.visit; // changes when the page is left (main.js)
+  const isLinux = (await api('platform').catch(() => '')) === 'linux';
   const [cfg, ov] = await Promise.all([api('get_config'), api('get_overview')]);
   const setup = ov.repo_ok ? await api('setup_status') : null;
   const report = cfg.dump_dir && ov.repo_ok ? await api('validate_dump', { path: cfg.dump_dir }) : null;
   const chosen = report && report.chosen;
   let status = await api('game_status');
+  // Windows: little memory left for the game to take (memory.rs)
+  let memory = await api('memory_warning').catch(() => null);
+  let reportsPrompted = !!cfg.reports_prompted;
   // Linux: fefw.exe as a non-Steam game (steam.rs)
   let steam = await api('steam_status').catch(() => ({ available: false }));
   let addingSteam = false;
+  // Linux handhelds: the Decky plugin, when it is not installed
+  let decky = await api('decky_offer').catch(() => null);
+
+  function memoryHtml() {
+    if (!memory || status.state === 'running') return '';
+    const key = memory.kind === 'noPageFile' ? 'play.memoryNoPageFile' : 'play.memoryLow';
+    return `<div class="banner warn">${icon('triangle-alert')}<div>${esc(t(key, { free: memory.free_gb.toFixed(1) }))}</div></div>`;
+  }
+
+  // Asks again, and redraws only the warning: the rest of the page stays as the player left it.
+  async function checkMemory() {
+    const now = await api('memory_warning').catch(() => null);
+    if (el.dataset.visit !== visit || JSON.stringify(now) === JSON.stringify(memory)) return;
+    memory = now;
+    const box = el.querySelector('#memory');
+    if (box) box.innerHTML = memoryHtml();
+    refreshIcons();
+  }
 
   function draw() {
     const running = status.state === 'running';
@@ -58,6 +82,7 @@ export async function render(el, ctx) {
           <p class="dim">${esc(t('play.intro'))}</p>
         </div>
         ${problems.map((p) => `<div class="banner danger">${icon('circle-x')}<div>${esc(p)}</div></div>`).join('')}
+        <div id="memory" style="display: contents">${memoryHtml()}</div>
         ${problems.length && ov.repo_ok ? `<div><button class="btn primary" id="to-setup">${icon(chosen ? 'hammer' : 'folder-open')}${esc(t(chosen ? 'play.openSetup' : 'play.chooseFiles'))}</button></div>` : ''}
 
         <div class="row wrap">
@@ -65,6 +90,27 @@ export async function render(el, ctx) {
           ${statusChip(status)}
         </div>
         ${reportHtml(status)}
+        ${!reportsPrompted ? `
+        <div class="card" id="reports-prompt">
+          <h2>${icon('activity')}${esc(t('setup.reportsTitle'))}</h2>
+          <p class="dim">${esc(t('setup.reportsToggle'))}</p>
+          <p class="faint" style="margin-top: var(--space-2)">${esc(t('setup.reportsHint'))}</p>
+          <div class="row" style="margin-top: var(--space-4)">
+            <button class="btn primary" id="reports-enable">${icon('circle-check')}${esc(t('play.reportsEnable'))}</button>
+            <button class="btn quiet" id="reports-dismiss">${esc(t('play.reportsDismiss'))}</button>
+          </div>
+        </div>` : ''}
+        ${decky ? `
+        <div class="card" id="decky-offer">
+          <h2>${icon('gamepad-2')}${esc(t('play.deckyTitle'))}</h2>
+          <p class="dim">${esc(t('play.deckyText'))}</p>
+          <p class="faint" style="margin-top: var(--space-2)">${esc(t('play.deckyHint'))}</p>
+          ${decky.folder ? `<p class="faint" style="margin-top: var(--space-2)">${esc(t('play.deckyFolder'))}</p><div class="path">${esc(decky.folder)}</div>` : ''}
+          <div class="row" style="margin-top: var(--space-4)">
+            <button class="btn primary" id="decky-get">${icon('download')}${esc(t('play.deckyGet'))}</button>
+            <button class="btn quiet" id="decky-dismiss">${esc(t('play.reportsDismiss'))}</button>
+          </div>
+        </div>` : ''}
         ${steam.available && steam.stale ? `<div class="banner warn">${icon('triangle-alert')}<div style="flex:1">${esc(t('play.steamStale'))}</div><button class="btn" id="update-steam" ${ov.exe_exists && !addingSteam ? '' : 'disabled'}>${icon('gamepad-2')}${esc(t('play.updateSteam'))}</button></div>` : ''}
 
         <div class="card">
@@ -81,7 +127,7 @@ export async function render(el, ctx) {
             <dt>${esc(t('play.runFolder'))}</dt>
             <dd><span class="faint">${esc(t('play.runFolderContents'))}</span><div class="path">${esc(ov.game_dir)}</div></dd>
             <dt>${esc(t('play.mods'))}</dt>
-            <dd><span class="faint">${esc(t('play.modsHint'))}</span></dd>
+            <dd><ul class="faint bullets">${['modsRomfs', 'modsExefs', 'modsOff', 'modsOrder', 'modsRebuild'].map((k) => `<li>${esc(t(`play.${k}`))}</li>`).join('')}</ul></dd>
           </dl>
           <div class="row" style="margin-top: var(--space-4)">
             <button class="btn" id="open-dir" ${ov.repo_ok ? '' : 'disabled'}>${icon('folder-open')}${esc(t('play.openRunFolder'))}</button>
@@ -92,7 +138,37 @@ export async function render(el, ctx) {
         <p class="faint">${esc(t('play.footer'))}</p>
       </div>`;
     refreshIcons();
-    el.querySelector('#play')?.addEventListener('click', () => api('play').catch((e) => toast(errText(e), 'error')));
+    el.querySelector('#play')?.addEventListener('click', async (ev) => {
+      const btn = ev.currentTarget;
+      btn.disabled = true;
+      const go = await confirmUpscalerFiles(isLinux);
+      btn.disabled = false;
+      if (!go) return;
+      api('play').catch((e) => toast(errText(e), 'error'));
+    });
+    const answerReports = async (enabled) => {
+      try {
+        await api('set_send_reports', { enabled });
+        reportsPrompted = true;
+        draw();
+      } catch (e) {
+        toast(errText(e), 'error');
+      }
+    };
+    el.querySelector('#reports-enable')?.addEventListener('click', () => answerReports(true));
+    el.querySelector('#reports-dismiss')?.addEventListener('click', () => answerReports(false));
+    el.querySelector('#decky-get')?.addEventListener('click', () =>
+      api('open_decky_installer').then(() => toast(t('play.deckyOpened'), 'ok')).catch((e) => toast(errText(e), 'error')),
+    );
+    el.querySelector('#decky-dismiss')?.addEventListener('click', async () => {
+      try {
+        await api('decline_decky');
+        decky = null;
+        draw();
+      } catch (e) {
+        toast(errText(e), 'error');
+      }
+    });
     el.querySelector('#to-setup')?.addEventListener('click', () => ctx.go('setup'));
     el.querySelector('#open-dir')?.addEventListener('click', () => api('open_game_dir').catch((e) => toast(errText(e), 'error')));
     el.querySelector('#open-mods')?.addEventListener('click', () => api('open_mods_dir').catch((e) => toast(errText(e), 'error')));
@@ -118,6 +194,13 @@ export async function render(el, ctx) {
   ctx.onStatus((s) => {
     status = s;
     draw();
+    if (s.state === 'exited') checkMemory();
   });
+  // programs closed or opened while the page is on show
+  const memoryTimer = setInterval(() => {
+    if (el.dataset.visit !== visit) clearInterval(memoryTimer);
+    else if (status.state !== 'running') checkMemory();
+  }, 5000);
+  ctx.onLanguage(draw);
   draw();
 }
